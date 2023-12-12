@@ -20,7 +20,7 @@ use crate::delta_datafusion::{
     get_null_of_arrow_type, logical_expr_to_physical_expr, to_correct_scalar_value,
 };
 use crate::errors::{DeltaResult, DeltaTableError};
-use crate::protocol::Add;
+use crate::kernel::Add;
 use crate::table::state::DeltaTableState;
 
 impl DeltaTableState {
@@ -35,18 +35,18 @@ impl DeltaTableState {
         }
 
     fn _arrow_schema(&self, wrap_partitions: bool) -> DeltaResult<ArrowSchemaRef> {
-        let meta = self.current_metadata().ok_or(DeltaTableError::NoMetadata)?;
+        let meta = self.metadata().ok_or(DeltaTableError::NoMetadata)?;
         let fields = meta
             .schema
-            .get_fields()
+            .fields()
             .iter()
-            .filter(|f| !meta.partition_columns.contains(&f.get_name().to_string()))
+            .filter(|f| !meta.partition_columns.contains(&f.name().to_string()))
             .map(|f| f.try_into())
             .chain(
                 meta.schema
-                    .get_fields()
+                    .fields()
                     .iter()
-                    .filter(|f| meta.partition_columns.contains(&f.get_name().to_string()))
+                    .filter(|f| meta.partition_columns.contains(&f.name().to_string()))
                     .map(|f| {
                         let field = ArrowField::try_from(f)?;
                         let corrected = if wrap_partitions {
@@ -193,9 +193,12 @@ impl<'a> AddContainer<'a> {
                     Some(v) => serde_json::Value::String(v.to_string()),
                     None => serde_json::Value::Null,
                 };
-                to_correct_scalar_value(&value, data_type).unwrap_or(
-                    get_null_of_arrow_type(data_type).expect("Could not determine null type"),
-                )
+                to_correct_scalar_value(&value, data_type)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(
+                        get_null_of_arrow_type(data_type).expect("Could not determine null type"),
+                    )
             } else if let Ok(Some(statistics)) = add.get_stats() {
                 let values = if get_max {
                     statistics.max_values
@@ -205,7 +208,11 @@ impl<'a> AddContainer<'a> {
 
                 values
                     .get(&column.name)
-                    .and_then(|f| to_correct_scalar_value(f.as_value()?, data_type))
+                    .and_then(|f| {
+                        to_correct_scalar_value(f.as_value()?, data_type)
+                            .ok()
+                            .flatten()
+                    })
                     .unwrap_or(
                         get_null_of_arrow_type(data_type).expect("Could not determine null type"),
                     )
@@ -297,7 +304,7 @@ impl PruningStatistics for DeltaTableState {
     /// return the minimum values for the named column, if known.
     /// Note: the returned array must contain `num_containers()` rows
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
-        let partition_columns = &self.current_metadata()?.partition_columns;
+        let partition_columns = &self.metadata()?.partition_columns;
         let container =
             AddContainer::new(self.files(), partition_columns, self.arrow_schema().ok()?);
         container.min_values(column)
@@ -306,7 +313,7 @@ impl PruningStatistics for DeltaTableState {
     /// return the maximum values for the named column, if known.
     /// Note: the returned array must contain `num_containers()` rows.
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
-        let partition_columns = &self.current_metadata()?.partition_columns;
+        let partition_columns = &self.metadata()?.partition_columns;
         let container =
             AddContainer::new(self.files(), partition_columns, self.arrow_schema().ok()?);
         container.max_values(column)
@@ -323,7 +330,7 @@ impl PruningStatistics for DeltaTableState {
     ///
     /// Note: the returned array must contain `num_containers()` rows.
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
-        let partition_columns = &self.current_metadata()?.partition_columns;
+        let partition_columns = &self.metadata()?.partition_columns;
         let container =
             AddContainer::new(self.files(), partition_columns, self.arrow_schema().ok()?);
         container.null_counts(column)

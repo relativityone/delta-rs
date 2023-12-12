@@ -4,18 +4,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, error::Error, sync::Arc};
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use deltalake_core::errors::DeltaTableError;
+use deltalake_core::kernel::{Action, DataType, PrimitiveType, Remove, StructField};
 use deltalake_core::operations::optimize::{
     create_merge_plan, MetricDetails, Metrics, OptimizeType,
 };
 use deltalake_core::operations::transaction::commit;
 use deltalake_core::operations::DeltaOps;
-use deltalake_core::protocol::{Action, DeltaOperation, Remove};
+use deltalake_core::protocol::DeltaOperation;
 use deltalake_core::storage::ObjectStoreRef;
 use deltalake_core::writer::{DeltaWriter, RecordBatchWriter};
-use deltalake_core::{DeltaTable, PartitionFilter, Path, SchemaDataType, SchemaField};
+use deltalake_core::{DeltaTable, PartitionFilter, Path};
 use futures::TryStreamExt;
 use object_store::ObjectStore;
 use parquet::arrow::async_reader::ParquetObjectReader;
@@ -32,23 +33,20 @@ struct Context {
 
 async fn setup_test(partitioned: bool) -> Result<Context, Box<dyn Error>> {
     let columns = vec![
-        SchemaField::new(
+        StructField::new(
             "x".to_owned(),
-            SchemaDataType::primitive("integer".to_owned()),
+            DataType::Primitive(PrimitiveType::Integer),
             false,
-            HashMap::new(),
         ),
-        SchemaField::new(
+        StructField::new(
             "y".to_owned(),
-            SchemaDataType::primitive("integer".to_owned()),
+            DataType::Primitive(PrimitiveType::Integer),
             false,
-            HashMap::new(),
         ),
-        SchemaField::new(
+        StructField::new(
             "date".to_owned(),
-            SchemaDataType::primitive("string".to_owned()),
+            DataType::Primitive(PrimitiveType::String),
             false,
-            HashMap::new(),
         ),
     ];
 
@@ -92,9 +90,9 @@ fn generate_random_batch<T: Into<String>>(
 
     Ok(RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
-            Field::new("x", DataType::Int32, false),
-            Field::new("y", DataType::Int32, false),
-            Field::new("date", DataType::Utf8, false),
+            Field::new("x", ArrowDataType::Int32, false),
+            Field::new("y", ArrowDataType::Int32, false),
+            Field::new("date", ArrowDataType::Utf8, false),
         ])),
         vec![Arc::new(x_array), Arc::new(y_array), Arc::new(date_array)],
     )?)
@@ -121,9 +119,9 @@ fn tuples_to_batch<T: Into<String>>(
 
     Ok(RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
-            Field::new("x", DataType::Int32, false),
-            Field::new("y", DataType::Int32, false),
-            Field::new("date", DataType::Utf8, false),
+            Field::new("x", ArrowDataType::Int32, false),
+            Field::new("y", ArrowDataType::Int32, false),
+            Field::new("date", ArrowDataType::Utf8, false),
         ])),
         vec![Arc::new(x_array), Arc::new(y_array), Arc::new(date_array)],
     )?)
@@ -294,21 +292,21 @@ async fn test_conflict_for_remove_actions() -> Result<(), Box<dyn Error>> {
         partition_values: Some(add.partition_values.clone()),
         tags: Some(HashMap::new()),
         deletion_vector: add.deletion_vector.clone(),
+        base_row_id: add.base_row_id,
+        default_row_commit_version: add.default_row_commit_version,
     };
 
     let operation = DeltaOperation::Delete { predicate: None };
     commit(
-        other_dt.object_store().as_ref(),
-        &vec![Action::remove(remove)],
+        other_dt.log_store().as_ref(),
+        &vec![Action::Remove(remove)],
         operation,
         &other_dt.state,
         None,
     )
     .await?;
 
-    let maybe_metrics = plan
-        .execute(dt.object_store(), &dt.state, 1, 20, None)
-        .await;
+    let maybe_metrics = plan.execute(dt.log_store(), &dt.state, 1, 20, None).await;
 
     assert!(maybe_metrics.is_err());
     assert_eq!(dt.version(), version + 1);
@@ -357,9 +355,7 @@ async fn test_no_conflict_for_append_actions() -> Result<(), Box<dyn Error>> {
     )
     .await?;
 
-    let metrics = plan
-        .execute(dt.object_store(), &dt.state, 1, 20, None)
-        .await?;
+    let metrics = plan.execute(dt.log_store(), &dt.state, 1, 20, None).await?;
     assert_eq!(metrics.num_files_added, 1);
     assert_eq!(metrics.num_files_removed, 2);
 
@@ -399,7 +395,7 @@ async fn test_commit_interval() -> Result<(), Box<dyn Error>> {
 
     let metrics = plan
         .execute(
-            dt.object_store(),
+            dt.log_store(),
             &dt.state,
             1,
             20,
@@ -509,6 +505,71 @@ async fn test_idempotent_metrics() -> Result<(), Box<dyn Error>> {
 
     assert_eq!(expected, metrics);
     assert_eq!(version, dt.version());
+    Ok(())
+}
+
+#[tokio::test]
+/// Validate that multiple bins packing is idempotent.
+async fn test_idempotent_with_multiple_bins() -> Result<(), Box<dyn Error>> {
+    //TODO: Compression makes it hard to get the target file size...
+    //Maybe just commit files with a known size
+    let context = setup_test(true).await?;
+    let mut dt = context.table;
+    let mut writer = RecordBatchWriter::for_table(&dt)?;
+
+    write(
+        &mut writer,
+        &mut dt,
+        generate_random_batch(records_for_size(6_000_000), "2022-05-22")?,
+    )
+    .await?;
+    write(
+        &mut writer,
+        &mut dt,
+        generate_random_batch(records_for_size(3_000_000), "2022-05-22")?,
+    )
+    .await?;
+    write(
+        &mut writer,
+        &mut dt,
+        generate_random_batch(records_for_size(6_000_000), "2022-05-22")?,
+    )
+    .await?;
+    write(
+        &mut writer,
+        &mut dt,
+        generate_random_batch(records_for_size(3_000_000), "2022-05-22")?,
+    )
+    .await?;
+    write(
+        &mut writer,
+        &mut dt,
+        generate_random_batch(records_for_size(9_900_000), "2022-05-22")?,
+    )
+    .await?;
+
+    let version = dt.version();
+
+    let filter = vec![PartitionFilter::try_from(("date", "=", "2022-05-22"))?];
+
+    let optimize = DeltaOps(dt)
+        .optimize()
+        .with_filters(&filter)
+        .with_target_size(10_000_000);
+    let (dt, metrics) = optimize.await?;
+    assert_eq!(metrics.num_files_added, 2);
+    assert_eq!(metrics.num_files_removed, 4);
+    assert_eq!(dt.version(), version + 1);
+
+    let optimize = DeltaOps(dt)
+        .optimize()
+        .with_filters(&filter)
+        .with_target_size(10_000_000);
+    let (dt, metrics) = optimize.await?;
+    assert_eq!(metrics.num_files_added, 0);
+    assert_eq!(metrics.num_files_removed, 0);
+    assert_eq!(dt.version(), version + 1);
+
     Ok(())
 }
 

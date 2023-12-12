@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use super::config::TableConfig;
 use crate::errors::DeltaTableError;
+use crate::kernel::{Action, Add, CommitInfo, DataType, DomainMetadata, Remove, StructType};
+use crate::kernel::{Metadata, Protocol};
 use crate::partitions::{DeltaTablePartition, PartitionFilter};
-use crate::protocol::{self, Action, Add, ProtocolError};
-use crate::schema::SchemaDataType;
+use crate::protocol::ProtocolError;
 use crate::storage::commit_uri_from_version;
 use crate::table::DeltaTableMetaData;
 use crate::DeltaTable;
-use crate::Schema;
 
 #[cfg(any(feature = "parquet", feature = "parquet2"))]
 use super::{CheckPoint, DeltaTableConfig};
@@ -31,23 +31,18 @@ pub struct DeltaTableState {
     version: i64,
     // A remove action should remain in the state of the table as a tombstone until it has expired.
     // A tombstone expires when the creation timestamp of the delta file exceeds the expiration
-    tombstones: HashSet<protocol::Remove>,
+    tombstones: HashSet<Remove>,
     // active files for table state
-    files: Vec<protocol::Add>,
+    files: Vec<Add>,
     // Information added to individual commits
-    commit_infos: Vec<protocol::CommitInfo>,
+    commit_infos: Vec<CommitInfo>,
     // Domain metadatas provided by the system or user
-    domain_metadatas: Vec<protocol::DomainMetaData>,
+    domain_metadatas: Vec<DomainMetadata>,
     app_transaction_version: HashMap<String, i64>,
-    min_reader_version: i32,
-    min_writer_version: i32,
     // table metadata corresponding to current version
     current_metadata: Option<DeltaTableMetaData>,
-    // retention period for tombstones in milli-seconds
-    tombstone_retention_millis: i64,
-    // retention period for log entries in milli-seconds
-    log_retention_millis: i64,
-    enable_expired_log_cleanup: bool,
+    protocol: Option<Protocol>,
+    metadata: Option<Metadata>,
 }
 
 impl DeltaTableState {
@@ -67,7 +62,7 @@ impl DeltaTableState {
     /// Construct a delta table state object from commit version.
     pub async fn from_commit(table: &DeltaTable, version: i64) -> Result<Self, ProtocolError> {
         let commit_uri = commit_uri_from_version(version);
-        let commit_log_bytes = match table.storage.get(&commit_uri).await {
+        let commit_log_bytes = match table.object_store().get(&commit_uri).await {
             Ok(get) => Ok(get.bytes().await?),
             Err(ObjectStoreError::NotFound { .. }) => Err(ProtocolError::EndOfLog),
             Err(source) => Err(ProtocolError::ObjectStore { source }),
@@ -76,7 +71,7 @@ impl DeltaTableState {
 
         let mut new_state = DeltaTableState::with_version(version);
         for line in reader.lines() {
-            let action: protocol::Action = serde_json::from_str(line?.as_str())?;
+            let action: Action = serde_json::from_str(line?.as_str())?;
             new_state.process_action(
                 action,
                 table.config.require_tombstones,
@@ -110,13 +105,13 @@ impl DeltaTableState {
             let preader = SerializedFileReader::new(data)?;
             let schema = preader.metadata().file_metadata().schema();
             if !schema.is_group() {
-                return Err(DeltaTableError::from(protocol::ProtocolError::Generic(
+                return Err(DeltaTableError::from(ProtocolError::Generic(
                     "Action record in checkpoint should be a struct".to_string(),
                 )));
             }
             for record in preader.get_row_iter(None)? {
                 self.process_action(
-                    protocol::Action::from_parquet_record(schema, &record.unwrap())?,
+                    Action::from_parquet_record(schema, &record.unwrap())?,
                     table_config.require_tombstones,
                     table_config.require_files,
                 )?;
@@ -132,8 +127,8 @@ impl DeltaTableState {
             let metadata = read_metadata(&mut reader)?;
 
             for row_group in metadata.row_groups {
-                for action in actions_from_row_group(row_group, &mut reader)
-                    .map_err(protocol::ProtocolError::from)?
+                for action in
+                    actions_from_row_group(row_group, &mut reader).map_err(ProtocolError::from)?
                 {
                     self.process_action(
                         action,
@@ -157,7 +152,7 @@ impl DeltaTableState {
         let mut new_state = Self::with_version(check_point.version);
 
         for f in &checkpoint_data_paths {
-            let obj = table.storage.get(f).await?.bytes().await?;
+            let obj = table.object_store().get(f).await?.bytes().await?;
             new_state.process_checkpoint_bytes(obj, &table.config)?;
         }
 
@@ -165,34 +160,23 @@ impl DeltaTableState {
     }
 
     /// List of commit info maps.
-    pub fn commit_infos(&self) -> &Vec<protocol::CommitInfo> {
+    pub fn commit_infos(&self) -> &Vec<CommitInfo> {
         &self.commit_infos
     }
 
-    /// Retention of tombstone in milliseconds.
-    pub fn tombstone_retention_millis(&self) -> i64 {
-        self.tombstone_retention_millis
-    }
-
-    /// Retention of logs in milliseconds.
-    pub fn log_retention_millis(&self) -> i64 {
-        self.log_retention_millis
-    }
-
-    /// Whether to clean up expired checkpoints and delta logs.
-    pub fn enable_expired_log_cleanup(&self) -> bool {
-        self.enable_expired_log_cleanup
-    }
-
     /// Full list of tombstones (remove actions) representing files removed from table state).
-    pub fn all_tombstones(&self) -> &HashSet<protocol::Remove> {
+    pub fn all_tombstones(&self) -> &HashSet<Remove> {
         &self.tombstones
     }
 
     /// List of unexpired tombstones (remove actions) representing files removed from table state.
     /// The retention period is set by `deletedFileRetentionDuration` with default value of 1 week.
-    pub fn unexpired_tombstones(&self) -> impl Iterator<Item = &protocol::Remove> {
-        let retention_timestamp = Utc::now().timestamp_millis() - self.tombstone_retention_millis;
+    pub fn unexpired_tombstones(&self) -> impl Iterator<Item = &Remove> {
+        let retention_timestamp = Utc::now().timestamp_millis()
+            - self
+                .table_config()
+                .deleted_file_retention_duration()
+                .as_millis() as i64;
         self.tombstones
             .iter()
             .filter(move |t| t.deletion_timestamp.unwrap_or(0) > retention_timestamp)
@@ -200,7 +184,7 @@ impl DeltaTableState {
 
     /// Full list of add actions representing all parquet files that are part of the current
     /// delta table state.
-    pub fn files(&self) -> &Vec<protocol::Add> {
+    pub fn files(&self) -> &Vec<Add> {
         self.files.as_ref()
     }
 
@@ -219,23 +203,26 @@ impl DeltaTableState {
         &self.app_transaction_version
     }
 
-    /// The min reader version required by the protocol.
-    pub fn min_reader_version(&self) -> i32 {
-        self.min_reader_version
-    }
-
-    /// The min writer version required by the protocol.
-    pub fn min_writer_version(&self) -> i32 {
-        self.min_writer_version
+    /// The most recent protocol of the table.
+    pub fn protocol(&self) -> &Protocol {
+        lazy_static! {
+            static ref DEFAULT_PROTOCOL: Protocol = Protocol::default();
+        }
+        self.protocol.as_ref().unwrap_or(&DEFAULT_PROTOCOL)
     }
 
     /// The most recent metadata of the table.
-    pub fn current_metadata(&self) -> Option<&DeltaTableMetaData> {
+    pub fn metadata_action(&self) -> Result<&Metadata, ProtocolError> {
+        self.metadata.as_ref().ok_or(ProtocolError::NoMetaData)
+    }
+
+    /// The most recent metadata of the table.
+    pub fn metadata(&self) -> Option<&DeltaTableMetaData> {
         self.current_metadata.as_ref()
     }
 
     /// The table schema
-    pub fn schema(&self) -> Option<&Schema> {
+    pub fn schema(&self) -> Option<&StructType> {
         self.current_metadata.as_ref().map(|m| &m.schema)
     }
 
@@ -285,16 +272,15 @@ impl DeltaTableState {
             self.files.append(&mut new_state.files);
         }
 
-        if new_state.min_reader_version > 0 {
-            self.min_reader_version = new_state.min_reader_version;
-            self.min_writer_version = new_state.min_writer_version;
+        if new_state.current_metadata.is_some() {
+            self.current_metadata = new_state.current_metadata.take();
+        }
+        if new_state.metadata.is_some() {
+            self.metadata = new_state.metadata.take();
         }
 
-        if new_state.current_metadata.is_some() {
-            self.tombstone_retention_millis = new_state.tombstone_retention_millis;
-            self.log_retention_millis = new_state.log_retention_millis;
-            self.enable_expired_log_cleanup = new_state.enable_expired_log_cleanup;
-            self.current_metadata = new_state.current_metadata.take();
+        if new_state.protocol.is_some() {
+            self.protocol = new_state.protocol.take();
         }
 
         new_state
@@ -319,47 +305,41 @@ impl DeltaTableState {
     /// Process given action by updating current state.
     fn process_action(
         &mut self,
-        action: protocol::Action,
+        action: Action,
         require_tombstones: bool,
         require_files: bool,
     ) -> Result<(), ProtocolError> {
         match action {
             // TODO: optionally load CDC into TableState
-            protocol::Action::cdc(_v) => {}
-            protocol::Action::add(v) => {
+            Action::Cdc(_v) => {}
+            Action::Add(v) => {
                 if require_files {
                     self.files.push(v);
                 }
             }
-            protocol::Action::remove(v) => {
+            Action::Remove(v) => {
                 if require_tombstones && require_files {
                     self.tombstones.insert(v);
                 }
             }
-            protocol::Action::protocol(v) => {
-                self.min_reader_version = v.min_reader_version;
-                self.min_writer_version = v.min_writer_version;
+            Action::Protocol(v) => {
+                self.protocol = Some(v);
             }
-            protocol::Action::metaData(v) => {
+            Action::Metadata(v) => {
+                self.metadata = Some(v.clone());
                 let md = DeltaTableMetaData::try_from(v)?;
-                let table_config = TableConfig(&md.configuration);
-                self.tombstone_retention_millis =
-                    table_config.deleted_file_retention_duration().as_millis() as i64;
-                self.log_retention_millis =
-                    table_config.log_retention_duration().as_millis() as i64;
-                self.enable_expired_log_cleanup = table_config.enable_expired_log_cleanup();
                 self.current_metadata = Some(md);
             }
-            protocol::Action::txn(v) => {
+            Action::Txn(v) => {
                 *self
                     .app_transaction_version
                     .entry(v.app_id)
                     .or_insert(v.version) = v.version;
             }
-            protocol::Action::commitInfo(v) => {
+            Action::CommitInfo(v) => {
                 self.commit_infos.push(v);
             }
-            protocol::Action::domainMetadata(v) => {
+            Action::DomainMetadata(v) => {
                 self.domain_metadatas.push(v);
             }
         }
@@ -372,7 +352,7 @@ impl DeltaTableState {
         &'a self,
         filters: &'a [PartitionFilter],
     ) -> Result<impl Iterator<Item = &Add> + '_, DeltaTableError> {
-        let current_metadata = self.current_metadata().ok_or(DeltaTableError::NoMetadata)?;
+        let current_metadata = self.metadata().ok_or(DeltaTableError::NoMetadata)?;
 
         let nonpartitioned_columns: Vec<String> = filters
             .iter()
@@ -386,7 +366,7 @@ impl DeltaTableState {
             });
         }
 
-        let partition_col_data_types: HashMap<&str, &SchemaDataType> = current_metadata
+        let partition_col_data_types: HashMap<&String, &DataType> = current_metadata
             .get_partition_col_data_types()
             .into_iter()
             .collect();
@@ -408,6 +388,7 @@ impl DeltaTableState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::Txn;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -419,12 +400,9 @@ mod tests {
             commit_infos: vec![],
             domain_metadatas: vec![],
             app_transaction_version: Default::default(),
-            min_reader_version: 0,
-            min_writer_version: 0,
             current_metadata: None,
-            tombstone_retention_millis: 0,
-            log_retention_millis: 0,
-            enable_expired_log_cleanup: false,
+            metadata: None,
+            protocol: None,
         };
         let bytes = serde_json::to_vec(&expected).unwrap();
         let actual: DeltaTableState = serde_json::from_slice(&bytes).unwrap();
@@ -444,15 +422,12 @@ mod tests {
             domain_metadatas: vec![],
             tombstones: HashSet::new(),
             current_metadata: None,
-            min_reader_version: 1,
-            min_writer_version: 1,
+            protocol: None,
+            metadata: None,
             app_transaction_version,
-            tombstone_retention_millis: 0,
-            log_retention_millis: 0,
-            enable_expired_log_cleanup: true,
         };
 
-        let txn_action = protocol::Action::txn(protocol::Txn {
+        let txn_action = Action::Txn(Txn {
             app_id: "abc".to_string(),
             version: 2,
             last_updated: Some(0),

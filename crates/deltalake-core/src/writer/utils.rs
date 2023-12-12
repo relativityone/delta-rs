@@ -5,13 +5,14 @@ use std::io::Write;
 use std::sync::Arc;
 
 use arrow::array::{
-    as_boolean_array, as_generic_binary_array, as_primitive_array, as_string_array, Array,
+    as_boolean_array, as_generic_binary_array, as_largestring_array, as_primitive_array,
+    as_string_array, Array,
 };
 use arrow::datatypes::{
-    DataType, Date32Type, Date64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-    Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimeUnit, TimestampMicrosecondType,
-    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    DataType, Date32Type, Date64Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Int8Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimeUnit,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow::json::ReaderBuilder;
 use arrow::record_batch::*;
@@ -27,8 +28,8 @@ use uuid::Uuid;
 
 use crate::errors::DeltaResult;
 use crate::writer::DeltaWriterError;
+use crate::NULL_PARTITION_VALUE_DATA_PATH;
 
-const NULL_PARTITION_VALUE_DATA_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
 const PARTITION_DATE_FORMAT: &str = "%Y-%m-%d";
 const PARTITION_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
@@ -168,7 +169,7 @@ pub fn record_batch_from_message(
 // a happy middle-road might be to compute stats for partition columns only on the initial write since we should validate partition values anyway, and compute additional stats later (at checkpoint time perhaps?).
 // also this does not currently support nested partition columns and many other data types.
 // TODO is this comment still valid, since we should be sure now, that the arrays where this
-// gets aplied have a single unique value
+// gets applied have a single unique value
 pub(crate) fn stringified_partition_value(
     arr: &Arc<dyn Array>,
 ) -> Result<Option<String>, DeltaWriterError> {
@@ -187,7 +188,10 @@ pub(crate) fn stringified_partition_value(
         DataType::UInt16 => as_primitive_array::<UInt16Type>(arr).value(0).to_string(),
         DataType::UInt32 => as_primitive_array::<UInt32Type>(arr).value(0).to_string(),
         DataType::UInt64 => as_primitive_array::<UInt64Type>(arr).value(0).to_string(),
+        DataType::Float32 => as_primitive_array::<Float32Type>(arr).value(0).to_string(),
+        DataType::Float64 => as_primitive_array::<Float64Type>(arr).value(0).to_string(),
         DataType::Utf8 => as_string_array(arr).value(0).to_string(),
+        DataType::LargeUtf8 => as_largestring_array(arr).value(0).to_string(),
         DataType::Boolean => as_boolean_array(arr).value(0).to_string(),
         DataType::Date32 => as_primitive_array::<Date32Type>(arr)
             .value_as_date(0)

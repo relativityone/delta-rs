@@ -1,44 +1,48 @@
-//! Conversion between Delta Table schema and Arrow schema
+//! Conversions between Delta and Arrow data types
 
-use crate::schema;
-use arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
-    Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimeUnit,
-};
-use arrow::error::ArrowError;
-use lazy_static::lazy_static;
-use regex::Regex;
-use std::convert::TryFrom;
 use std::sync::Arc;
 
-impl TryFrom<&schema::Schema> for ArrowSchema {
+use arrow_schema::{
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
+    Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimeUnit,
+};
+use lazy_static::lazy_static;
+
+use super::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+
+pub mod schemas;
+
+const MAP_KEYS_NAME: &str = "keys";
+const MAP_VALUES_NAME: &str = "values";
+
+impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;
 
-    fn try_from(s: &schema::Schema) -> Result<Self, ArrowError> {
+    fn try_from(s: &StructType) -> Result<Self, ArrowError> {
         let fields = s
-            .get_fields()
+            .fields()
             .iter()
-            .map(<ArrowField as TryFrom<&schema::SchemaField>>::try_from)
+            .map(<ArrowField as TryFrom<&StructField>>::try_from)
             .collect::<Result<Vec<ArrowField>, ArrowError>>()?;
 
         Ok(ArrowSchema::new(fields))
     }
 }
 
-impl TryFrom<&schema::SchemaField> for ArrowField {
+impl TryFrom<&StructField> for ArrowField {
     type Error = ArrowError;
 
-    fn try_from(f: &schema::SchemaField) -> Result<Self, ArrowError> {
+    fn try_from(f: &StructField) -> Result<Self, ArrowError> {
         let metadata = f
-            .get_metadata()
+            .metadata()
             .iter()
             .map(|(key, val)| Ok((key.clone(), serde_json::to_string(val)?)))
             .collect::<Result<_, serde_json::Error>>()
             .map_err(|err| ArrowError::JsonError(err.to_string()))?;
 
         let field = ArrowField::new(
-            f.get_name(),
-            ArrowDataType::try_from(f.get_type())?,
+            f.name(),
+            ArrowDataType::try_from(f.data_type())?,
             f.is_nullable(),
         )
         .with_metadata(metadata);
@@ -47,119 +51,113 @@ impl TryFrom<&schema::SchemaField> for ArrowField {
     }
 }
 
-impl TryFrom<&schema::SchemaTypeArray> for ArrowField {
+impl TryFrom<&ArrayType> for ArrowField {
     type Error = ArrowError;
 
-    fn try_from(a: &schema::SchemaTypeArray) -> Result<Self, ArrowError> {
+    fn try_from(a: &ArrayType) -> Result<Self, ArrowError> {
         Ok(ArrowField::new(
             "item",
-            ArrowDataType::try_from(a.get_element_type())?,
+            ArrowDataType::try_from(a.element_type())?,
             a.contains_null(),
         ))
     }
 }
 
-impl TryFrom<&schema::SchemaTypeMap> for ArrowField {
+impl TryFrom<&MapType> for ArrowField {
     type Error = ArrowError;
 
-    fn try_from(a: &schema::SchemaTypeMap) -> Result<Self, ArrowError> {
-        Ok(ArrowField::new_map(
-            "map",
+    fn try_from(a: &MapType) -> Result<Self, ArrowError> {
+        Ok(ArrowField::new(
             "entries",
-            ArrowField::new("key", ArrowDataType::try_from(a.get_key_type())?, false),
-            ArrowField::new(
-                "value",
-                ArrowDataType::try_from(a.get_value_type())?,
-                a.get_value_contains_null(),
+            ArrowDataType::Struct(
+                vec![
+                    ArrowField::new(MAP_KEYS_NAME, ArrowDataType::try_from(a.key_type())?, false),
+                    ArrowField::new(
+                        MAP_VALUES_NAME,
+                        ArrowDataType::try_from(a.value_type())?,
+                        a.value_contains_null(),
+                    ),
+                ]
+                .into(),
             ),
-            false,
-            false,
+            false, // always non-null
         ))
     }
 }
 
-impl TryFrom<&schema::SchemaDataType> for ArrowDataType {
+impl TryFrom<&DataType> for ArrowDataType {
     type Error = ArrowError;
 
-    fn try_from(t: &schema::SchemaDataType) -> Result<Self, ArrowError> {
+    fn try_from(t: &DataType) -> Result<Self, ArrowError> {
         match t {
-            schema::SchemaDataType::primitive(p) => {
-                lazy_static! {
-                    static ref DECIMAL_REGEX: Regex =
-                        Regex::new(r"\((\d{1,2}),(\d{1,2})\)").unwrap();
-                }
-                match p.as_str() {
-                    "string" => Ok(ArrowDataType::Utf8),
-                    "long" => Ok(ArrowDataType::Int64), // undocumented type
-                    "integer" => Ok(ArrowDataType::Int32),
-                    "short" => Ok(ArrowDataType::Int16),
-                    "byte" => Ok(ArrowDataType::Int8),
-                    "float" => Ok(ArrowDataType::Float32),
-                    "double" => Ok(ArrowDataType::Float64),
-                    "boolean" => Ok(ArrowDataType::Boolean),
-                    "binary" => Ok(ArrowDataType::Binary),
-                    decimal if DECIMAL_REGEX.is_match(decimal) => {
-                        let extract = DECIMAL_REGEX.captures(decimal).ok_or_else(|| {
+            DataType::Primitive(p) => {
+                match p {
+                    PrimitiveType::String => Ok(ArrowDataType::Utf8),
+                    PrimitiveType::Long => Ok(ArrowDataType::Int64), // undocumented type
+                    PrimitiveType::Integer => Ok(ArrowDataType::Int32),
+                    PrimitiveType::Short => Ok(ArrowDataType::Int16),
+                    PrimitiveType::Byte => Ok(ArrowDataType::Int8),
+                    PrimitiveType::Float => Ok(ArrowDataType::Float32),
+                    PrimitiveType::Double => Ok(ArrowDataType::Float64),
+                    PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
+                    PrimitiveType::Binary => Ok(ArrowDataType::Binary),
+                    PrimitiveType::Decimal(precision, scale) => {
+                        let precision = u8::try_from(*precision).map_err(|_| {
                             ArrowError::SchemaError(format!(
-                                "Invalid decimal type for Arrow: {decimal}"
+                                "Invalid precision for decimal: {}",
+                                precision
                             ))
                         })?;
-                        let precision = extract.get(1).and_then(|v| v.as_str().parse::<u8>().ok());
-                        let scale = extract.get(2).and_then(|v| v.as_str().parse::<i8>().ok());
-                        match (precision, scale) {
-                            // TODO how do we decide which variant (128 / 256) to use?
-                            (Some(p), Some(s)) => Ok(ArrowDataType::Decimal128(p, s)),
-                            _ => Err(ArrowError::SchemaError(format!(
-                                "Invalid precision or scale decimal type for Arrow: {decimal}"
-                            ))),
+                        let scale = i8::try_from(*scale).map_err(|_| {
+                            ArrowError::SchemaError(format!("Invalid scale for decimal: {}", scale))
+                        })?;
+
+                        if precision <= 38 {
+                            Ok(ArrowDataType::Decimal128(precision, scale))
+                        } else if precision <= 76 {
+                            Ok(ArrowDataType::Decimal256(precision, scale))
+                        } else {
+                            Err(ArrowError::SchemaError(format!(
+                                "Precision too large to be represented in Arrow: {}",
+                                precision
+                            )))
                         }
                     }
-                    "date" => {
+                    PrimitiveType::Date => {
                         // A calendar date, represented as a year-month-day triple without a
-                        // timezone. Stored as 4 bytes integer representing days sinece 1970-01-01
+                        // timezone. Stored as 4 bytes integer representing days since 1970-01-01
                         Ok(ArrowDataType::Date32)
                     }
-                    "timestamp" => {
+                    PrimitiveType::Timestamp => {
                         // Issue: https://github.com/delta-io/delta/issues/643
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
-                    s => Err(ArrowError::SchemaError(format!(
-                        "Invalid data type for Arrow: {s}"
-                    ))),
                 }
             }
-            schema::SchemaDataType::r#struct(s) => Ok(ArrowDataType::Struct(
-                s.get_fields()
+            DataType::Struct(s) => Ok(ArrowDataType::Struct(
+                s.fields()
                     .iter()
-                    .map(<ArrowField as TryFrom<&schema::SchemaField>>::try_from)
+                    .map(<ArrowField as TryFrom<&StructField>>::try_from)
                     .collect::<Result<Vec<ArrowField>, ArrowError>>()?
                     .into(),
             )),
-            schema::SchemaDataType::array(a) => {
-                Ok(ArrowDataType::List(Arc::new(<ArrowField as TryFrom<
-                    &schema::SchemaTypeArray,
-                >>::try_from(
-                    a
-                )?)))
-            }
-            schema::SchemaDataType::map(m) => Ok(ArrowDataType::Map(
+            DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(<ArrowField as TryFrom<
+                &ArrayType,
+            >>::try_from(a)?))),
+            DataType::Map(m) => Ok(ArrowDataType::Map(
                 Arc::new(ArrowField::new(
                     "entries",
                     ArrowDataType::Struct(
                         vec![
                             ArrowField::new(
-                                "keys",
-                                <ArrowDataType as TryFrom<&schema::SchemaDataType>>::try_from(
-                                    m.get_key_type(),
-                                )?,
+                                MAP_KEYS_NAME,
+                                <ArrowDataType as TryFrom<&DataType>>::try_from(m.key_type())?,
                                 false,
                             ),
                             ArrowField::new(
-                                "values",
-                                <ArrowDataType as TryFrom<&schema::SchemaDataType>>::try_from(
-                                    m.get_value_type(),
-                                )?,
-                                m.get_value_contains_null(),
+                                MAP_VALUES_NAME,
+                                <ArrowDataType as TryFrom<&DataType>>::try_from(m.value_type())?,
+                                m.value_contains_null(),
                             ),
                         ]
                         .into(),
@@ -172,19 +170,20 @@ impl TryFrom<&schema::SchemaDataType> for ArrowDataType {
     }
 }
 
-impl TryFrom<&ArrowSchema> for schema::Schema {
+impl TryFrom<&ArrowSchema> for StructType {
     type Error = ArrowError;
+
     fn try_from(arrow_schema: &ArrowSchema) -> Result<Self, ArrowError> {
-        let new_fields: Result<Vec<schema::SchemaField>, _> = arrow_schema
+        let new_fields: Result<Vec<StructField>, _> = arrow_schema
             .fields()
             .iter()
             .map(|field| field.as_ref().try_into())
             .collect();
-        Ok(schema::Schema::new(new_fields?))
+        Ok(StructType::new(new_fields?))
     }
 }
 
-impl TryFrom<ArrowSchemaRef> for schema::Schema {
+impl TryFrom<ArrowSchemaRef> for StructType {
     type Error = ArrowError;
 
     fn try_from(arrow_schema: ArrowSchemaRef) -> Result<Self, ArrowError> {
@@ -192,99 +191,86 @@ impl TryFrom<ArrowSchemaRef> for schema::Schema {
     }
 }
 
-impl TryFrom<&ArrowField> for schema::SchemaField {
+impl TryFrom<&ArrowField> for StructField {
     type Error = ArrowError;
+
     fn try_from(arrow_field: &ArrowField) -> Result<Self, ArrowError> {
-        Ok(schema::SchemaField::new(
+        Ok(StructField::new(
             arrow_field.name().clone(),
             arrow_field.data_type().try_into()?,
             arrow_field.is_nullable(),
-            arrow_field
-                .metadata()
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect(),
-        ))
+        )
+        .with_metadata(arrow_field.metadata().iter().map(|(k, v)| (k.clone(), v))))
     }
 }
 
-impl TryFrom<&ArrowDataType> for schema::SchemaDataType {
+impl TryFrom<&ArrowDataType> for DataType {
     type Error = ArrowError;
+
     fn try_from(arrow_datatype: &ArrowDataType) -> Result<Self, ArrowError> {
         match arrow_datatype {
-            ArrowDataType::Utf8 => Ok(schema::SchemaDataType::primitive("string".to_string())),
-            ArrowDataType::LargeUtf8 => Ok(schema::SchemaDataType::primitive("string".to_string())),
-            ArrowDataType::Int64 => Ok(schema::SchemaDataType::primitive("long".to_string())), // undocumented type
-            ArrowDataType::Int32 => Ok(schema::SchemaDataType::primitive("integer".to_string())),
-            ArrowDataType::Int16 => Ok(schema::SchemaDataType::primitive("short".to_string())),
-            ArrowDataType::Int8 => Ok(schema::SchemaDataType::primitive("byte".to_string())),
-            ArrowDataType::UInt64 => Ok(schema::SchemaDataType::primitive("long".to_string())), // undocumented type
-            ArrowDataType::UInt32 => Ok(schema::SchemaDataType::primitive("integer".to_string())),
-            ArrowDataType::UInt16 => Ok(schema::SchemaDataType::primitive("short".to_string())),
-            ArrowDataType::UInt8 => Ok(schema::SchemaDataType::primitive("byte".to_string())),
-            ArrowDataType::Float32 => Ok(schema::SchemaDataType::primitive("float".to_string())),
-            ArrowDataType::Float64 => Ok(schema::SchemaDataType::primitive("double".to_string())),
-            ArrowDataType::Boolean => Ok(schema::SchemaDataType::primitive("boolean".to_string())),
-            ArrowDataType::Binary => Ok(schema::SchemaDataType::primitive("binary".to_string())),
-            ArrowDataType::FixedSizeBinary(_) => {
-                Ok(schema::SchemaDataType::primitive("binary".to_string()))
-            }
-            ArrowDataType::LargeBinary => {
-                Ok(schema::SchemaDataType::primitive("binary".to_string()))
-            }
-            ArrowDataType::Decimal128(p, s) => Ok(schema::SchemaDataType::primitive(format!(
-                "decimal({p},{s})"
+            ArrowDataType::Utf8 => Ok(DataType::Primitive(PrimitiveType::String)),
+            ArrowDataType::LargeUtf8 => Ok(DataType::Primitive(PrimitiveType::String)),
+            ArrowDataType::Int64 => Ok(DataType::Primitive(PrimitiveType::Long)), // undocumented type
+            ArrowDataType::Int32 => Ok(DataType::Primitive(PrimitiveType::Integer)),
+            ArrowDataType::Int16 => Ok(DataType::Primitive(PrimitiveType::Short)),
+            ArrowDataType::Int8 => Ok(DataType::Primitive(PrimitiveType::Byte)),
+            ArrowDataType::UInt64 => Ok(DataType::Primitive(PrimitiveType::Long)), // undocumented type
+            ArrowDataType::UInt32 => Ok(DataType::Primitive(PrimitiveType::Integer)),
+            ArrowDataType::UInt16 => Ok(DataType::Primitive(PrimitiveType::Short)),
+            ArrowDataType::UInt8 => Ok(DataType::Primitive(PrimitiveType::Boolean)),
+            ArrowDataType::Float32 => Ok(DataType::Primitive(PrimitiveType::Float)),
+            ArrowDataType::Float64 => Ok(DataType::Primitive(PrimitiveType::Double)),
+            ArrowDataType::Boolean => Ok(DataType::Primitive(PrimitiveType::Boolean)),
+            ArrowDataType::Binary => Ok(DataType::Primitive(PrimitiveType::Binary)),
+            ArrowDataType::FixedSizeBinary(_) => Ok(DataType::Primitive(PrimitiveType::Binary)),
+            ArrowDataType::LargeBinary => Ok(DataType::Primitive(PrimitiveType::Binary)),
+            ArrowDataType::Decimal128(p, s) => Ok(DataType::Primitive(PrimitiveType::Decimal(
+                *p as i32, *s as i32,
             ))),
-            ArrowDataType::Decimal256(p, s) => Ok(schema::SchemaDataType::primitive(format!(
-                "decimal({p},{s})"
+            ArrowDataType::Decimal256(p, s) => Ok(DataType::Primitive(PrimitiveType::Decimal(
+                *p as i32, *s as i32,
             ))),
-            ArrowDataType::Date32 => Ok(schema::SchemaDataType::primitive("date".to_string())),
-            ArrowDataType::Date64 => Ok(schema::SchemaDataType::primitive("date".to_string())),
+            ArrowDataType::Date32 => Ok(DataType::Primitive(PrimitiveType::Date)),
+            ArrowDataType::Date64 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {
-                Ok(schema::SchemaDataType::primitive("timestamp".to_string()))
+                Ok(DataType::Primitive(PrimitiveType::Timestamp))
             }
             ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz))
                 if tz.eq_ignore_ascii_case("utc") =>
             {
-                Ok(schema::SchemaDataType::primitive("timestamp".to_string()))
+                Ok(DataType::Primitive(PrimitiveType::Timestamp))
             }
             ArrowDataType::Struct(fields) => {
-                let converted_fields: Result<Vec<schema::SchemaField>, _> = fields
+                let converted_fields: Result<Vec<StructField>, _> = fields
                     .iter()
                     .map(|field| field.as_ref().try_into())
                     .collect();
-                Ok(schema::SchemaDataType::r#struct(
-                    schema::SchemaTypeStruct::new(converted_fields?),
-                ))
+                Ok(DataType::Struct(Box::new(StructType::new(
+                    converted_fields?,
+                ))))
             }
-            ArrowDataType::List(field) => {
-                Ok(schema::SchemaDataType::array(schema::SchemaTypeArray::new(
-                    Box::new((*field).data_type().try_into()?),
-                    (*field).is_nullable(),
-                )))
-            }
-            ArrowDataType::LargeList(field) => {
-                Ok(schema::SchemaDataType::array(schema::SchemaTypeArray::new(
-                    Box::new((*field).data_type().try_into()?),
-                    (*field).is_nullable(),
-                )))
-            }
-            ArrowDataType::FixedSizeList(field, _) => {
-                Ok(schema::SchemaDataType::array(schema::SchemaTypeArray::new(
-                    Box::new((*field).data_type().try_into()?),
-                    (*field).is_nullable(),
-                )))
-            }
+            ArrowDataType::List(field) => Ok(DataType::Array(Box::new(ArrayType::new(
+                (*field).data_type().try_into()?,
+                (*field).is_nullable(),
+            )))),
+            ArrowDataType::LargeList(field) => Ok(DataType::Array(Box::new(ArrayType::new(
+                (*field).data_type().try_into()?,
+                (*field).is_nullable(),
+            )))),
+            ArrowDataType::FixedSizeList(field, _) => Ok(DataType::Array(Box::new(
+                ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()),
+            ))),
             ArrowDataType::Map(field, _) => {
                 if let ArrowDataType::Struct(struct_fields) = field.data_type() {
                     let key_type = struct_fields[0].data_type().try_into()?;
                     let value_type = struct_fields[1].data_type().try_into()?;
                     let value_type_nullable = struct_fields[1].is_nullable();
-                    Ok(schema::SchemaDataType::map(schema::SchemaTypeMap::new(
-                        Box::new(key_type),
-                        Box::new(value_type),
+                    Ok(DataType::Map(Box::new(MapType::new(
+                        key_type,
+                        value_type,
                         value_type_nullable,
-                    )))
+                    ))))
                 } else {
                     panic!("DataType::Map should contain a struct field child");
                 }
@@ -637,7 +623,6 @@ fn null_count_schema_for_fields(dest: &mut Vec<ArrowField>, f: &ArrowField) {
 #[cfg(test)]
 mod tests {
     use arrow::array::ArrayData;
-    use arrow::datatypes::DataType;
     use arrow_array::Array;
     use arrow_array::{make_array, ArrayRef, MapArray, StringArray, StructArray};
     use arrow_buffer::{Buffer, ToByteSlice};
@@ -792,33 +777,18 @@ mod tests {
     fn test_arrow_from_delta_decimal_type() {
         let precision = 20;
         let scale = 2;
-        let decimal_type = format!["decimal({precision},{scale})"];
-        let decimal_field = crate::SchemaDataType::primitive(decimal_type);
+        let decimal_field = DataType::Primitive(PrimitiveType::Decimal(precision, scale));
         assert_eq!(
-            <ArrowDataType as TryFrom<&crate::SchemaDataType>>::try_from(&decimal_field).unwrap(),
-            ArrowDataType::Decimal128(precision, scale)
+            <ArrowDataType as TryFrom<&DataType>>::try_from(&decimal_field).unwrap(),
+            ArrowDataType::Decimal128(precision as u8, scale as i8)
         );
     }
 
     #[test]
-    fn test_arrow_from_delta_wrong_decimal_type() {
-        let precision = 20;
-        let scale = "wrong";
-        let decimal_type = format!["decimal({precision},{scale})"];
-        let _error = format!("Invalid precision or scale decimal type for Arrow: {scale}");
-        let decimal_field = crate::SchemaDataType::primitive(decimal_type);
-        assert!(matches!(
-            <ArrowDataType as TryFrom<&crate::SchemaDataType>>::try_from(&decimal_field)
-                .unwrap_err(),
-            arrow::error::ArrowError::SchemaError(_error),
-        ));
-    }
-
-    #[test]
     fn test_arrow_from_delta_timestamp_type() {
-        let timestamp_field = crate::SchemaDataType::primitive("timestamp".to_string());
+        let timestamp_field = DataType::Primitive(PrimitiveType::Timestamp);
         assert_eq!(
-            <ArrowDataType as TryFrom<&crate::SchemaDataType>>::try_from(&timestamp_field).unwrap(),
+            <ArrowDataType as TryFrom<&DataType>>::try_from(&timestamp_field).unwrap(),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None)
         );
     }
@@ -827,8 +797,8 @@ mod tests {
     fn test_delta_from_arrow_timestamp_type() {
         let timestamp_field = ArrowDataType::Timestamp(TimeUnit::Microsecond, None);
         assert_eq!(
-            <crate::SchemaDataType as TryFrom<&ArrowDataType>>::try_from(&timestamp_field).unwrap(),
-            crate::SchemaDataType::primitive("timestamp".to_string())
+            <DataType as TryFrom<&ArrowDataType>>::try_from(&timestamp_field).unwrap(),
+            DataType::Primitive(PrimitiveType::Timestamp)
         );
     }
 
@@ -837,8 +807,8 @@ mod tests {
         let timestamp_field =
             ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".to_string().into()));
         assert_eq!(
-            <crate::SchemaDataType as TryFrom<&ArrowDataType>>::try_from(&timestamp_field).unwrap(),
-            crate::SchemaDataType::primitive("timestamp".to_string())
+            <DataType as TryFrom<&ArrowDataType>>::try_from(&timestamp_field).unwrap(),
+            DataType::Primitive(PrimitiveType::Timestamp)
         );
     }
 
@@ -858,15 +828,15 @@ mod tests {
             )),
             false,
         );
-        let converted_map: crate::SchemaDataType = (&arrow_map).try_into().unwrap();
+        let converted_map: DataType = (&arrow_map).try_into().unwrap();
 
         assert_eq!(
             converted_map,
-            crate::SchemaDataType::map(crate::SchemaTypeMap::new(
-                Box::new(crate::SchemaDataType::primitive("byte".to_string())),
-                Box::new(crate::SchemaDataType::primitive("binary".to_string())),
+            DataType::Map(Box::new(MapType::new(
+                DataType::Primitive(PrimitiveType::Byte),
+                DataType::Primitive(PrimitiveType::Binary),
                 true,
-            ))
+            )))
         );
     }
 
@@ -893,7 +863,7 @@ mod tests {
             let entry_offsets_buffer = Buffer::from(entry_offsets.to_byte_slice());
             let keys_data = StringArray::from_iter_values(keys);
 
-            let keys_field = Arc::new(Field::new("keys", DataType::Utf8, false));
+            let keys_field = Arc::new(Field::new("keys", ArrowDataType::Utf8, false));
             let values_field = Arc::new(Field::new(
                 "values",
                 values.data_type().clone(),
@@ -905,7 +875,7 @@ mod tests {
                 (values_field, make_array(values.to_data())),
             ]);
 
-            let map_data_type = DataType::Map(
+            let map_data_type = ArrowDataType::Map(
                 Arc::new(Field::new(
                     "entries",
                     entry_struct.data_type().clone(),
@@ -930,19 +900,19 @@ mod tests {
         )
         .expect("Could not create a map array");
 
-        let schema = <arrow::datatypes::Schema as TryFrom<&crate::Schema>>::try_from(
-            &crate::Schema::new(vec![crate::SchemaField::new(
-                "example".to_string(),
-                crate::SchemaDataType::map(crate::SchemaTypeMap::new(
-                    Box::new(crate::SchemaDataType::primitive("string".to_string())),
-                    Box::new(crate::SchemaDataType::primitive("binary".to_string())),
+        let schema =
+            <arrow::datatypes::Schema as TryFrom<&StructType>>::try_from(&StructType::new(vec![
+                StructField::new(
+                    "example".to_string(),
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::Primitive(PrimitiveType::String),
+                        DataType::Primitive(PrimitiveType::Binary),
+                        false,
+                    ))),
                     false,
-                )),
-                false,
-                HashMap::new(),
-            )]),
-        )
-        .expect("Could not get schema");
+                ),
+            ]))
+            .expect("Could not get schema");
 
         let record_batch =
             arrow::record_batch::RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)])
@@ -1083,6 +1053,6 @@ mod tests {
             ),
             true,
         ));
-        let _converted: schema::SchemaField = field.as_ref().try_into().unwrap();
+        let _converted: StructField = field.as_ref().try_into().unwrap();
     }
 }

@@ -2,10 +2,15 @@
 
 use std::convert::TryFrom;
 
-use super::SchemaDataType;
+use chrono::{NaiveDateTime, ParseResult};
+
 use crate::errors::DeltaTableError;
+use crate::kernel::{DataType, PrimitiveType};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+
+/// A special value used in Hive to represent the null partition in partitioned tables
+pub const NULL_PARTITION_VALUE_DATA_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
 
 /// A Enum used for selecting the partition value operation when filtering a DeltaTable partition.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,23 +42,40 @@ pub struct PartitionFilter {
     pub value: PartitionValue,
 }
 
+fn parse_timestamp(timestamp_str: &str) -> ParseResult<NaiveDateTime> {
+    // Timestamp format as per https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+    let format = "%Y-%m-%d %H:%M:%S%.f";
+
+    NaiveDateTime::parse_from_str(timestamp_str, format)
+}
+
 fn compare_typed_value(
     partition_value: &str,
     filter_value: &str,
-    data_type: &SchemaDataType,
+    data_type: &DataType,
 ) -> Option<Ordering> {
     match data_type {
-        SchemaDataType::primitive(primitive_type) => match primitive_type.as_str() {
-            "long" | "integer" | "short" | "byte" => match filter_value.parse::<i64>() {
+        DataType::Primitive(primitive_type) => match primitive_type {
+            PrimitiveType::Long
+            | PrimitiveType::Integer
+            | PrimitiveType::Short
+            | PrimitiveType::Byte => match filter_value.parse::<i64>() {
                 Ok(parsed_filter_value) => {
                     let parsed_partition_value = partition_value.parse::<i64>().unwrap();
                     parsed_partition_value.partial_cmp(&parsed_filter_value)
                 }
                 _ => None,
             },
-            "float" | "double" => match filter_value.parse::<f64>() {
+            PrimitiveType::Float | PrimitiveType::Double => match filter_value.parse::<f64>() {
                 Ok(parsed_filter_value) => {
                     let parsed_partition_value = partition_value.parse::<f64>().unwrap();
+                    parsed_partition_value.partial_cmp(&parsed_filter_value)
+                }
+                _ => None,
+            },
+            PrimitiveType::Timestamp => match parse_timestamp(filter_value) {
+                Ok(parsed_filter_value) => {
+                    let parsed_partition_value = parse_timestamp(partition_value).unwrap();
                     parsed_partition_value.partial_cmp(&parsed_filter_value)
                 }
                 _ => None,
@@ -67,18 +89,30 @@ fn compare_typed_value(
 /// Partition filters methods for filtering the DeltaTable partitions.
 impl PartitionFilter {
     /// Indicates if a DeltaTable partition matches with the partition filter by key and value.
-    pub fn match_partition(
-        &self,
-        partition: &DeltaTablePartition,
-        data_type: &SchemaDataType,
-    ) -> bool {
+    pub fn match_partition(&self, partition: &DeltaTablePartition, data_type: &DataType) -> bool {
         if self.key != partition.key {
             return false;
         }
 
         match &self.value {
-            PartitionValue::Equal(value) => value == &partition.value,
-            PartitionValue::NotEqual(value) => value != &partition.value,
+            PartitionValue::Equal(value) => {
+                if let DataType::Primitive(PrimitiveType::Timestamp) = data_type {
+                    compare_typed_value(&partition.value, value, data_type)
+                        .map(|x| x.is_eq())
+                        .unwrap_or(false)
+                } else {
+                    value == &partition.value
+                }
+            }
+            PartitionValue::NotEqual(value) => {
+                if let DataType::Primitive(PrimitiveType::Timestamp) = data_type {
+                    compare_typed_value(&partition.value, value, data_type)
+                        .map(|x| !x.is_eq())
+                        .unwrap_or(false)
+                } else {
+                    value != &partition.value
+                }
+            }
             PartitionValue::GreaterThan(value) => {
                 compare_typed_value(&partition.value, value, data_type)
                     .map(|x| x.is_gt())
@@ -109,12 +143,9 @@ impl PartitionFilter {
     pub fn match_partitions(
         &self,
         partitions: &[DeltaTablePartition],
-        partition_col_data_types: &HashMap<&str, &SchemaDataType>,
+        partition_col_data_types: &HashMap<&String, &DataType>,
     ) -> bool {
-        let data_type = partition_col_data_types
-            .get(self.key.as_str())
-            .unwrap()
-            .to_owned();
+        let data_type = partition_col_data_types.get(&self.key).unwrap().to_owned();
         partitions
             .iter()
             .any(|partition| self.match_partition(partition, data_type))

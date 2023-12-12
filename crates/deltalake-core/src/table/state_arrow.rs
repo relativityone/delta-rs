@@ -16,11 +16,11 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Fields, TimeUnit};
 use itertools::Itertools;
 
+use super::config::ColumnMappingMode;
 use super::state::DeltaTableState;
 use crate::errors::DeltaTableError;
+use crate::kernel::{DataType as DeltaDataType, StructType};
 use crate::protocol::{ColumnCountStat, ColumnValueStat, Stats};
-use crate::SchemaDataType;
-use crate::SchemaTypeStruct;
 
 impl DeltaTableState {
     /// Get an [arrow::record_batch::RecordBatch] containing add action data.
@@ -86,7 +86,7 @@ impl DeltaTableState {
             (Cow::Borrowed("data_change"), Arc::new(data_change)),
         ];
 
-        let metadata = self.current_metadata().ok_or(DeltaTableError::NoMetadata)?;
+        let metadata = self.metadata().ok_or(DeltaTableError::NoMetadata)?;
 
         if !metadata.partition_columns.is_empty() {
             let partition_cols_batch = self.partition_columns_as_batch(flatten)?;
@@ -145,15 +145,15 @@ impl DeltaTableState {
         &self,
         flatten: bool,
     ) -> Result<arrow::record_batch::RecordBatch, DeltaTableError> {
-        let metadata = self.current_metadata().ok_or(DeltaTableError::NoMetadata)?;
-
+        let metadata = self.metadata().ok_or(DeltaTableError::NoMetadata)?;
+        let column_mapping_mode = self.table_config().column_mapping_mode();
         let partition_column_types: Vec<arrow::datatypes::DataType> = metadata
             .partition_columns
             .iter()
             .map(
                 |name| -> Result<arrow::datatypes::DataType, DeltaTableError> {
-                    let field = metadata.schema.get_field_with_name(name)?;
-                    Ok(field.get_type().try_into()?)
+                    let field = metadata.schema.field_with_name(name)?;
+                    Ok(field.data_type().try_into()?)
                 },
             )
             .collect::<Result<_, DeltaTableError>>()?;
@@ -168,13 +168,44 @@ impl DeltaTableState {
             })
             .collect::<HashMap<&str, _>>();
 
+        let physical_name_to_logical_name = match column_mapping_mode {
+            ColumnMappingMode::None => HashMap::with_capacity(0), // No column mapping, no need for this HashMap
+            ColumnMappingMode::Id | ColumnMappingMode::Name => metadata
+                .partition_columns
+                .iter()
+                .map(|name| -> Result<_, DeltaTableError> {
+                    let physical_name = metadata
+                        .schema
+                        .field_with_name(name)
+                        .or(Err(DeltaTableError::MetadataError(format!(
+                            "Invalid partition column {0}",
+                            name
+                        ))))?
+                        .physical_name()
+                        .map_err(|e| DeltaTableError::Kernel { source: e })?;
+                    Ok((physical_name, name.as_str()))
+                })
+                .collect::<Result<HashMap<&str, &str>, DeltaTableError>>()?,
+        };
         // Append values
         for action in self.files() {
             for (name, maybe_value) in action.partition_values.iter() {
+                let logical_name = match column_mapping_mode {
+                    ColumnMappingMode::None => name.as_str(),
+                    ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                        physical_name_to_logical_name.get(name.as_str()).ok_or(
+                            DeltaTableError::MetadataError(format!(
+                                "Invalid partition column {0}",
+                                name
+                            )),
+                        )?
+                    }
+                };
                 if let Some(value) = maybe_value {
-                    builders.get_mut(name.as_str()).unwrap().append_value(value);
+                    builders.get_mut(logical_name).unwrap().append_value(value);
+                // Unwrap is safe here since the name exists in the mapping where we check validity already
                 } else {
-                    builders.get_mut(name.as_str()).unwrap().append_null();
+                    builders.get_mut(logical_name).unwrap().append_null();
                 }
             }
         }
@@ -299,7 +330,7 @@ impl DeltaTableState {
 
         for add in self.files() {
             if let Some(value) = &add.deletion_vector {
-                storage_type.append_value(value.storage_type.to_string());
+                storage_type.append_value(&value.storage_type);
                 path_or_inline_div.append_value(value.path_or_inline_dv.clone());
                 if let Some(ofs) = value.offset {
                     offset.append_value(ofs);
@@ -382,7 +413,7 @@ impl DeltaTableState {
                 .map(|maybe_stat| maybe_stat.as_ref().map(|stat| stat.num_records))
                 .collect::<Vec<Option<i64>>>(),
         );
-        let metadata = self.current_metadata().ok_or(DeltaTableError::NoMetadata)?;
+        let metadata = self.metadata().ok_or(DeltaTableError::NoMetadata)?;
         let schema = &metadata.schema;
 
         #[derive(Debug)]
@@ -415,7 +446,7 @@ impl DeltaTableState {
         };
 
         let mut columnar_stats: Vec<ColStats> = SchemaLeafIterator::new(schema)
-            .filter(|(_path, datatype)| !matches!(datatype, SchemaDataType::r#struct(_)))
+            .filter(|(_path, datatype)| !matches!(datatype, DeltaDataType::Struct(_)))
             .map(|(path, datatype)| -> Result<ColStats, DeltaTableError> {
                 let null_count = stats
                     .iter()
@@ -432,7 +463,7 @@ impl DeltaTableState {
                 let arrow_type: arrow::datatypes::DataType = datatype.try_into()?;
 
                 // Min and max are collected for primitive values, not list or maps
-                let min_values = if matches!(datatype, SchemaDataType::primitive(_)) {
+                let min_values = if matches!(datatype, DeltaDataType::Primitive(_)) {
                     let min_values = stats
                         .iter()
                         .flat_map(|maybe_stat| {
@@ -449,7 +480,7 @@ impl DeltaTableState {
                     None
                 };
 
-                let max_values = if matches!(datatype, SchemaDataType::primitive(_)) {
+                let max_values = if matches!(datatype, DeltaDataType::Primitive(_)) {
                     let max_values = stats
                         .iter()
                         .flat_map(|maybe_stat| {
@@ -636,33 +667,33 @@ fn resolve_column_count_stat(
 }
 
 struct SchemaLeafIterator<'a> {
-    fields_remaining: VecDeque<(Vec<&'a str>, &'a SchemaDataType)>,
+    fields_remaining: VecDeque<(Vec<&'a str>, &'a DeltaDataType)>,
 }
 
 impl<'a> SchemaLeafIterator<'a> {
-    fn new(schema: &'a SchemaTypeStruct) -> Self {
+    fn new(schema: &'a StructType) -> Self {
         SchemaLeafIterator {
             fields_remaining: schema
-                .get_fields()
+                .fields()
                 .iter()
-                .map(|field| (vec![field.get_name()], field.get_type()))
+                .map(|field| (vec![field.name().as_ref()], field.data_type()))
                 .collect(),
         }
     }
 }
 
 impl<'a> std::iter::Iterator for SchemaLeafIterator<'a> {
-    type Item = (Vec<&'a str>, &'a SchemaDataType);
+    type Item = (Vec<&'a str>, &'a DeltaDataType);
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some((path, datatype)) = self.fields_remaining.pop_front() {
-            if let SchemaDataType::r#struct(struct_type) = datatype {
+            if let DeltaDataType::Struct(struct_type) = datatype {
                 // push child fields to front
-                for field in struct_type.get_fields() {
+                for field in struct_type.fields() {
                     let mut new_path = path.clone();
-                    new_path.push(field.get_name());
+                    new_path.push(field.name());
                     self.fields_remaining
-                        .push_front((new_path, field.get_type()));
+                        .push_front((new_path, field.data_type()));
                 }
             };
 

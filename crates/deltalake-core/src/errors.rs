@@ -205,6 +205,15 @@ pub enum DeltaTableError {
         /// Source error
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
+
+    #[error("Kernel: {source}")]
+    Kernel {
+        #[from]
+        source: crate::kernel::Error,
+    },
+
+    #[error("Table metadata is invalid: {0}")]
+    MetadataError(String),
 }
 
 impl From<object_store::path::Error> for DeltaTableError {

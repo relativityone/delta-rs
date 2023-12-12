@@ -3,7 +3,6 @@
 use deltalake_core::test_utils::{IntegrationContext, StorageIntegration, TestResult, TestTables};
 use deltalake_core::{DeltaTableBuilder, ObjectStore};
 #[cfg(any(feature = "s3", feature = "s3-native-tls"))]
-use dynamodb_lock::dynamo_lock_options;
 #[cfg(any(feature = "s3", feature = "s3-native-tls"))]
 use maplit::hashmap;
 use object_store::path::Path;
@@ -60,7 +59,7 @@ mod local {
         assert_eq!(table.get_files(), vec![Path::from(a.path.clone())]);
 
         // Remove added file.
-        let r = deltalake::protocol::Remove {
+        let r = deltalake_core::kernel::Remove {
             path: a.path.clone(),
             deletion_timestamp: Some(chrono::Utc::now().timestamp_millis()),
             data_change: false,
@@ -69,6 +68,8 @@ mod local {
             size: None,
             tags: None,
             deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
         };
 
         assert_eq!(2, fs_common::commit_removes(&mut table, vec![&r]).await);
@@ -153,7 +154,8 @@ async fn verify_store(integration: &IntegrationContext, root_path: &str) -> Test
     let table_uri = format!("{}/{}", integration.root_uri(), root_path);
     let storage = DeltaTableBuilder::from_uri(table_uri.clone())
         .with_allow_http(true)
-        .build_storage()?;
+        .build_storage()?
+        .object_store();
 
     let files = storage.list_with_delimiter(None).await?;
     assert_eq!(
@@ -186,9 +188,10 @@ async fn read_simple_table(integration: &IntegrationContext) -> TestResult {
     let table_uri = integration.uri_for_table(TestTables::Simple);
     // the s3 options don't hurt us for other integrations ...
     #[cfg(any(feature = "s3", feature = "s3-native-tls"))]
-    let table = DeltaTableBuilder::from_uri(table_uri).with_allow_http(true).with_storage_options(hashmap! {
-        dynamo_lock_options::DYNAMO_LOCK_OWNER_NAME.to_string() => "s3::deltars/simple".to_string(),
-    }).load().await?;
+    let table = DeltaTableBuilder::from_uri(table_uri)
+        .with_allow_http(true)
+        .load()
+        .await?;
     #[cfg(not(any(feature = "s3", feature = "s3-native-tls")))]
     let table = DeltaTableBuilder::from_uri(table_uri)
         .with_allow_http(true)
@@ -196,8 +199,8 @@ async fn read_simple_table(integration: &IntegrationContext) -> TestResult {
         .await?;
 
     assert_eq!(table.version(), 4);
-    assert_eq!(table.get_min_writer_version(), 2);
-    assert_eq!(table.get_min_reader_version(), 1);
+    assert_eq!(table.protocol().min_writer_version, 2);
+    assert_eq!(table.protocol().min_reader_version, 1);
     assert_eq!(
         table.get_files(),
         vec![
@@ -210,12 +213,17 @@ async fn read_simple_table(integration: &IntegrationContext) -> TestResult {
     );
     let tombstones = table.get_state().all_tombstones();
     assert_eq!(tombstones.len(), 31);
-    assert!(tombstones.contains(&deltalake::protocol::Remove {
+    assert!(tombstones.contains(&deltalake_core::kernel::Remove {
         path: "part-00006-63ce9deb-bc0f-482d-b9a1-7e717b67f294-c000.snappy.parquet".to_string(),
         deletion_timestamp: Some(1587968596250),
         data_change: true,
         extended_file_metadata: None,
-        ..Default::default()
+        deletion_vector: None,
+        base_row_id: None,
+        default_row_commit_version: None,
+        size: None,
+        partition_values: None,
+        tags: None,
     }));
 
     Ok(())
@@ -231,8 +239,8 @@ async fn read_simple_table_with_version(integration: &IntegrationContext) -> Tes
         .await?;
 
     assert_eq!(table.version(), 3);
-    assert_eq!(table.get_min_writer_version(), 2);
-    assert_eq!(table.get_min_reader_version(), 1);
+    assert_eq!(table.protocol().min_writer_version, 2);
+    assert_eq!(table.protocol().min_reader_version, 1);
     assert_eq!(
         table.get_files(),
         vec![
@@ -246,11 +254,17 @@ async fn read_simple_table_with_version(integration: &IntegrationContext) -> Tes
     );
     let tombstones = table.get_state().all_tombstones();
     assert_eq!(tombstones.len(), 29);
-    assert!(tombstones.contains(&deltalake::protocol::Remove {
+    assert!(tombstones.contains(&deltalake_core::kernel::Remove {
         path: "part-00006-63ce9deb-bc0f-482d-b9a1-7e717b67f294-c000.snappy.parquet".to_string(),
         deletion_timestamp: Some(1587968596250),
         data_change: true,
-        ..Default::default()
+        tags: None,
+        partition_values: None,
+        base_row_id: None,
+        default_row_commit_version: None,
+        size: None,
+        deletion_vector: None,
+        extended_file_metadata: None,
     }));
 
     Ok(())
@@ -266,8 +280,8 @@ async fn read_golden(integration: &IntegrationContext) -> TestResult {
         .unwrap();
 
     assert_eq!(table.version(), 0);
-    assert_eq!(table.get_min_writer_version(), 2);
-    assert_eq!(table.get_min_reader_version(), 1);
+    assert_eq!(table.protocol().min_writer_version, 2);
+    assert_eq!(table.protocol().min_reader_version, 1);
 
     Ok(())
 }
@@ -291,12 +305,12 @@ mod gcs {
     #[tokio::test]
     async fn test_gcs_simple() {
         let bucket = std::env::var("GCS_DELTA_BUCKET").unwrap();
-        let table = deltalake::open_table(format!("gs://{}/simple_table", bucket).as_str())
+        let table = deltalake_core::open_table(format!("gs://{}/simple_table", bucket).as_str())
             .await
             .unwrap();
         assert_eq!(table.version(), 4);
-        assert_eq!(table.get_min_writer_version(), 2);
-        assert_eq!(table.get_min_reader_version(), 1);
+        assert_eq!(table.protocol().min_writer_version, 2);
+        assert_eq!(table.protocol().min_reader_version, 1);
         assert_eq!(
             table.get_files(),
             vec![
@@ -309,11 +323,17 @@ mod gcs {
         );
         let tombstones = table.get_state().all_tombstones();
         assert_eq!(tombstones.len(), 31);
-        assert!(tombstones.contains(&deltalake::protocol::Remove {
+        assert!(tombstones.contains(&deltalake_core::kernel::Remove {
             path: "part-00006-63ce9deb-bc0f-482d-b9a1-7e717b67f294-c000.snappy.parquet".to_string(),
             deletion_timestamp: Some(1587968596250),
             data_change: true,
-            ..Default::default()
+            extended_file_metadata: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            size: None,
+            partition_values: None,
+            tags: None,
         }));
     }
 }

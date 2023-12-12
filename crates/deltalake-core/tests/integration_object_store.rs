@@ -50,6 +50,7 @@ async fn test_object_store_onelake_abfs() -> TestResult {
 
 #[cfg(feature = "s3")]
 #[tokio::test]
+#[ignore = "S3 does not support rename_if_not_exists"]
 #[serial]
 async fn test_object_store_aws() -> TestResult {
     test_object_store(StorageIntegration::Amazon, true).await?;
@@ -81,7 +82,8 @@ async fn read_write_test_onelake(integration: StorageIntegration, path: &Path) -
 
     let delta_store = DeltaTableBuilder::from_uri(&context.root_uri())
         .with_allow_http(true)
-        .build_storage()?;
+        .build_storage()?
+        .object_store();
 
     //println!("{:#?}",delta_store);
 
@@ -103,7 +105,8 @@ async fn test_object_store(integration: StorageIntegration, skip_copy: bool) -> 
     let context = IntegrationContext::new(integration)?;
     let delta_store = DeltaTableBuilder::from_uri(context.root_uri())
         .with_allow_http(true)
-        .build_storage()?;
+        .build_storage()?
+        .object_store();
 
     put_get_delete_list(delta_store.as_ref()).await?;
     list_with_delimiter(delta_store.as_ref()).await?;
@@ -482,7 +485,8 @@ async fn test_object_store_prefixes(integration: StorageIntegration) -> TestResu
         let rooturi = format!("{}/{}", context.root_uri(), prefix);
         let delta_store = DeltaTableBuilder::from_uri(&rooturi)
             .with_allow_http(true)
-            .build_storage()?;
+            .build_storage()?
+            .object_store();
 
         let contents = Bytes::from("cats");
         let path = Path::from("test");

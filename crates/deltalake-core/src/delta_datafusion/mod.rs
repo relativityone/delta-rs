@@ -22,7 +22,6 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
@@ -56,6 +55,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use datafusion_common::scalar::ScalarValue;
+use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
 use datafusion_common::{Column, DataFusionError, Result as DataFusionResult, ToDFSchema};
 use datafusion_expr::expr::{ScalarFunction, ScalarUDF};
@@ -65,20 +65,24 @@ use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use log::error;
 use object_store::ObjectMeta;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::errors::{DeltaResult, DeltaTableError};
-use crate::protocol::{self, Add};
-use crate::storage::ObjectStoreRef;
+use crate::kernel::{Add, DataType as DeltaDataType, Invariant, PrimitiveType};
+use crate::logstore::LogStoreRef;
+use crate::protocol::{ColumnCountStat, ColumnValueStat};
 use crate::table::builder::ensure_table_uri;
 use crate::table::state::DeltaTableState;
-use crate::{open_table, open_table_with_storage_options, DeltaTable, Invariant, SchemaDataType};
+use crate::{open_table, open_table_with_storage_options, DeltaTable};
 
 const PATH_COLUMN: &str = "__delta_rs_path";
 
 pub mod expr;
+pub mod logical;
+pub mod physical;
 
 impl From<DeltaTableError> for DataFusionError {
     fn from(err: DeltaTableError) -> Self {
@@ -104,152 +108,128 @@ impl From<DataFusionError> for DeltaTableError {
     }
 }
 
-impl DeltaTableState {
-    /// Return statistics for Datafusion Table
-    pub fn datafusion_table_statistics(&self) -> Statistics {
-        let stats = self
-            .files()
-            .iter()
-            .try_fold(
-                Statistics {
-                    num_rows: Some(0),
-                    total_byte_size: Some(0),
-                    column_statistics: Some(vec![
-                        ColumnStatistics {
-                            null_count: Some(0),
-                            max_value: None,
-                            min_value: None,
-                            distinct_count: None
-                        };
-                        self.schema().unwrap().get_fields().len()
-                    ]),
-                    is_exact: true,
-                },
-                |acc, action| {
-                    let new_stats = action
-                        .get_stats()
-                        .unwrap_or_else(|_| Some(protocol::Stats::default()))?;
-                    Some(Statistics {
-                        num_rows: acc
-                            .num_rows
-                            .map(|rows| rows + new_stats.num_records as usize),
-                        total_byte_size: acc
-                            .total_byte_size
-                            .map(|total_size| total_size + action.size as usize),
-                        column_statistics: acc.column_statistics.map(|col_stats| {
-                            self.schema()
-                                .unwrap()
-                                .get_fields()
-                                .iter()
-                                .zip(col_stats)
-                                .map(|(field, stats)| {
-                                    let null_count = new_stats
-                                        .null_count
-                                        .get(field.get_name())
-                                        .and_then(|x| {
-                                            let null_count_acc = stats.null_count?;
-                                            let null_count = x.as_value()? as usize;
-                                            Some(null_count_acc + null_count)
-                                        })
-                                        .or(stats.null_count);
-
-                                    let max_value = new_stats
-                                        .max_values
-                                        .get(field.get_name())
-                                        .and_then(|x| {
-                                            let old_stats = stats.clone();
-                                            let max_value = to_scalar_value(x.as_value()?);
-
-                                            match (max_value, old_stats.max_value) {
-                                                (Some(max_value), Some(old_max_value)) => {
-                                                    if left_larger_than_right(
-                                                        old_max_value.clone(),
-                                                        max_value.clone(),
-                                                    )? {
-                                                        Some(old_max_value)
-                                                    } else {
-                                                        Some(max_value)
-                                                    }
-                                                }
-                                                (Some(max_value), None) => Some(max_value),
-                                                (None, old) => old,
-                                            }
-                                        })
-                                        .or_else(|| stats.max_value.clone());
-
-                                    let min_value = new_stats
-                                        .min_values
-                                        .get(field.get_name())
-                                        .and_then(|x| {
-                                            let old_stats = stats.clone();
-                                            let min_value = to_scalar_value(x.as_value()?);
-
-                                            match (min_value, old_stats.min_value) {
-                                                (Some(min_value), Some(old_min_value)) => {
-                                                    if left_larger_than_right(
-                                                        min_value.clone(),
-                                                        old_min_value.clone(),
-                                                    )? {
-                                                        Some(old_min_value)
-                                                    } else {
-                                                        Some(min_value)
-                                                    }
-                                                }
-                                                (Some(min_value), None) => Some(min_value),
-                                                (None, old) => old,
-                                            }
-                                        })
-                                        .or_else(|| stats.min_value.clone());
-
-                                    ColumnStatistics {
-                                        null_count,
-                                        max_value,
-                                        min_value,
-                                        distinct_count: None, // TODO: distinct
-                                    }
-                                })
-                                .collect()
-                        }),
-                        is_exact: true,
-                    })
-                },
-            )
-            .unwrap_or_default();
-
-        // Convert column max/min scalar values to correct types based on arrow types.
-        Statistics {
-            is_exact: true,
-            num_rows: stats.num_rows,
-            total_byte_size: stats.total_byte_size,
-            column_statistics: stats.column_statistics.map(|col_stats| {
-                let fields = self.schema().unwrap().get_fields();
-                col_stats
-                    .iter()
-                    .zip(fields)
-                    .map(|(col_states, field)| {
-                        let dt = self
-                            .arrow_schema()
-                            .unwrap()
-                            .field_with_name(field.get_name())
-                            .unwrap()
-                            .data_type()
-                            .clone();
-                        ColumnStatistics {
-                            null_count: col_states.null_count,
-                            max_value: col_states
-                                .max_value
-                                .as_ref()
-                                .and_then(|scalar| correct_scalar_value_type(scalar.clone(), &dt)),
-                            min_value: col_states
-                                .min_value
-                                .as_ref()
-                                .and_then(|scalar| correct_scalar_value_type(scalar.clone(), &dt)),
-                            distinct_count: col_states.distinct_count,
-                        }
-                    })
-                    .collect()
+fn get_scalar_value(value: Option<&ColumnValueStat>, field: &Arc<Field>) -> Precision<ScalarValue> {
+    match value {
+        Some(ColumnValueStat::Value(value)) => to_correct_scalar_value(value, field.data_type())
+            .map(|maybe_scalar| maybe_scalar.map(Precision::Exact).unwrap_or_default())
+            .unwrap_or_else(|_| {
+                error!(
+                    "Unable to parse scalar value of {:?} with type {} for column {}",
+                    value,
+                    field.data_type(),
+                    field.name()
+                );
+                Precision::Absent
             }),
+        _ => Precision::Absent,
+    }
+}
+
+impl DeltaTableState {
+    /// Provide table level statistics to Datafusion
+    pub fn datafusion_table_statistics(&self) -> DataFusionResult<Statistics> {
+        // Statistics only support primitive types. Any non primitive column will not have their statistics captured
+        // If column statistics are missing for any add actions then we simply downgrade to Absent.
+
+        let schema = self.arrow_schema()?;
+        // Downgrade statistics to absent if file metadata is not present.
+        let mut downgrade = false;
+        let unknown_stats = Statistics::new_unknown(&schema);
+
+        let files = self.files();
+
+        // Initalize statistics
+        let mut table_stats = match files.get(0) {
+            Some(file) => match file.get_stats() {
+                Ok(Some(stats)) => {
+                    let mut column_statistics = Vec::with_capacity(schema.fields().size());
+                    let total_byte_size = Precision::Exact(file.size as usize);
+                    let num_rows = Precision::Exact(stats.num_records as usize);
+
+                    for field in schema.fields() {
+                        let null_count = match stats.null_count.get(field.name()) {
+                            Some(ColumnCountStat::Value(x)) => Precision::Exact(*x as usize),
+                            _ => Precision::Absent,
+                        };
+
+                        let max_value = get_scalar_value(stats.max_values.get(field.name()), field);
+                        let min_value = get_scalar_value(stats.min_values.get(field.name()), field);
+
+                        column_statistics.push(ColumnStatistics {
+                            null_count,
+                            max_value,
+                            min_value,
+                            distinct_count: Precision::Absent,
+                        });
+                    }
+
+                    Statistics {
+                        total_byte_size,
+                        num_rows,
+                        column_statistics,
+                    }
+                }
+                Ok(None) => {
+                    downgrade = true;
+                    let mut stats = unknown_stats.clone();
+                    stats.total_byte_size = Precision::Exact(file.size as usize);
+                    stats
+                }
+                _ => return Ok(unknown_stats),
+            },
+            None => {
+                // The Table is empty
+                let mut stats = unknown_stats;
+                stats.num_rows = Precision::Exact(0);
+                stats.total_byte_size = Precision::Exact(0);
+                return Ok(stats);
+            }
+        };
+
+        // Populate the remaining statistics. If file statistics are not present then relevant statistics are downgraded to absent.
+        for file in &files.as_slice()[1..] {
+            let byte_size = Precision::Exact(file.size as usize);
+            table_stats.total_byte_size = table_stats.total_byte_size.add(&byte_size);
+
+            if !downgrade {
+                match file.get_stats() {
+                    Ok(Some(stats)) => {
+                        let num_records = Precision::Exact(stats.num_records as usize);
+
+                        table_stats.num_rows = table_stats.num_rows.add(&num_records);
+
+                        for (idx, field) in schema.fields().iter().enumerate() {
+                            let column_stats = table_stats.column_statistics.get_mut(idx).unwrap();
+
+                            let null_count = match stats.null_count.get(field.name()) {
+                                Some(ColumnCountStat::Value(x)) => Precision::Exact(*x as usize),
+                                _ => Precision::Absent,
+                            };
+
+                            let max_value =
+                                get_scalar_value(stats.max_values.get(field.name()), field);
+                            let min_value =
+                                get_scalar_value(stats.min_values.get(field.name()), field);
+
+                            column_stats.null_count = column_stats.null_count.add(&null_count);
+                            column_stats.max_value = column_stats.max_value.max(&max_value);
+                            column_stats.min_value = column_stats.min_value.min(&min_value);
+                        }
+                    }
+                    Ok(None) => {
+                        downgrade = true;
+                    }
+                    Err(_) => return Ok(unknown_stats),
+                }
+            }
         }
+
+        if downgrade {
+            table_stats.column_statistics = unknown_stats.column_statistics;
+            table_stats.num_rows = Precision::Absent;
+        }
+
+        Ok(table_stats)
     }
 }
 
@@ -258,17 +238,15 @@ fn get_prune_stats(table: &DeltaTable, column: &Column, get_max: bool) -> Option
     let field = table
         .get_schema()
         .ok()
-        .map(|s| s.get_field_with_name(&column.name).ok())??;
+        .map(|s| s.field_with_name(&column.name).ok())??;
 
     // See issue 1214. Binary type does not support natural order which is required for Datafusion to prune
-    if let SchemaDataType::primitive(t) = &field.get_type() {
-        if t == "binary" {
-            return None;
-        }
+    if let DeltaDataType::Primitive(PrimitiveType::Binary) = &field.data_type() {
+        return None;
     }
 
-    let data_type = field.get_type().try_into().ok()?;
-    let partition_columns = &table.get_metadata().ok()?.partition_columns;
+    let data_type = field.data_type().try_into().ok()?;
+    let partition_columns = &table.metadata().ok()?.partition_columns;
 
     let values = table.get_state().files().iter().map(|add| {
         if partition_columns.contains(&column.name) {
@@ -277,9 +255,12 @@ fn get_prune_stats(table: &DeltaTable, column: &Column, get_max: bool) -> Option
                 Some(v) => serde_json::Value::String(v.to_string()),
                 None => serde_json::Value::Null,
             };
-            to_correct_scalar_value(&value, &data_type).unwrap_or(
-                get_null_of_arrow_type(&data_type).expect("Could not determine null type"),
-            )
+            to_correct_scalar_value(&value, &data_type)
+                .ok()
+                .flatten()
+                .unwrap_or(
+                    get_null_of_arrow_type(&data_type).expect("Could not determine null type"),
+                )
         } else if let Ok(Some(statistics)) = add.get_stats() {
             let values = if get_max {
                 statistics.max_values
@@ -289,7 +270,11 @@ fn get_prune_stats(table: &DeltaTable, column: &Column, get_max: bool) -> Option
 
             values
                 .get(&column.name)
-                .and_then(|f| to_correct_scalar_value(f.as_value()?, &data_type))
+                .and_then(|f| {
+                    to_correct_scalar_value(f.as_value()?, &data_type)
+                        .ok()
+                        .flatten()
+                })
                 .unwrap_or(
                     get_null_of_arrow_type(&data_type).expect("Could not determine null type"),
                 )
@@ -325,7 +310,7 @@ impl PruningStatistics for DeltaTable {
     ///
     /// Note: the returned array must contain `num_containers()` rows.
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
-        let partition_columns = &self.get_metadata().ok()?.partition_columns;
+        let partition_columns = &self.metadata().ok()?.partition_columns;
 
         let values = self.get_state().files().iter().map(|add| {
             if let Ok(Some(statistics)) = add.get_stats() {
@@ -358,17 +343,17 @@ impl PruningStatistics for DeltaTable {
 
 // each delta table must register a specific object store, since paths are internally
 // handled relative to the table root.
-pub(crate) fn register_store(store: ObjectStoreRef, env: Arc<RuntimeEnv>) {
+pub(crate) fn register_store(store: LogStoreRef, env: Arc<RuntimeEnv>) {
     let object_store_url = store.object_store_url();
     let url: &Url = object_store_url.as_ref();
-    env.register_object_store(url, store);
+    env.register_object_store(url, store.object_store());
 }
 
 pub(crate) fn logical_schema(
     snapshot: &DeltaTableState,
     scan_config: &DeltaScanConfig,
 ) -> DeltaResult<SchemaRef> {
-    let input_schema = snapshot.input_schema()?;
+    let input_schema = snapshot.arrow_schema()?;
     let mut fields = Vec::new();
     for field in input_schema.fields.iter() {
         fields.push(field.to_owned());
@@ -386,7 +371,7 @@ pub(crate) fn logical_schema(
 }
 
 #[derive(Debug, Clone, Default)]
-/// Used to specify if additonal metadata columns are exposed to the user
+/// Used to specify if additional metadata columns are exposed to the user
 pub struct DeltaScanConfigBuilder {
     /// Include the source path for each record. The name of this column is determine by `file_column_name`
     include_file_column: bool,
@@ -459,7 +444,7 @@ impl DeltaScanConfigBuilder {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-/// Include additonal metadata columns during a [`DeltaScan`]
+/// Include additional metadata columns during a [`DeltaScan`]
 pub struct DeltaScanConfig {
     /// Include the source path for each record
     pub file_column_name: Option<String>,
@@ -468,7 +453,7 @@ pub struct DeltaScanConfig {
 #[derive(Debug)]
 pub(crate) struct DeltaScanBuilder<'a> {
     snapshot: &'a DeltaTableState,
-    object_store: ObjectStoreRef,
+    log_store: LogStoreRef,
     filter: Option<Expr>,
     state: &'a SessionState,
     projection: Option<&'a Vec<usize>>,
@@ -481,12 +466,12 @@ pub(crate) struct DeltaScanBuilder<'a> {
 impl<'a> DeltaScanBuilder<'a> {
     pub fn new(
         snapshot: &'a DeltaTableState,
-        object_store: ObjectStoreRef,
+        log_store: LogStoreRef,
         state: &'a SessionState,
     ) -> Self {
         DeltaScanBuilder {
             snapshot,
-            object_store,
+            log_store,
             filter: None,
             state,
             files: None,
@@ -522,18 +507,13 @@ impl<'a> DeltaScanBuilder<'a> {
         self
     }
 
-    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
-        self.schema = Some(schema);
-        self
-    }
-
     pub async fn build(self) -> DeltaResult<DeltaScan> {
         let config = self.config;
         let schema = match self.schema {
             Some(schema) => schema,
             None => {
                 self.snapshot
-                    .physical_arrow_schema(self.object_store.clone())
+                    .physical_arrow_schema(self.log_store.object_store())
                     .await?
             }
         };
@@ -586,8 +566,14 @@ impl<'a> DeltaScanBuilder<'a> {
         // However we may want to do some additional balancing in case we are far off from the above.
         let mut file_groups: HashMap<Vec<ScalarValue>, Vec<PartitionedFile>> = HashMap::new();
 
+        let table_partition_cols = &self
+            .snapshot
+            .metadata()
+            .ok_or(DeltaTableError::NoMetadata)?
+            .partition_columns;
+
         for action in files.iter() {
-            let mut part = partitioned_file_from_action(action, &schema);
+            let mut part = partitioned_file_from_action(action, table_partition_cols, &schema);
 
             if config.file_column_name.is_some() {
                 part.partition_values
@@ -602,13 +588,6 @@ impl<'a> DeltaScanBuilder<'a> {
                 .push(part);
         }
 
-        let table_partition_cols = self
-            .snapshot
-            .current_metadata()
-            .ok_or(DeltaTableError::NoMetadata)?
-            .partition_columns
-            .clone();
-
         let file_schema = Arc::new(ArrowSchema::new(
             schema
                 .fields()
@@ -620,24 +599,36 @@ impl<'a> DeltaScanBuilder<'a> {
 
         let mut table_partition_cols = table_partition_cols
             .iter()
-            .map(|c| Ok((c.to_owned(), schema.field_with_name(c)?.data_type().clone())))
+            .map(|name| schema.field_with_name(name).map(|f| f.to_owned()))
             .collect::<Result<Vec<_>, ArrowError>>()?;
 
         if let Some(file_column_name) = &config.file_column_name {
-            table_partition_cols.push((
+            table_partition_cols.push(Field::new(
                 file_column_name.clone(),
                 wrap_partition_type_in_dict(DataType::Utf8),
+                false,
             ));
         }
+
+        let stats = self
+            .snapshot
+            .datafusion_table_statistics()
+            .unwrap_or_else(|e| {
+                error!(
+                    "Error while computing table statistics. Using unknown statistics. {}",
+                    e
+                );
+                Statistics::new_unknown(&schema)
+            });
 
         let scan = ParquetFormat::new()
             .create_physical_plan(
                 self.state,
                 FileScanConfig {
-                    object_store_url: self.object_store.object_store_url(),
+                    object_store_url: self.log_store.object_store_url(),
                     file_schema,
                     file_groups: file_groups.into_values().collect(),
-                    statistics: self.snapshot.datafusion_table_statistics(),
+                    statistics: stats,
                     projection: self.projection.cloned(),
                     limit: self.limit,
                     table_partition_cols,
@@ -649,9 +640,7 @@ impl<'a> DeltaScanBuilder<'a> {
             .await?;
 
         Ok(DeltaScan {
-            table_uri: ensure_table_uri(self.object_store.root_uri())?
-                .as_str()
-                .into(),
+            table_uri: ensure_table_uri(self.log_store.root_uri())?.as_str().into(),
             parquet_scan: scan,
             config,
             logical_schema,
@@ -688,10 +677,10 @@ impl TableProvider for DeltaTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        register_store(self.object_store(), session.runtime_env().clone());
+        register_store(self.log_store(), session.runtime_env().clone());
         let filter_expr = conjunction(filters.iter().cloned());
 
-        let scan = DeltaScanBuilder::new(&self.state, self.object_store(), session)
+        let scan = DeltaScanBuilder::new(&self.state, self.log_store(), session)
             .with_projection(projection)
             .with_limit(limit)
             .with_filter(filter_expr)
@@ -709,14 +698,14 @@ impl TableProvider for DeltaTable {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        Some(self.state.datafusion_table_statistics())
+        self.state.datafusion_table_statistics().ok()
     }
 }
 
-/// A Delta table provider that enables additonal metadata columns to be included during the scan
+/// A Delta table provider that enables additional metadata columns to be included during the scan
 pub struct DeltaTableProvider {
     snapshot: DeltaTableState,
-    store: ObjectStoreRef,
+    log_store: LogStoreRef,
     config: DeltaScanConfig,
     schema: Arc<ArrowSchema>,
 }
@@ -725,13 +714,13 @@ impl DeltaTableProvider {
     /// Build a DeltaTableProvider
     pub fn try_new(
         snapshot: DeltaTableState,
-        store: ObjectStoreRef,
+        log_store: LogStoreRef,
         config: DeltaScanConfig,
     ) -> DeltaResult<Self> {
         Ok(DeltaTableProvider {
             schema: logical_schema(&snapshot, &config)?,
             snapshot,
-            store,
+            log_store,
             config,
         })
     }
@@ -766,10 +755,10 @@ impl TableProvider for DeltaTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        register_store(self.store.clone(), session.runtime_env().clone());
+        register_store(self.log_store.clone(), session.runtime_env().clone());
         let filter_expr = conjunction(filters.iter().cloned());
 
-        let scan = DeltaScanBuilder::new(&self.snapshot, self.store.clone(), session)
+        let scan = DeltaScanBuilder::new(&self.snapshot, self.log_store.clone(), session)
             .with_projection(projection)
             .with_limit(limit)
             .with_filter(filter_expr)
@@ -788,7 +777,7 @@ impl TableProvider for DeltaTableProvider {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        Some(self.snapshot.datafusion_table_statistics())
+        self.snapshot.datafusion_table_statistics().ok()
     }
 }
 
@@ -855,7 +844,7 @@ impl ExecutionPlan for DeltaScan {
         self.parquet_scan.execute(partition, context)
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> DataFusionResult<Statistics> {
         self.parquet_scan.statistics()
     }
 }
@@ -922,21 +911,32 @@ pub(crate) fn get_null_of_arrow_type(t: &ArrowDataType) -> DeltaResult<ScalarVal
 }
 
 pub(crate) fn partitioned_file_from_action(
-    action: &protocol::Add,
+    action: &Add,
+    partition_columns: &[String],
     schema: &ArrowSchema,
 ) -> PartitionedFile {
-    let partition_values = schema
-        .fields()
+    let partition_values = partition_columns
         .iter()
-        .filter_map(|f| {
-            action.partition_values.get(f.name()).map(|val| match val {
-                Some(value) => to_correct_scalar_value(
-                    &serde_json::Value::String(value.to_string()),
-                    f.data_type(),
-                )
-                .unwrap_or(ScalarValue::Null),
-                None => get_null_of_arrow_type(f.data_type()).unwrap_or(ScalarValue::Null),
-            })
+        .map(|part| {
+            action
+                .partition_values
+                .get(part)
+                .map(|val| {
+                    schema
+                        .field_with_name(part)
+                        .map(|field| match val {
+                            Some(value) => to_correct_scalar_value(
+                                &serde_json::Value::String(value.to_string()),
+                                field.data_type(),
+                            )
+                            .unwrap_or(Some(ScalarValue::Null))
+                            .unwrap_or(ScalarValue::Null),
+                            None => get_null_of_arrow_type(field.data_type())
+                                .unwrap_or(ScalarValue::Null),
+                        })
+                        .unwrap_or(ScalarValue::Null)
+                })
+                .unwrap_or(ScalarValue::Null)
         })
         .collect::<Vec<_>>();
 
@@ -955,171 +955,52 @@ pub(crate) fn partitioned_file_from_action(
     }
 }
 
-fn to_scalar_value(stat_val: &serde_json::Value) -> Option<ScalarValue> {
-    match stat_val {
-        serde_json::Value::Bool(val) => Some(ScalarValue::from(*val)),
-        serde_json::Value::Number(num) => {
-            if let Some(val) = num.as_i64() {
-                Some(ScalarValue::from(val))
-            } else if let Some(val) = num.as_u64() {
-                Some(ScalarValue::from(val))
-            } else {
-                num.as_f64().map(ScalarValue::from)
-            }
-        }
-        serde_json::Value::String(s) => Some(ScalarValue::from(s.as_str())),
-        serde_json::Value::Array(_) => None,
-        serde_json::Value::Object(_) => None,
-        serde_json::Value::Null => None,
-    }
+fn parse_timestamp(
+    stat_val: &serde_json::Value,
+    field_dt: &ArrowDataType,
+) -> DataFusionResult<ScalarValue> {
+    let string = match stat_val {
+        serde_json::Value::String(s) => s.to_owned(),
+        _ => stat_val.to_string(),
+    };
+
+    let time_micro = ScalarValue::try_from_string(
+        string,
+        &ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+    )?;
+    let cast_arr = cast_with_options(
+        &time_micro.to_array()?,
+        field_dt,
+        &CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )?;
+    ScalarValue::try_from_array(&cast_arr, 0)
 }
 
 pub(crate) fn to_correct_scalar_value(
     stat_val: &serde_json::Value,
     field_dt: &ArrowDataType,
-) -> Option<ScalarValue> {
+) -> DataFusionResult<Option<ScalarValue>> {
     match stat_val {
-        serde_json::Value::Array(_) => None,
-        serde_json::Value::Object(_) => None,
-        serde_json::Value::Null => get_null_of_arrow_type(field_dt).ok(),
+        serde_json::Value::Array(_) => Ok(None),
+        serde_json::Value::Object(_) => Ok(None),
+        serde_json::Value::Null => Ok(Some(get_null_of_arrow_type(field_dt)?)),
         serde_json::Value::String(string_val) => match field_dt {
-            ArrowDataType::Timestamp(_, _) => {
-                let time_nanos = ScalarValue::try_from_string(
-                    string_val.to_owned(),
-                    &ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
-                )
-                .ok()?;
-                let cast_arr = cast_with_options(
-                    &time_nanos.to_array(),
-                    field_dt,
-                    &CastOptions {
-                        safe: false,
-                        ..Default::default()
-                    },
-                )
-                .ok()?;
-                Some(ScalarValue::try_from_array(&cast_arr, 0).ok()?)
-            }
-            _ => Some(ScalarValue::try_from_string(string_val.to_owned(), field_dt).ok()?),
+            ArrowDataType::Timestamp(_, _) => Ok(Some(parse_timestamp(stat_val, field_dt)?)),
+            _ => Ok(Some(ScalarValue::try_from_string(
+                string_val.to_owned(),
+                field_dt,
+            )?)),
         },
         other => match field_dt {
-            ArrowDataType::Timestamp(_, _) => {
-                let time_nanos = ScalarValue::try_from_string(
-                    other.to_string(),
-                    &ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
-                )
-                .ok()?;
-                let cast_arr = cast_with_options(
-                    &time_nanos.to_array(),
-                    field_dt,
-                    &CastOptions {
-                        safe: false,
-                        ..Default::default()
-                    },
-                )
-                .ok()?;
-                Some(ScalarValue::try_from_array(&cast_arr, 0).ok()?)
-            }
-            _ => Some(ScalarValue::try_from_string(other.to_string(), field_dt).ok()?),
+            ArrowDataType::Timestamp(_, _) => Ok(Some(parse_timestamp(stat_val, field_dt)?)),
+            _ => Ok(Some(ScalarValue::try_from_string(
+                other.to_string(),
+                field_dt,
+            )?)),
         },
-    }
-}
-
-fn correct_scalar_value_type(value: ScalarValue, field_dt: &ArrowDataType) -> Option<ScalarValue> {
-    match field_dt {
-        ArrowDataType::Int64 => {
-            let raw_value = i64::try_from(value).ok()?;
-            Some(ScalarValue::from(raw_value))
-        }
-        ArrowDataType::Int32 => {
-            let raw_value = i64::try_from(value).ok()? as i32;
-            Some(ScalarValue::from(raw_value))
-        }
-        ArrowDataType::Int16 => {
-            let raw_value = i64::try_from(value).ok()? as i16;
-            Some(ScalarValue::from(raw_value))
-        }
-        ArrowDataType::Int8 => {
-            let raw_value = i64::try_from(value).ok()? as i8;
-            Some(ScalarValue::from(raw_value))
-        }
-        ArrowDataType::Float32 => {
-            let raw_value = f64::try_from(value).ok()? as f32;
-            Some(ScalarValue::from(raw_value))
-        }
-        ArrowDataType::Float64 => {
-            let raw_value = f64::try_from(value).ok()?;
-            Some(ScalarValue::from(raw_value))
-        }
-        ArrowDataType::Utf8 => match value {
-            ScalarValue::Utf8(val) => Some(ScalarValue::Utf8(val)),
-            _ => None,
-        },
-        ArrowDataType::LargeUtf8 => match value {
-            ScalarValue::Utf8(val) => Some(ScalarValue::LargeUtf8(val)),
-            _ => None,
-        },
-        ArrowDataType::Boolean => {
-            let raw_value = bool::try_from(value).ok()?;
-            Some(ScalarValue::from(raw_value))
-        }
-        ArrowDataType::Decimal128(_, _) => {
-            let raw_value = f64::try_from(value).ok()?;
-            Some(ScalarValue::from(raw_value))
-        }
-        ArrowDataType::Decimal256(_, _) => {
-            let raw_value = f64::try_from(value).ok()?;
-            Some(ScalarValue::from(raw_value))
-        }
-        ArrowDataType::Date32 => {
-            let raw_value = i64::try_from(value).ok()? as i32;
-            Some(ScalarValue::Date32(Some(raw_value)))
-        }
-        ArrowDataType::Date64 => {
-            let raw_value = i64::try_from(value).ok()?;
-            Some(ScalarValue::Date64(Some(raw_value)))
-        }
-        ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => {
-            let raw_value = i64::try_from(value).ok()?;
-            Some(ScalarValue::TimestampNanosecond(Some(raw_value), None))
-        }
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {
-            let raw_value = i64::try_from(value).ok()?;
-            Some(ScalarValue::TimestampMicrosecond(Some(raw_value), None))
-        }
-        ArrowDataType::Timestamp(TimeUnit::Millisecond, None) => {
-            let raw_value = i64::try_from(value).ok()?;
-            Some(ScalarValue::TimestampMillisecond(Some(raw_value), None))
-        }
-        _ => {
-            log::error!(
-                "Scalar value of arrow type unimplemented for {:?} and {:?}",
-                value,
-                field_dt
-            );
-            None
-        }
-    }
-}
-
-fn left_larger_than_right(left: ScalarValue, right: ScalarValue) -> Option<bool> {
-    match (&left, &right) {
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => Some(l > r),
-        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => Some(l > r),
-        (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => Some(l > r),
-        (ScalarValue::Int16(Some(l)), ScalarValue::Int16(Some(r))) => Some(l > r),
-        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => Some(l > r),
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => Some(l > r),
-        (ScalarValue::Utf8(Some(l)), ScalarValue::Utf8(Some(r))) => Some(l > r),
-        (ScalarValue::Boolean(Some(l)), ScalarValue::Boolean(Some(r))) => Some(l & !r),
-        _ => {
-            log::error!(
-                "Scalar value comparison unimplemented for {:?} and {:?}",
-                left,
-                right
-            );
-            None
-        }
     }
 }
 
@@ -1454,7 +1335,7 @@ fn join_batches_with_add_actions(
 /// Determine which files contain a record that statisfies the predicate
 pub(crate) async fn find_files_scan<'a>(
     snapshot: &DeltaTableState,
-    store: ObjectStoreRef,
+    log_store: LogStoreRef,
     state: &SessionState,
     expression: Expr,
 ) -> DeltaResult<Vec<Add>> {
@@ -1481,7 +1362,7 @@ pub(crate) async fn find_files_scan<'a>(
     // Add path column
     used_columns.push(logical_schema.index_of(scan_config.file_column_name.as_ref().unwrap())?);
 
-    let scan = DeltaScanBuilder::new(snapshot, store.clone(), state)
+    let scan = DeltaScanBuilder::new(snapshot, log_store, state)
         .with_filter(Some(expression.clone()))
         .with_projection(Some(&used_columns))
         .with_scan_config(scan_config)
@@ -1572,13 +1453,11 @@ pub(crate) async fn scan_memory_table(
 /// Finds files in a snapshot that match the provided predicate.
 pub async fn find_files<'a>(
     snapshot: &DeltaTableState,
-    object_store: ObjectStoreRef,
+    log_store: LogStoreRef,
     state: &SessionState,
     predicate: Option<Expr>,
 ) -> DeltaResult<FindFiles> {
-    let current_metadata = snapshot
-        .current_metadata()
-        .ok_or(DeltaTableError::NoMetadata)?;
+    let current_metadata = snapshot.metadata().ok_or(DeltaTableError::NoMetadata)?;
 
     match &predicate {
         Some(predicate) => {
@@ -1600,8 +1479,7 @@ pub async fn find_files<'a>(
                 })
             } else {
                 let candidates =
-                    find_files_scan(snapshot, object_store.clone(), state, predicate.to_owned())
-                        .await?;
+                    find_files_scan(snapshot, log_store, state, predicate.to_owned()).await?;
 
                 Ok(FindFiles {
                     candidates,
@@ -1618,6 +1496,7 @@ pub async fn find_files<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::writer::test_utils::get_delta_schema;
     use arrow::array::StructArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::{TimeZone, Utc};
@@ -1700,78 +1579,8 @@ mod tests {
         ];
 
         for (raw, data_type, ref_scalar) in reference_pairs {
-            let scalar = to_correct_scalar_value(raw, data_type).unwrap();
+            let scalar = to_correct_scalar_value(raw, data_type).unwrap().unwrap();
             assert_eq!(*ref_scalar, scalar)
-        }
-    }
-
-    #[test]
-    fn test_to_scalar_value() {
-        let reference_pairs = &[
-            (
-                json!("val"),
-                Some(ScalarValue::Utf8(Some(String::from("val")))),
-            ),
-            (json!("2"), Some(ScalarValue::Utf8(Some(String::from("2"))))),
-            (json!(true), Some(ScalarValue::Boolean(Some(true)))),
-            (json!(false), Some(ScalarValue::Boolean(Some(false)))),
-            (json!(2), Some(ScalarValue::Int64(Some(2)))),
-            (json!(-2), Some(ScalarValue::Int64(Some(-2)))),
-            (json!(2.0), Some(ScalarValue::Float64(Some(2.0)))),
-            (json!(["1", "2"]), None),
-            (json!({"key": "val"}), None),
-            (json!(null), None),
-        ];
-        for (stat_val, scalar_val) in reference_pairs {
-            assert_eq!(to_scalar_value(stat_val), *scalar_val)
-        }
-    }
-
-    #[test]
-    fn test_left_larger_than_right() {
-        let correct_reference_pairs = vec![
-            (
-                ScalarValue::Float64(Some(1.0)),
-                ScalarValue::Float64(Some(2.0)),
-            ),
-            (
-                ScalarValue::Float32(Some(1.0)),
-                ScalarValue::Float32(Some(2.0)),
-            ),
-            (ScalarValue::Int8(Some(1)), ScalarValue::Int8(Some(2))),
-            (ScalarValue::Int16(Some(1)), ScalarValue::Int16(Some(2))),
-            (ScalarValue::Int32(Some(1)), ScalarValue::Int32(Some(2))),
-            (ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(2))),
-            (
-                ScalarValue::Boolean(Some(false)),
-                ScalarValue::Boolean(Some(true)),
-            ),
-            (
-                ScalarValue::Utf8(Some(String::from("1"))),
-                ScalarValue::Utf8(Some(String::from("2"))),
-            ),
-        ];
-        for (smaller_val, larger_val) in correct_reference_pairs {
-            assert_eq!(
-                left_larger_than_right(smaller_val.clone(), larger_val.clone()),
-                Some(false)
-            );
-            assert_eq!(left_larger_than_right(larger_val, smaller_val), Some(true));
-        }
-
-        let incorrect_reference_pairs = vec![
-            (
-                ScalarValue::Float64(Some(1.0)),
-                ScalarValue::Float32(Some(2.0)),
-            ),
-            (ScalarValue::Int32(Some(1)), ScalarValue::Float32(Some(2.0))),
-            (
-                ScalarValue::Boolean(Some(true)),
-                ScalarValue::Float32(Some(2.0)),
-            ),
-        ];
-        for (left, right) in incorrect_reference_pairs {
-            assert_eq!(left_larger_than_right(left, right), None);
         }
     }
 
@@ -1780,7 +1589,7 @@ mod tests {
         let mut partition_values = std::collections::HashMap::new();
         partition_values.insert("month".to_string(), Some("1".to_string()));
         partition_values.insert("year".to_string(), Some("2015".to_string()));
-        let action = protocol::Add {
+        let action = Add {
             path: "year=2015/month=1/part-00000-4dcb50d3-d017-450c-9df7-a7257dbd3c5d-c000.snappy.parquet".to_string(),
             size: 10644,
             partition_values,
@@ -1791,13 +1600,17 @@ mod tests {
             deletion_vector: None,
             stats_parsed: None,
             tags: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
         };
         let schema = ArrowSchema::new(vec![
             Field::new("year", ArrowDataType::Int64, true),
             Field::new("month", ArrowDataType::Int64, true),
         ]);
 
-        let file = partitioned_file_from_action(&action, &schema);
+        let part_columns = vec!["year".to_string(), "month".to_string()];
+        let file = partitioned_file_from_action(&action, &part_columns, &schema);
         let ref_file = PartitionedFile {
             object_meta: object_store::ObjectMeta {
                 location: Path::from("year=2015/month=1/part-00000-4dcb50d3-d017-450c-9df7-a7257dbd3c5d-c000.snappy.parquet".to_string()), 
@@ -1912,7 +1725,8 @@ mod tests {
             .build(&table.state)
             .unwrap();
 
-        let provider = DeltaTableProvider::try_new(table.state, table.storage, config).unwrap();
+        let log_store = table.log_store();
+        let provider = DeltaTableProvider::try_new(table.state, log_store, config).unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("test", Arc::new(provider)).unwrap();
 
@@ -1927,6 +1741,67 @@ mod tests {
                 "| 6  | 5  | b  | c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet |",
                 "+----+----+----+-------------------------------------------------------------------------------+",
             ];
+        assert_batches_sorted_eq!(&expected, &actual);
+    }
+
+    #[tokio::test]
+    async fn delta_scan_mixed_partition_order() {
+        // Tests issue (1787) where partition columns were incorrect when they
+        // have a different order in the metadata and table schema
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("modified", DataType::Utf8, true),
+            Field::new("id", DataType::Utf8, true),
+            Field::new("value", DataType::Int32, true),
+        ]));
+
+        let table = crate::DeltaOps::new_in_memory()
+            .create()
+            .with_columns(get_delta_schema().fields().clone())
+            .with_partition_columns(["modified", "id"])
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 0);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "2021-02-01",
+                    "2021-02-01",
+                    "2021-02-02",
+                    "2021-02-02",
+                ])),
+                Arc::new(arrow::array::StringArray::from(vec!["A", "B", "C", "D"])),
+                Arc::new(arrow::array::Int32Array::from(vec![1, 10, 20, 100])),
+            ],
+        )
+        .unwrap();
+        // write some data
+        let table = crate::DeltaOps(table)
+            .write(vec![batch.clone()])
+            .with_save_mode(crate::protocol::SaveMode::Append)
+            .await
+            .unwrap();
+
+        let config = DeltaScanConfigBuilder::new().build(&table.state).unwrap();
+
+        let log_store = table.log_store();
+        let provider = DeltaTableProvider::try_new(table.state, log_store, config).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(provider)).unwrap();
+
+        let df = ctx.sql("select * from test").await.unwrap();
+        let actual = df.collect().await.unwrap();
+        let expected = vec![
+            "+-------+------------+----+",
+            "| value | modified   | id |",
+            "+-------+------------+----+",
+            "| 1     | 2021-02-01 | A  |",
+            "| 10    | 2021-02-01 | B  |",
+            "| 100   | 2021-02-02 | D  |",
+            "| 20    | 2021-02-02 | C  |",
+            "+-------+------------+----+",
+        ];
         assert_batches_sorted_eq!(&expected, &actual);
     }
 }
