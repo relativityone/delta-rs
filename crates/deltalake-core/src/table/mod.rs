@@ -15,6 +15,7 @@ use regex::Regex;
 use serde::de::{Error, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use tracing::instrument;
 use uuid::Uuid;
 
 use self::builder::DeltaTableConfig;
@@ -405,6 +406,7 @@ impl DeltaTable {
     }
 
     /// This method scans delta logs to find the earliest delta log version
+    #[instrument(skip(self))]
     async fn get_earliest_delta_log_version(&self) -> Result<i64, DeltaTableError> {
         // TODO check if regex matches against path
         lazy_static! {
@@ -432,6 +434,7 @@ impl DeltaTable {
     }
 
     #[cfg(any(feature = "parquet", feature = "parquet2"))]
+    #[instrument(skip(self))]
     async fn restore_checkpoint(&mut self, check_point: CheckPoint) -> Result<(), DeltaTableError> {
         self.state = DeltaTableState::from_checkpoint(self, &check_point).await?;
 
@@ -439,8 +442,56 @@ impl DeltaTable {
     }
 
     /// returns the latest available version of the table
-    pub async fn get_latest_version(&self) -> Result<i64, DeltaTableError> {
-        self.log_store.get_latest_version(self.version()).await
+    #[instrument(skip(self))]
+    pub async fn get_latest_version(&mut self) -> Result<i64, DeltaTableError> {
+        let version_start = match get_last_checkpoint(&self.storage).await {
+            Ok(last_check_point) => last_check_point.version,
+            Err(ProtocolError::CheckpointNotFound) => {
+                // no checkpoint
+                -1
+            }
+            Err(e) => {
+                return Err(DeltaTableError::from(e));
+            }
+        };
+
+        debug!("latest checkpoint version: {version_start}");
+
+        let version_start = max(self.version(), version_start);
+
+        lazy_static! {
+            static ref DELTA_LOG_REGEX: Regex =
+                Regex::new(r"_delta_log/(\d{20})\.(json|checkpoint).*$").unwrap();
+        }
+
+        // list files to find max version
+        let version = async {
+            let mut max_version: i64 = version_start;
+            let prefix = Some(self.storage.log_path());
+            let offset_path = commit_uri_from_version(max_version);
+            let mut files = self.storage.list_with_offset(prefix, &offset_path).await?;
+
+            while let Some(obj_meta) = files.next().await {
+                let obj_meta = obj_meta?;
+                if let Some(captures) = DELTA_LOG_REGEX.captures(obj_meta.location.as_ref()) {
+                    let log_version = captures.get(1).unwrap().as_str().parse().unwrap();
+                    // listing may not be ordered
+                    max_version = max(max_version, log_version);
+                    // also cache timestamp for version, for faster time-travel
+                    self.version_timestamp
+                        .insert(log_version, obj_meta.last_modified.timestamp());
+                }
+            }
+
+            if max_version < 0 {
+                return Err(DeltaTableError::not_a_table(self.table_uri()));
+            }
+
+            Ok::<i64, DeltaTableError>(max_version)
+        }
+        .await?;
+
+        Ok(version)
     }
 
     /// Currently loaded version of the table
@@ -449,6 +500,7 @@ impl DeltaTable {
     }
 
     /// Load DeltaTable with data from latest checkpoint
+    #[instrument(skip(self))]
     pub async fn load(&mut self) -> Result<(), DeltaTableError> {
         self.last_check_point = None;
         self.state = DeltaTableState::with_version(-1);
@@ -456,6 +508,7 @@ impl DeltaTable {
     }
 
     /// Get the list of actions for the next commit
+    #[instrument(skip(self))]
     pub async fn peek_next_commit(
         &self,
         current_version: i64,
@@ -471,9 +524,34 @@ impl DeltaTable {
         Ok(PeekCommit::New(next_version, actions.unwrap()))
     }
 
+    /// Reads a commit and gets list of actions
+    #[instrument(skip(commit_log_bytes))]
+    async fn get_actions(
+        version: i64,
+        commit_log_bytes: bytes::Bytes,
+    ) -> Result<Vec<Action>, DeltaTableError> {
+        debug!("parsing commit with version {version}...");
+        let reader = BufReader::new(Cursor::new(commit_log_bytes));
+
+        let mut actions = Vec::new();
+        for re_line in reader.lines() {
+            let line = re_line?;
+            let lstr = line.as_str();
+            let action =
+                serde_json::from_str(lstr).map_err(|e| DeltaTableError::InvalidJsonLog {
+                    json_err: e,
+                    line,
+                    version,
+                })?;
+            actions.push(action);
+        }
+        Ok(actions)
+    }
+
     /// Updates the DeltaTable to the most recent state committed to the transaction log by
     /// loading the last checkpoint and incrementally applying each version since.
     #[cfg(any(feature = "parquet", feature = "parquet2"))]
+    #[instrument(skip(self))]
     pub async fn update(&mut self) -> Result<(), DeltaTableError> {
         match get_last_checkpoint(self.log_store.as_ref()).await {
             Ok(last_check_point) => {
@@ -502,6 +580,7 @@ impl DeltaTable {
 
     /// Updates the DeltaTable to the latest version by incrementally applying newer versions.
     /// It assumes that the table is already updated to the current version `self.version`.
+    #[instrument(skip(self))]
     pub async fn update_incremental(
         &mut self,
         max_version: Option<i64>,
@@ -558,6 +637,7 @@ impl DeltaTable {
     }
 
     /// Loads the DeltaTable state for the given version.
+    #[instrument(skip(self))]
     pub async fn load_version(&mut self, version: i64) -> Result<(), DeltaTableError> {
         // check if version is valid
         let commit_uri = commit_uri_from_version(version);
@@ -590,6 +670,7 @@ impl DeltaTable {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub(crate) async fn get_version_timestamp(
         &mut self,
         version: i64,
