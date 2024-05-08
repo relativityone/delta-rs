@@ -98,15 +98,18 @@ impl LogSegment {
         table_root: &Path,
         version: Option<i64>,
         store: &dyn ObjectStore,
+        config: &DeltaTableConfig,
     ) -> DeltaResult<Self> {
         let log_url = table_root.child("_delta_log");
         let maybe_cp = read_last_checkpoint(store, &log_url).await?;
 
         // List relevant files from log
         let (mut commit_files, checkpoint_files) = match (maybe_cp, version) {
-            (Some(cp), None) => list_log_files_with_checkpoint(&cp, store, &log_url).await?,
+            (Some(cp), None) => {
+                list_log_files_with_checkpoint(&cp, store, &log_url, config).await?
+            }
             (Some(cp), Some(v)) if cp.version <= v => {
-                list_log_files_with_checkpoint(&cp, store, &log_url).await?
+                list_log_files_with_checkpoint(&cp, store, &log_url, config).await?
             }
             _ => list_log_files(store, &log_url, version, None).await?,
         };
@@ -419,14 +422,45 @@ async fn list_log_files_with_checkpoint(
     cp: &CheckpointMetadata,
     fs_client: &dyn ObjectStore,
     log_root: &Path,
+    config: &DeltaTableConfig,
 ) -> DeltaResult<(Vec<ObjectMeta>, Vec<ObjectMeta>)> {
-    let version_prefix = format!("{:020}", cp.version);
-    let start_from = log_root.child(version_prefix.as_str());
+    let files = match config.log_seek_checkpoint_interval {
+        Some(checkpoint_interval) => {
+            let cp_path = log_root.child(format!("{:020}.checkpoint.parquet", cp.version));
+            let next_possible_cp =
+                (cp.version + checkpoint_interval) - (cp.version % checkpoint_interval);
 
-    let files = fs_client
-        .list_with_offset(Some(log_root), &start_from)
-        .try_collect::<Vec<_>>()
-        .await?
+            let seek_range = (cp.version + 1)..next_possible_cp;
+            let seek_iter = std::iter::once(cp_path)
+                .chain(seek_range.map(|v| log_root.child(format!("{:020}.json", v))));
+
+            futures::stream::iter(seek_iter)
+                .map(|path| async move {
+                    match fs_client.head(&path).await {
+                        Ok(meta) => Ok(Some(meta)),
+                        Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+                        Err(err) => Err(err.into()),
+                    }
+                })
+                .buffered(config.log_buffer_size)
+                // Stop at first file not found
+                .try_take_while(|m| futures::future::ok::<_, object_store::Error>(m.is_some()))
+                // Collect all found files which is everything up until this point
+                .try_filter_map(|m| futures::future::ok(m))
+                .try_collect::<Vec<_>>()
+                .await?
+        }
+        None => {
+            let version_prefix = format!("{:020}", cp.version);
+            let start_from = log_root.child(version_prefix.as_str());
+            fs_client
+                .list_with_offset(Some(log_root), &start_from)
+                .try_collect::<Vec<_>>()
+                .await?
+        }
+    };
+
+    let files = files
         .into_iter()
         // TODO this filters out .crc files etc which start with "." - how do we want to use these kind of files?
         .filter(|f| f.location.commit_version().is_some())
@@ -523,12 +557,29 @@ pub(super) mod tests {
 
     use super::*;
 
-    pub(crate) async fn test_log_segment(context: &IntegrationContext) -> TestResult {
-        read_log_files(context).await?;
+    pub(crate) async fn test_log_segment(
+        context: &IntegrationContext,
+        seek_log: bool,
+    ) -> TestResult {
+        read_log_files(context, seek_log).await?;
         read_metadata(context).await?;
         log_segment_serde(context).await?;
 
         Ok(())
+    }
+
+    pub(crate) fn table_load_config(table: TestTables, seek_log: bool) -> DeltaTableConfig {
+        match table {
+            TestTables::SimpleWithCheckpoint if seek_log => DeltaTableConfig {
+                log_seek_checkpoint_interval: Some(10),
+                ..Default::default()
+            },
+            TestTables::Checkpoints if seek_log => DeltaTableConfig {
+                log_seek_checkpoint_interval: Some(5),
+                ..Default::default()
+            },
+            _ => Default::default(),
+        }
     }
 
     async fn log_segment_serde(context: &IntegrationContext) -> TestResult {
@@ -537,7 +588,13 @@ pub(super) mod tests {
             .build_storage()?
             .object_store();
 
-        let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
+        let segment = LogSegment::try_new(
+            &Path::default(),
+            None,
+            store.as_ref(),
+            &DeltaTableConfig::default(),
+        )
+        .await?;
         let bytes = serde_json::to_vec(&segment).unwrap();
         let actual: LogSegment = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(actual.version(), segment.version());
@@ -550,7 +607,7 @@ pub(super) mod tests {
         Ok(())
     }
 
-    async fn read_log_files(context: &IntegrationContext) -> TestResult {
+    async fn read_log_files(context: &IntegrationContext, seek_log: bool) -> TestResult {
         let store = context
             .table_builder(TestTables::SimpleWithCheckpoint)
             .build_storage()?
@@ -562,7 +619,9 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(cp.version, 10);
 
-        let (log, check) = list_log_files_with_checkpoint(&cp, store.as_ref(), &log_path).await?;
+        let config = table_load_config(TestTables::SimpleWithCheckpoint, seek_log);
+        let (log, check) =
+            list_log_files_with_checkpoint(&cp, store.as_ref(), &log_path, &config).await?;
         assert_eq!(log.len(), 0);
         assert_eq!(check.len(), 1);
 
@@ -574,12 +633,13 @@ pub(super) mod tests {
         assert_eq!(log.len(), 9);
         assert_eq!(check.len(), 0);
 
-        let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
+        let segment = LogSegment::try_new(&Path::default(), None, store.as_ref(), &config).await?;
         assert_eq!(segment.version, 10);
         assert_eq!(segment.commit_files.len(), 0);
         assert_eq!(segment.checkpoint_files.len(), 1);
 
-        let segment = LogSegment::try_new(&Path::default(), Some(8), store.as_ref()).await?;
+        let segment =
+            LogSegment::try_new(&Path::default(), Some(8), store.as_ref(), &config).await?;
         assert_eq!(segment.version, 8);
         assert_eq!(segment.commit_files.len(), 9);
         assert_eq!(segment.checkpoint_files.len(), 0);
@@ -605,7 +665,13 @@ pub(super) mod tests {
             .table_builder(TestTables::WithDvSmall)
             .build_storage()?
             .object_store();
-        let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
+        let segment = LogSegment::try_new(
+            &Path::default(),
+            None,
+            store.as_ref(),
+            &DeltaTableConfig::default(),
+        )
+        .await?;
         let (protocol, _metadata) = segment
             .read_metadata(store.clone(), &Default::default())
             .await?;

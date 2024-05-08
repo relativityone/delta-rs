@@ -63,7 +63,7 @@ impl Snapshot {
         config: DeltaTableConfig,
         version: Option<i64>,
     ) -> DeltaResult<Self> {
-        let log_segment = LogSegment::try_new(table_root, version, store.as_ref()).await?;
+        let log_segment = LogSegment::try_new(table_root, version, store.as_ref(), &config).await?;
         let (protocol, metadata) = log_segment.read_metadata(store.clone(), &config).await?;
         if metadata.is_none() || protocol.is_none() {
             return Err(DeltaTableError::Generic(
@@ -285,7 +285,8 @@ impl Snapshot {
     /// Get the statistics schema of the snapshot
     pub fn stats_schema(&self) -> DeltaResult<StructType> {
         let num_indexed_cols = self.table_config().num_indexed_cols();
-        let stats_fields: Vec<_> = self.schema()
+        let stats_fields: Vec<_> = self
+            .schema()
             .fields
             .iter()
             .enumerate()
@@ -549,6 +550,7 @@ mod tests {
     use deltalake_test::utils::*;
     use futures::TryStreamExt;
     use itertools::Itertools;
+    use tests::log_segment::tests::table_load_config;
 
     use super::log_segment::tests::test_log_segment;
     use super::replay::tests::test_log_replay;
@@ -564,15 +566,31 @@ mod tests {
         context.load_table(TestTables::SimpleWithCheckpoint).await?;
         context.load_table(TestTables::WithDvSmall).await?;
 
-        test_log_segment(&context).await?;
-        test_log_replay(&context).await?;
-        test_snapshot(&context).await?;
-        test_eager_snapshot(&context).await?;
+        test_log_segment(&context, false).await?;
+        test_log_replay(&context, false).await?;
+        test_snapshot(&context, false).await?;
+        test_eager_snapshot(&context, false).await?;
 
         Ok(())
     }
 
-    async fn test_snapshot(context: &IntegrationContext) -> TestResult {
+    #[tokio::test]
+    async fn test_snapshots_seek() -> TestResult {
+        let context = IntegrationContext::new(Box::<LocalStorageIntegration>::default())?;
+        context.load_table(TestTables::Checkpoints).await?;
+        context.load_table(TestTables::Simple).await?;
+        context.load_table(TestTables::SimpleWithCheckpoint).await?;
+        context.load_table(TestTables::WithDvSmall).await?;
+
+        test_log_segment(&context, true).await?;
+        test_log_replay(&context, true).await?;
+        test_snapshot(&context, true).await?;
+        test_eager_snapshot(&context, true).await?;
+
+        Ok(())
+    }
+
+    async fn test_snapshot(context: &IntegrationContext, seek_log: bool) -> TestResult {
         let store = context
             .table_builder(TestTables::Simple)
             .build_storage()?
@@ -626,11 +644,12 @@ mod tests {
             .build_storage()?
             .object_store();
 
+        let config = table_load_config(TestTables::Checkpoints, seek_log);
         for version in 0..=12 {
             let snapshot = Snapshot::try_new(
                 &Path::default(),
                 store.clone(),
-                Default::default(),
+                config.clone(),
                 Some(version),
             )
             .await?;
@@ -645,7 +664,7 @@ mod tests {
         Ok(())
     }
 
-    async fn test_eager_snapshot(context: &IntegrationContext) -> TestResult {
+    async fn test_eager_snapshot(context: &IntegrationContext, seek_log: bool) -> TestResult {
         let store = context
             .table_builder(TestTables::Simple)
             .build_storage()?
@@ -663,6 +682,7 @@ mod tests {
         let expected: StructType = serde_json::from_str(schema_string)?;
         assert_eq!(snapshot.schema(), &expected);
 
+        let config = table_load_config(TestTables::Checkpoints, seek_log);
         let store = context
             .table_builder(TestTables::Checkpoints)
             .build_storage()?
@@ -672,7 +692,7 @@ mod tests {
             let snapshot = EagerSnapshot::try_new(
                 &Path::default(),
                 store.clone(),
-                Default::default(),
+                config.clone(),
                 Some(version),
             )
             .await?;

@@ -79,6 +79,10 @@ pub struct DeltaTableConfig {
     /// Control the number of records to read / process from the commit / checkpoint files
     /// when processing record batches.
     pub log_batch_size: usize,
+    /// When set this value is used to determine which log files are attempted to be read
+    /// from the latest checkpoint, otherwise all log directory is listed from lastest_checkpont.
+    /// Consider using if your ObjectStore does not support list_with_offset.
+    pub log_seek_checkpoint_interval: Option<i64>,
 }
 
 impl Default for DeltaTableConfig {
@@ -88,6 +92,7 @@ impl Default for DeltaTableConfig {
             require_files: true,
             log_buffer_size: num_cpus::get() * 4,
             log_batch_size: 1024,
+            log_seek_checkpoint_interval: None,
         }
     }
 }
@@ -126,6 +131,10 @@ pub struct DeltaTableLoadOptions {
     /// Control the number of records to read / process from the commit / checkpoint files
     /// when processing record batches.
     pub log_batch_size: usize,
+    /// When set this value is used to determine which log files are attempted to be read
+    /// from the latest checkpoint, otherwise all log directory is listed from lastest_checkpont.
+    /// Consider using if your ObjectStore does not support list_with_offset.
+    pub log_seek_checkpoint_interval: Option<i64>,
 }
 
 impl DeltaTableLoadOptions {
@@ -139,6 +148,7 @@ impl DeltaTableLoadOptions {
             log_buffer_size: num_cpus::get() * 4,
             version: DeltaVersion::default(),
             log_batch_size: 1024,
+            log_seek_checkpoint_interval: None,
         }
     }
 }
@@ -273,6 +283,13 @@ impl DeltaTableBuilder {
         self
     }
 
+    /// Changes behavior for table load. If set the table load will seek the commit log
+    /// from the last checkpoint up until the next possible checkpoint
+    pub fn with_log_seek_checkpoint_interval(mut self, checkpoint_interval: i64) -> Self {
+        self.options.log_seek_checkpoint_interval = Some(checkpoint_interval);
+        self
+    }
+
     /// Storage options for configuring backend object store
     pub fn storage_options(&self) -> StorageOptions {
         let mut storage_options = self.storage_options.clone().unwrap_or_default();
@@ -315,6 +332,7 @@ impl DeltaTableBuilder {
             require_files: self.options.require_files,
             log_buffer_size: self.options.log_buffer_size,
             log_batch_size: self.options.log_batch_size,
+            log_seek_checkpoint_interval: self.options.log_seek_checkpoint_interval,
         };
         Ok(DeltaTable::new(self.build_storage()?, config))
     }

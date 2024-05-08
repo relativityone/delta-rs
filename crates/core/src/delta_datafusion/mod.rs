@@ -57,8 +57,7 @@ use datafusion::physical_plan::{
 use datafusion_common::scalar::ScalarValue;
 use datafusion_common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
 use datafusion_common::{
-    config::ConfigOptions, Column, DataFusionError, Result as DataFusionResult,
-    ToDFSchema,
+    config::ConfigOptions, Column, DataFusionError, Result as DataFusionResult, ToDFSchema,
 };
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::logical_plan::CreateExternalTable;
