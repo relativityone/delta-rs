@@ -447,6 +447,17 @@ async fn list_log_files_with_checkpoint(
                 .try_take_while(|m| futures::future::ok::<_, object_store::Error>(m.is_some()))
                 // Collect all found files which is everything up until this point
                 .try_filter_map(|m| futures::future::ok(m))
+                .map_ok(|m| {
+                    // in order to mimic list response we need to remove additional prefix if present
+                    if let Some(i) = m.location.as_ref().find(log_root.as_ref()) {
+                        ObjectMeta {
+                            location: String::from(m.location).split_off(i).into(),
+                            ..m
+                        }
+                    } else {
+                        m
+                    }
+                })
                 .try_collect::<Vec<_>>()
                 .await?
         }
