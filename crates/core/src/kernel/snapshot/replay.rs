@@ -338,13 +338,11 @@ pub(super) mod tests {
 
     use super::super::log_segment::LogSegment;
     use super::*;
-    use crate::kernel::{
-        models::ActionType, snapshot::log_segment::tests::table_load_config, StructType,
-    };
+    use crate::kernel::{models::ActionType, StructType};
 
     pub(crate) async fn test_log_replay(
         context: &IntegrationContext,
-        seek_log: bool,
+        config: &DeltaTableConfig,
     ) -> TestResult {
         let log_schema = Arc::new(StructType::new(vec![
             ActionType::Add.schema_field().clone(),
@@ -356,7 +354,6 @@ pub(super) mod tests {
             .build_storage()?
             .object_store();
 
-        let config = table_load_config(TestTables::SimpleWithCheckpoint, seek_log);
         let segment =
             LogSegment::try_new(&Path::default(), Some(9), store.as_ref(), &config).await?;
         let mut scanner = LogReplayScanner::new();

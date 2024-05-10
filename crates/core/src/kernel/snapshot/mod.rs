@@ -550,7 +550,6 @@ mod tests {
     use deltalake_test::utils::*;
     use futures::TryStreamExt;
     use itertools::Itertools;
-    use tests::log_segment::tests::table_load_config;
 
     use super::log_segment::tests::test_log_segment;
     use super::replay::tests::test_log_replay;
@@ -566,10 +565,12 @@ mod tests {
         context.load_table(TestTables::SimpleWithCheckpoint).await?;
         context.load_table(TestTables::WithDvSmall).await?;
 
-        test_log_segment(&context, false).await?;
-        test_log_replay(&context, false).await?;
-        test_snapshot(&context, false).await?;
-        test_eager_snapshot(&context, false).await?;
+        let config = DeltaTableConfig::default();
+
+        test_log_segment(&context, &config).await?;
+        test_log_replay(&context, &config).await?;
+        test_snapshot(&context, &config).await?;
+        test_eager_snapshot(&context, &config).await?;
 
         Ok(())
     }
@@ -582,15 +583,20 @@ mod tests {
         context.load_table(TestTables::SimpleWithCheckpoint).await?;
         context.load_table(TestTables::WithDvSmall).await?;
 
-        test_log_segment(&context, true).await?;
-        test_log_replay(&context, true).await?;
-        test_snapshot(&context, true).await?;
-        test_eager_snapshot(&context, true).await?;
+        let config = DeltaTableConfig {
+            seek_from_checkpoint: true,
+            ..Default::default()
+        };
+
+        test_log_segment(&context, &config).await?;
+        test_log_replay(&context, &config).await?;
+        test_snapshot(&context, &config).await?;
+        test_eager_snapshot(&context, &config).await?;
 
         Ok(())
     }
 
-    async fn test_snapshot(context: &IntegrationContext, seek_log: bool) -> TestResult {
+    async fn test_snapshot(context: &IntegrationContext, config: &DeltaTableConfig) -> TestResult {
         let store = context
             .table_builder(TestTables::Simple)
             .build_storage()?
@@ -644,7 +650,6 @@ mod tests {
             .build_storage()?
             .object_store();
 
-        let config = table_load_config(TestTables::Checkpoints, seek_log);
         for version in 0..=12 {
             let snapshot = Snapshot::try_new(
                 &Path::default(),
@@ -664,7 +669,10 @@ mod tests {
         Ok(())
     }
 
-    async fn test_eager_snapshot(context: &IntegrationContext, seek_log: bool) -> TestResult {
+    async fn test_eager_snapshot(
+        context: &IntegrationContext,
+        config: &DeltaTableConfig,
+    ) -> TestResult {
         let store = context
             .table_builder(TestTables::Simple)
             .build_storage()?
@@ -682,7 +690,6 @@ mod tests {
         let expected: StructType = serde_json::from_str(schema_string)?;
         assert_eq!(snapshot.schema(), &expected);
 
-        let config = table_load_config(TestTables::Checkpoints, seek_log);
         let store = context
             .table_builder(TestTables::Checkpoints)
             .build_storage()?
