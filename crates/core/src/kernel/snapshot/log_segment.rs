@@ -104,9 +104,7 @@ impl LogSegment {
 
         // List relevant files from log
         let (mut commit_files, checkpoint_files) = match (maybe_cp, version) {
-            (Some(cp), None) => {
-                list_log_files_with_checkpoint(&cp, store, &log_url).await?
-            }
+            (Some(cp), None) => list_log_files_with_checkpoint(&cp, store, &log_url).await?,
             (Some(cp), Some(v)) if cp.version <= v => {
                 list_log_files_with_checkpoint(&cp, store, &log_url).await?
             }
@@ -566,8 +564,7 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(cp.version, 10);
 
-        let (log, check) =
-            list_log_files_with_checkpoint(&cp, store.as_ref(), &log_path).await?;
+        let (log, check) = list_log_files_with_checkpoint(&cp, store.as_ref(), &log_path).await?;
         assert_eq!(log.len(), 0);
         assert_eq!(check.len(), 1);
 
@@ -584,8 +581,7 @@ pub(super) mod tests {
         assert_eq!(segment.commit_files.len(), 0);
         assert_eq!(segment.checkpoint_files.len(), 1);
 
-        let segment =
-            LogSegment::try_new(&Path::default(), Some(8), store.as_ref()).await?;
+        let segment = LogSegment::try_new(&Path::default(), Some(8), store.as_ref()).await?;
         assert_eq!(segment.version, 8);
         assert_eq!(segment.commit_files.len(), 9);
         assert_eq!(segment.checkpoint_files.len(), 0);

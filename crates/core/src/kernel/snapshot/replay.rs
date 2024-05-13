@@ -351,8 +351,7 @@ pub(super) mod tests {
             .build_storage()?
             .object_store();
 
-        let segment =
-            LogSegment::try_new(&Path::default(), Some(9), store.as_ref()).await?;
+        let segment = LogSegment::try_new(&Path::default(), Some(9), store.as_ref()).await?;
         let mut scanner = LogReplayScanner::new();
 
         let batches = segment
@@ -373,9 +372,7 @@ pub(super) mod tests {
             .table_builder(TestTables::Simple)
             .build_storage()?
             .object_store();
-        let segment =
-            LogSegment::try_new(&Path::default(), None, store.as_ref())
-                .await?;
+        let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
         let batches = segment
             .commit_stream(store.clone(), &log_schema, &Default::default())?
             .try_collect::<Vec<_>>()
