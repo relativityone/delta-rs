@@ -340,10 +340,7 @@ pub(super) mod tests {
     use super::*;
     use crate::kernel::{models::ActionType, StructType};
 
-    pub(crate) async fn test_log_replay(
-        context: &IntegrationContext,
-        config: &DeltaTableConfig,
-    ) -> TestResult {
+    pub(crate) async fn test_log_replay(context: &IntegrationContext) -> TestResult {
         let log_schema = Arc::new(StructType::new(vec![
             ActionType::Add.schema_field().clone(),
             ActionType::Remove.schema_field().clone(),
@@ -355,7 +352,7 @@ pub(super) mod tests {
             .object_store();
 
         let segment =
-            LogSegment::try_new(&Path::default(), Some(9), store.as_ref(), &config).await?;
+            LogSegment::try_new(&Path::default(), Some(9), store.as_ref()).await?;
         let mut scanner = LogReplayScanner::new();
 
         let batches = segment
@@ -377,7 +374,7 @@ pub(super) mod tests {
             .build_storage()?
             .object_store();
         let segment =
-            LogSegment::try_new(&Path::default(), None, store.as_ref(), &Default::default())
+            LogSegment::try_new(&Path::default(), None, store.as_ref())
                 .await?;
         let batches = segment
             .commit_stream(store.clone(), &log_schema, &Default::default())?

@@ -79,9 +79,6 @@ pub struct DeltaTableConfig {
     /// Control the number of records to read / process from the commit / checkpoint files
     /// when processing record batches.
     pub log_batch_size: usize,
-    /// When true, instead of listing the _delta_log directory, table load will attempt to load versions
-    /// incrementally from the last checkpoint up until one is not found.
-    pub seek_from_checkpoint: bool,
 }
 
 impl Default for DeltaTableConfig {
@@ -91,7 +88,6 @@ impl Default for DeltaTableConfig {
             require_files: true,
             log_buffer_size: num_cpus::get() * 4,
             log_batch_size: 1024,
-            seek_from_checkpoint: false,
         }
     }
 }
@@ -130,9 +126,6 @@ pub struct DeltaTableLoadOptions {
     /// Control the number of records to read / process from the commit / checkpoint files
     /// when processing record batches.
     pub log_batch_size: usize,
-    /// When true, instead of listing the _delta_log directory, table load will attempt to load versions
-    /// incrementally from the last checkpoint up until one is not found.
-    pub seek_from_checkpoint: bool,
 }
 
 impl DeltaTableLoadOptions {
@@ -146,7 +139,6 @@ impl DeltaTableLoadOptions {
             log_buffer_size: num_cpus::get() * 4,
             version: DeltaVersion::default(),
             log_batch_size: 1024,
-            seek_from_checkpoint: false,
         }
     }
 }
@@ -281,13 +273,6 @@ impl DeltaTableBuilder {
         self
     }
 
-    /// Changes behavior for table load. If true the table load will seek the commit log
-    /// from the last checkpoint up until a version is not found.
-    pub fn with_seek_from_checkpoint(mut self, seek: bool) -> Self {
-        self.options.seek_from_checkpoint = seek;
-        self
-    }
-
     /// Storage options for configuring backend object store
     pub fn storage_options(&self) -> StorageOptions {
         let mut storage_options = self.storage_options.clone().unwrap_or_default();
@@ -330,7 +315,6 @@ impl DeltaTableBuilder {
             require_files: self.options.require_files,
             log_buffer_size: self.options.log_buffer_size,
             log_batch_size: self.options.log_batch_size,
-            seek_from_checkpoint: self.options.seek_from_checkpoint,
         };
         Ok(DeltaTable::new(self.build_storage()?, config))
     }

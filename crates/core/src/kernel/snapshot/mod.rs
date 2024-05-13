@@ -63,7 +63,7 @@ impl Snapshot {
         config: DeltaTableConfig,
         version: Option<i64>,
     ) -> DeltaResult<Self> {
-        let log_segment = LogSegment::try_new(table_root, version, store.as_ref(), &config).await?;
+        let log_segment = LogSegment::try_new(table_root, version, store.as_ref()).await?;
         let (protocol, metadata) = log_segment.read_metadata(store.clone(), &config).await?;
         if metadata.is_none() || protocol.is_none() {
             return Err(DeltaTableError::Generic(
@@ -565,38 +565,15 @@ mod tests {
         context.load_table(TestTables::SimpleWithCheckpoint).await?;
         context.load_table(TestTables::WithDvSmall).await?;
 
-        let config = DeltaTableConfig::default();
-
-        test_log_segment(&context, &config).await?;
-        test_log_replay(&context, &config).await?;
-        test_snapshot(&context, &config).await?;
-        test_eager_snapshot(&context, &config).await?;
+        test_log_segment(&context).await?;
+        test_log_replay(&context).await?;
+        test_snapshot(&context).await?;
+        test_eager_snapshot(&context).await?;
 
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_snapshots_seek() -> TestResult {
-        let context = IntegrationContext::new(Box::<LocalStorageIntegration>::default())?;
-        context.load_table(TestTables::Checkpoints).await?;
-        context.load_table(TestTables::Simple).await?;
-        context.load_table(TestTables::SimpleWithCheckpoint).await?;
-        context.load_table(TestTables::WithDvSmall).await?;
-
-        let config = DeltaTableConfig {
-            seek_from_checkpoint: true,
-            ..Default::default()
-        };
-
-        test_log_segment(&context, &config).await?;
-        test_log_replay(&context, &config).await?;
-        test_snapshot(&context, &config).await?;
-        test_eager_snapshot(&context, &config).await?;
-
-        Ok(())
-    }
-
-    async fn test_snapshot(context: &IntegrationContext, config: &DeltaTableConfig) -> TestResult {
+    async fn test_snapshot(context: &IntegrationContext) -> TestResult {
         let store = context
             .table_builder(TestTables::Simple)
             .build_storage()?
@@ -654,7 +631,7 @@ mod tests {
             let snapshot = Snapshot::try_new(
                 &Path::default(),
                 store.clone(),
-                config.clone(),
+                Default::default(),
                 Some(version),
             )
             .await?;
@@ -669,10 +646,7 @@ mod tests {
         Ok(())
     }
 
-    async fn test_eager_snapshot(
-        context: &IntegrationContext,
-        config: &DeltaTableConfig,
-    ) -> TestResult {
+    async fn test_eager_snapshot(context: &IntegrationContext) -> TestResult {
         let store = context
             .table_builder(TestTables::Simple)
             .build_storage()?
@@ -699,7 +673,7 @@ mod tests {
             let snapshot = EagerSnapshot::try_new(
                 &Path::default(),
                 store.clone(),
-                config.clone(),
+                Default::default(),
                 Some(version),
             )
             .await?;
