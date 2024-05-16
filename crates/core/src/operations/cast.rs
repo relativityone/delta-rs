@@ -3,11 +3,12 @@
 use crate::kernel::{
     ArrayType, DataType as DeltaDataType, MapType, MetadataValue, StructField, StructType,
 };
-use arrow_array::{new_null_array, Array, ArrayRef, RecordBatch, StructArray};
+use arrow_array::{new_null_array, Array, ArrayRef, RecordBatch, StructArray, RecordBatchOptions, GenericListArray, OffsetSizeTrait, MapArray};
 use arrow_cast::{cast_with_options, CastOptions};
-use arrow_schema::{ArrowError, DataType, Fields, SchemaRef as ArrowSchemaRef};
+use arrow_schema::{ArrowError, DataType, FieldRef, Fields, SchemaRef as ArrowSchemaRef};
 use std::collections::HashMap;
 use std::sync::Arc;
+use arrow_array::cast::AsArray;
 
 use crate::DeltaResult;
 
@@ -131,8 +132,10 @@ fn cast_struct(
     fields: &Fields,
     cast_options: &CastOptions,
     add_missing: bool,
-) -> Result<Vec<Arc<(dyn Array)>>, arrow_schema::ArrowError> {
-    fields
+) -> Result<StructArray, ArrowError> {
+    Ok(StructArray::new(
+        fields.to_owned(),
+        fields
         .iter()
         .map(|field| {
             let col_or_not = struct_array.column_by_name(field.name());
@@ -144,27 +147,107 @@ fn cast_struct(
                         field.name()
                     ))),
                 },
-                Some(col) => {
-                    if let (DataType::Struct(_), DataType::Struct(child_fields)) =
-                        (col.data_type(), field.data_type())
-                    {
-                        let child_struct = StructArray::from(col.into_data());
-                        let s =
-                            cast_struct(&child_struct, child_fields, cast_options, add_missing)?;
-                        Ok(Arc::new(StructArray::new(
-                            child_fields.clone(),
-                            s,
-                            child_struct.nulls().map(ToOwned::to_owned),
-                        )) as ArrayRef)
-                    } else if is_cast_required(col.data_type(), field.data_type()) {
-                        cast_with_options(col, field.data_type(), cast_options)
-                    } else {
-                        Ok(col.clone())
-                    }
-                }
+                Some(col) =>
+                    cast_field(col, field, cast_options, add_missing)
             }
         })
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>, _>>()?,
+        struct_array.nulls().map(ToOwned::to_owned),
+    ))
+}
+
+fn cast_list<T: OffsetSizeTrait>(
+    array: &GenericListArray<T>,
+    field: &FieldRef,
+    cast_options: &CastOptions,
+    add_missing: bool,
+) -> Result<GenericListArray<T>, ArrowError> {
+    let values = cast_field(array.values(), &field, cast_options, add_missing)?;
+    GenericListArray::<T>::try_new(
+        field.clone(),
+        array.offsets().clone(),
+        values,
+        array.nulls().cloned(),
+    )
+}
+
+fn cast_map(
+    array: &MapArray,
+    entries_field: &FieldRef,
+    sorted: bool,
+    cast_options: &CastOptions,
+    add_missing: bool,
+) -> Result<MapArray, ArrowError> {
+    match entries_field.data_type() {
+        DataType::Struct(entry_fields) => {
+            let entries = cast_struct(array.entries(), entry_fields, cast_options, add_missing)?;
+            MapArray::try_new(
+                entries_field.clone(),
+                array.offsets().to_owned(),
+                entries,
+                array.nulls().cloned(),
+                sorted,
+            )
+        }
+        _ => Err(ArrowError::CastError(
+            "Map entries must be a struct".to_string(),
+        )),
+    }
+}
+
+fn cast_field(col: &ArrayRef, field: &FieldRef, cast_options: &CastOptions, add_missing: bool) -> Result<ArrayRef, ArrowError> {
+    if let (DataType::Struct(_), DataType::Struct(child_fields)) =
+        (col.data_type(), field.data_type())
+    {
+        let child_struct = StructArray::from(col.into_data());
+        Ok(Arc::new(
+            cast_struct(&child_struct, child_fields, cast_options, add_missing)?
+        ) as ArrayRef)
+    } else if let (DataType::List(_), DataType::List(child_fields)) =
+        (col.data_type(), field.data_type())
+    {
+        Ok(Arc::new(cast_list(
+            col.as_any().downcast_ref::<GenericListArray<i32>>().ok_or(ArrowError::CastError(format!(
+                "Expected a list for {} but got {}",
+                field.name(),
+                col.data_type()
+            )))?,
+            child_fields,
+            cast_options,
+            add_missing,
+        )?) as ArrayRef)
+    } else if let (DataType::LargeList(_), DataType::LargeList(child_fields)) =
+        (col.data_type(), field.data_type())
+    {
+        Ok(Arc::new(cast_list(
+            col.as_any().downcast_ref::<GenericListArray<i64>>().ok_or(ArrowError::CastError(format!(
+                "Expected a list for {} but got {}",
+                field.name(),
+                col.data_type()
+            )))?,
+            child_fields,
+            cast_options,
+            add_missing,
+        )?) as ArrayRef)
+    } else if let (DataType::Map(_, _), DataType::Map(child_fields, sorted)) =
+        (col.data_type(), field.data_type())
+    {
+        Ok(Arc::new(cast_map(
+            col.as_map_opt().ok_or(ArrowError::CastError(format!(
+                "Expected a map for {} but got {}",
+                field.name(),
+                col.data_type()
+            )))?,
+            child_fields,
+            *sorted,
+            cast_options,
+            add_missing,
+        )?) as ArrayRef)
+    } else if is_cast_required(col.data_type(), field.data_type()) {
+        cast_with_options(col, field.data_type(), cast_options)
+    } else {
+        Ok(col.clone())
+    }
 }
 
 fn is_cast_required(a: &DataType, b: &DataType) -> bool {
@@ -194,8 +277,11 @@ pub fn cast_record_batch(
         batch.columns().to_owned(),
         None,
     );
-    let columns = cast_struct(&s, target_schema.fields(), &cast_options, add_missing)?;
-    Ok(RecordBatch::try_new(target_schema, columns)?)
+    let struct_array = cast_struct(&s, target_schema.fields(), &cast_options, add_missing)?;
+    Ok(RecordBatch::try_new_with_options(
+        target_schema,
+        struct_array.columns().to_vec(),
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())))?)
 }
 
 #[cfg(test)]

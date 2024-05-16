@@ -69,3 +69,13 @@ async-trait = { version = "0.1" }
 futures = { version = "0.3" }
 tokio = { version = "1" }
 num_cpus = { version = "1" }
+
+[patch.crates-io]
+datafusion = { git = "https://github.com/relativityone/datafusion.git", branch = "v37.1.0-main" }
+datafusion-expr = { git = "https://github.com/relativityone/datafusion.git", branch = "v37.1.0-main" }
+datafusion-common = { git = "https://github.com/relativityone/datafusion.git", branch = "v37.1.0-main" }
+datafusion-proto = { git = "https://github.com/relativityone/datafusion.git", branch = "v37.1.0-main" }
+datafusion-sql = { git = "https://github.com/relativityone/datafusion.git", branch = "v37.1.0-main" }
+datafusion-physical-expr = { git = "https://github.com/relativityone/datafusion.git", branch = "v37.1.0-main" }
+datafusion-functions = { git = "https://github.com/relativityone/datafusion.git", branch = "v37.1.0-main" }
+datafusion-functions-array = { git = "https://github.com/relativityone/datafusion.git", branch = "v37.1.0-main" }
