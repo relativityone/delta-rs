@@ -40,7 +40,6 @@ use arrow_cast::display::array_value_to_string;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
-use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::physical_plan::{wrap_partition_type_in_dict, wrap_partition_value_in_dict, FileScanConfig, ParquetExec};
 use datafusion::datasource::provider::TableProviderFactory;
 use datafusion::datasource::{listing::PartitionedFile, MemTable, TableProvider, TableType};
@@ -514,11 +513,7 @@ impl<'a> DeltaScanBuilder<'a> {
         let config = self.config;
         let schema = match self.schema {
             Some(schema) => schema,
-            None => {
-                self.snapshot
-                    .physical_arrow_schema(self.log_store.object_store())
-                    .await?
-            }
+            None => self.snapshot.arrow_schema()?
         };
         let logical_schema = df_logical_schema(self.snapshot, &config)?;
 
