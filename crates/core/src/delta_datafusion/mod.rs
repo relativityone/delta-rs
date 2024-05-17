@@ -40,7 +40,9 @@ use arrow_cast::display::array_value_to_string;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
-use datafusion::datasource::physical_plan::{wrap_partition_type_in_dict, wrap_partition_value_in_dict, FileScanConfig, ParquetExec};
+use datafusion::datasource::physical_plan::{
+    wrap_partition_type_in_dict, wrap_partition_value_in_dict, FileScanConfig, ParquetExec,
+};
 use datafusion::datasource::provider::TableProviderFactory;
 use datafusion::datasource::{listing::PartitionedFile, MemTable, TableProvider, TableType};
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState, TaskContext};
@@ -53,13 +55,13 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     Statistics,
 };
+use datafusion_common::config::TableParquetOptions;
 use datafusion_common::scalar::ScalarValue;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::{
     config::ConfigOptions, Column, DFSchema, DataFusionError, Result as DataFusionResult,
     ToDFSchema,
 };
-use datafusion_common::config::TableParquetOptions;
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::logical_plan::CreateExternalTable;
 use datafusion_expr::utils::conjunction;
@@ -83,6 +85,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::delta_datafusion::expr::parse_predicate_expression;
+use crate::delta_datafusion::schema_adapter::DeltaSchemaAdapterFactory;
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::{Add, DataCheck, EagerSnapshot, Invariant, Snapshot};
 use crate::logstore::LogStoreRef;
@@ -90,7 +93,6 @@ use crate::table::builder::ensure_table_uri;
 use crate::table::state::DeltaTableState;
 use crate::table::Constraint;
 use crate::{open_table, open_table_with_storage_options, DeltaTable};
-use crate::delta_datafusion::schema_adapter::DeltaSchemaAdapterFactory;
 
 const PATH_COLUMN: &str = "__delta_rs_path";
 
@@ -513,7 +515,7 @@ impl<'a> DeltaScanBuilder<'a> {
         let config = self.config;
         let schema = match self.schema {
             Some(schema) => schema,
-            None => self.snapshot.arrow_schema()?
+            None => self.snapshot.arrow_schema()?,
         };
         let logical_schema = df_logical_schema(self.snapshot, &config)?;
 
@@ -639,7 +641,8 @@ impl<'a> DeltaScanBuilder<'a> {
             parquet_pushdown,
             None,
             TableParquetOptions::default(),
-        ).with_schema_adapter_factory(Arc::new(DeltaSchemaAdapterFactory{}));
+        )
+        .with_schema_adapter_factory(Arc::new(DeltaSchemaAdapterFactory {}));
 
         Ok(DeltaScan {
             table_uri: ensure_table_uri(self.log_store.root_uri())?.as_str().into(),
@@ -2174,16 +2177,20 @@ mod tests {
 
     #[tokio::test]
     async fn delta_scan_supports_missing_columns() {
-        let schema1 = Arc::new(ArrowSchema::new(vec![
-            Field::new("col_1", DataType::Utf8, true),
-        ]));
+        let schema1 = Arc::new(ArrowSchema::new(vec![Field::new(
+            "col_1",
+            DataType::Utf8,
+            true,
+        )]));
 
         let batch1 = RecordBatch::try_new(
             schema1.clone(),
-            vec![
-                Arc::new(arrow::array::StringArray::from(vec![Some("A"), Some("B")])),
-            ],
-        ).unwrap();
+            vec![Arc::new(arrow::array::StringArray::from(vec![
+                Some("A"),
+                Some("B"),
+            ]))],
+        )
+        .unwrap();
 
         let schema2 = Arc::new(ArrowSchema::new(vec![
             Field::new("col_1", DataType::Utf8, true),
@@ -2193,10 +2200,19 @@ mod tests {
         let batch2 = RecordBatch::try_new(
             schema2.clone(),
             vec![
-                Arc::new(arrow::array::StringArray::from(vec![Some("E"), Some("F"), Some("G")])),
-                Arc::new(arrow::array::StringArray::from(vec![Some("E2"), Some("F2"), Some("G2")])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    Some("E"),
+                    Some("F"),
+                    Some("G"),
+                ])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    Some("E2"),
+                    Some("F2"),
+                    Some("G2"),
+                ])),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let table = crate::DeltaOps::new_in_memory()
             .write(vec![batch2])
@@ -2221,10 +2237,7 @@ mod tests {
         let ctx: SessionContext = DeltaSessionContext::default().into();
         ctx.register_table("test", Arc::new(provider)).unwrap();
 
-        let df = ctx
-            .sql("select col_1, col_2 from test")
-            .await
-            .unwrap();
+        let df = ctx.sql("select col_1, col_2 from test").await.unwrap();
         let actual = df.collect().await.unwrap();
         let expected = vec![
             "+-------+-------+",
@@ -2242,39 +2255,58 @@ mod tests {
 
     #[tokio::test]
     async fn delta_scan_supports_nested_missing_columns() {
-        let column1_schema1: arrow::datatypes::Fields = vec![
-            Field::new("col_1a", DataType::Utf8, true),
-        ].into();
-        let schema1 = Arc::new(ArrowSchema::new(vec![
-            Field::new("col_1", DataType::Struct(column1_schema1.clone()), true),
-        ]));
+        let column1_schema1: arrow::datatypes::Fields =
+            vec![Field::new("col_1a", DataType::Utf8, true)].into();
+        let schema1 = Arc::new(ArrowSchema::new(vec![Field::new(
+            "col_1",
+            DataType::Struct(column1_schema1.clone()),
+            true,
+        )]));
 
         let batch1 = RecordBatch::try_new(
             schema1.clone(),
-            vec![
-                Arc::new(StructArray::new(column1_schema1, vec![
-                    Arc::new(arrow::array::StringArray::from(vec![Some("A"), Some("B")])),
-                ], None)),
-            ],
-        ).unwrap();
+            vec![Arc::new(StructArray::new(
+                column1_schema1,
+                vec![Arc::new(arrow::array::StringArray::from(vec![
+                    Some("A"),
+                    Some("B"),
+                ]))],
+                None,
+            ))],
+        )
+        .unwrap();
 
         let column1_schema2: arrow::datatypes::Fields = vec![
             Field::new("col_1a", DataType::Utf8, true),
             Field::new("col_1b", DataType::Utf8, true),
-        ].into();
-        let schema2 = Arc::new(ArrowSchema::new(vec![
-            Field::new("col_1", DataType::Struct(column1_schema2.clone()), true),
-        ]));
+        ]
+        .into();
+        let schema2 = Arc::new(ArrowSchema::new(vec![Field::new(
+            "col_1",
+            DataType::Struct(column1_schema2.clone()),
+            true,
+        )]));
 
         let batch2 = RecordBatch::try_new(
             schema2.clone(),
-            vec![
-                Arc::new(StructArray::new(column1_schema2, vec![
-                    Arc::new(arrow::array::StringArray::from(vec![Some("E"), Some("F"), Some("G")])),
-                    Arc::new(arrow::array::StringArray::from(vec![Some("E2"), Some("F2"), Some("G2")])),
-                ], None)),
-            ],
-        ).unwrap();
+            vec![Arc::new(StructArray::new(
+                column1_schema2,
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec![
+                        Some("E"),
+                        Some("F"),
+                        Some("G"),
+                    ])),
+                    Arc::new(arrow::array::StringArray::from(vec![
+                        Some("E2"),
+                        Some("F2"),
+                        Some("G2"),
+                    ])),
+                ],
+                None,
+            ))],
+        )
+        .unwrap();
 
         let table = crate::DeltaOps::new_in_memory()
             .write(vec![batch1])

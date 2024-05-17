@@ -1,3 +1,4 @@
+use crate::operations::cast::cast_record_batch;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::datasource::physical_plan::parquet::{
@@ -5,7 +6,6 @@ use datafusion::datasource::physical_plan::parquet::{
 };
 use std::fmt::Debug;
 use std::sync::Arc;
-use crate::operations::cast::cast_record_batch;
 
 /// A Schema Adapter Factory which provides casting record batches from parquet to meet
 /// delta lake conventions.
@@ -38,8 +38,7 @@ impl SchemaAdapter for DeltaSchemaAdapter {
         let mut projection = Vec::with_capacity(file_schema.fields().len());
 
         for (file_idx, file_field) in file_schema.fields.iter().enumerate() {
-            if let Some(_) = self.table_schema.fields().find(file_field.name())
-            {
+            if let Some(_) = self.table_schema.fields().find(file_field.name()) {
                 projection.push(file_idx);
             }
         }
