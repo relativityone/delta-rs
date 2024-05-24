@@ -3,12 +3,15 @@
 use crate::kernel::{
     ArrayType, DataType as DeltaDataType, MapType, MetadataValue, StructField, StructType,
 };
-use arrow_array::{new_null_array, Array, ArrayRef, RecordBatch, StructArray, RecordBatchOptions, GenericListArray, OffsetSizeTrait, MapArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{
+    new_null_array, Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch,
+    RecordBatchOptions, StructArray,
+};
 use arrow_cast::{cast_with_options, CastOptions};
 use arrow_schema::{ArrowError, DataType, FieldRef, Fields, SchemaRef as ArrowSchemaRef};
 use std::collections::HashMap;
 use std::sync::Arc;
-use arrow_array::cast::AsArray;
 
 use crate::DeltaResult;
 
@@ -136,22 +139,21 @@ fn cast_struct(
     Ok(StructArray::new(
         fields.to_owned(),
         fields
-        .iter()
-        .map(|field| {
-            let col_or_not = struct_array.column_by_name(field.name());
-            match col_or_not {
-                None => match add_missing {
-                    true => Ok(new_null_array(field.data_type(), struct_array.len())),
-                    false => Err(arrow_schema::ArrowError::SchemaError(format!(
-                        "Could not find column {0}",
-                        field.name()
-                    ))),
-                },
-                Some(col) =>
-                    cast_field(col, field, cast_options, add_missing)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?,
+            .iter()
+            .map(|field| {
+                let col_or_not = struct_array.column_by_name(field.name());
+                match col_or_not {
+                    None => match add_missing {
+                        true => Ok(new_null_array(field.data_type(), struct_array.len())),
+                        false => Err(ArrowError::SchemaError(format!(
+                            "Could not find column {0}",
+                            field.name()
+                        ))),
+                    },
+                    Some(col) => cast_field(col, field, cast_options, add_missing),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         struct_array.nulls().map(ToOwned::to_owned),
     ))
 }
@@ -195,23 +197,33 @@ fn cast_map(
     }
 }
 
-fn cast_field(col: &ArrayRef, field: &FieldRef, cast_options: &CastOptions, add_missing: bool) -> Result<ArrayRef, ArrowError> {
+fn cast_field(
+    col: &ArrayRef,
+    field: &FieldRef,
+    cast_options: &CastOptions,
+    add_missing: bool,
+) -> Result<ArrayRef, ArrowError> {
     if let (DataType::Struct(_), DataType::Struct(child_fields)) =
         (col.data_type(), field.data_type())
     {
         let child_struct = StructArray::from(col.into_data());
-        Ok(Arc::new(
-            cast_struct(&child_struct, child_fields, cast_options, add_missing)?
-        ) as ArrayRef)
+        Ok(Arc::new(cast_struct(
+            &child_struct,
+            child_fields,
+            cast_options,
+            add_missing,
+        )?) as ArrayRef)
     } else if let (DataType::List(_), DataType::List(child_fields)) =
         (col.data_type(), field.data_type())
     {
         Ok(Arc::new(cast_list(
-            col.as_any().downcast_ref::<GenericListArray<i32>>().ok_or(ArrowError::CastError(format!(
-                "Expected a list for {} but got {}",
-                field.name(),
-                col.data_type()
-            )))?,
+            col.as_any()
+                .downcast_ref::<GenericListArray<i32>>()
+                .ok_or(ArrowError::CastError(format!(
+                    "Expected a list for {} but got {}",
+                    field.name(),
+                    col.data_type()
+                )))?,
             child_fields,
             cast_options,
             add_missing,
@@ -220,11 +232,13 @@ fn cast_field(col: &ArrayRef, field: &FieldRef, cast_options: &CastOptions, add_
         (col.data_type(), field.data_type())
     {
         Ok(Arc::new(cast_list(
-            col.as_any().downcast_ref::<GenericListArray<i64>>().ok_or(ArrowError::CastError(format!(
-                "Expected a list for {} but got {}",
-                field.name(),
-                col.data_type()
-            )))?,
+            col.as_any()
+                .downcast_ref::<GenericListArray<i64>>()
+                .ok_or(ArrowError::CastError(format!(
+                    "Expected a list for {} but got {}",
+                    field.name(),
+                    col.data_type()
+                )))?,
             child_fields,
             cast_options,
             add_missing,
@@ -281,7 +295,8 @@ pub fn cast_record_batch(
     Ok(RecordBatch::try_new_with_options(
         target_schema,
         struct_array.columns().to_vec(),
-        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())))?)
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )?)
 }
 
 #[cfg(test)]
