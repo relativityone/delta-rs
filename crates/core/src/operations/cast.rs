@@ -144,8 +144,10 @@ fn cast_struct(
                 let col_or_not = struct_array.column_by_name(field.name());
                 match col_or_not {
                     None => match add_missing {
-                        true => Ok(new_null_array(field.data_type(), struct_array.len())),
-                        false => Err(ArrowError::SchemaError(format!(
+                        true if field.is_nullable() => {
+                            Ok(new_null_array(field.data_type(), struct_array.len()))
+                        }
+                        _ => Err(ArrowError::SchemaError(format!(
                             "Could not find column {0}",
                             field.name()
                         ))),

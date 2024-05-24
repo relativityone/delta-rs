@@ -59,7 +59,6 @@ pub(crate) struct SchemaMapping {
 
 impl SchemaMapper for SchemaMapping {
     fn map_batch(&self, batch: RecordBatch) -> datafusion_common::Result<RecordBatch> {
-        // TODO check that only the nullable fields are missing otherwise the record batch won't match the desired schema
         let record_batch = cast_record_batch(&batch, self.table_schema.clone(), false, true)?;
         Ok(record_batch)
     }
