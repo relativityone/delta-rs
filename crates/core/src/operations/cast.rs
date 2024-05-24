@@ -58,7 +58,7 @@ pub(crate) fn merge_struct(
                             field.is_nullable() || right_field.is_nullable(),
                         );
 
-                        new_field.metadata = field.metadata.clone();
+                        new_field.metadata.clone_from(&field.metadata);
                         try_merge_metadata(&mut new_field.metadata, &right_field.metadata)?;
                         Ok(new_field)
                     }
@@ -136,7 +136,7 @@ fn cast_struct(
     cast_options: &CastOptions,
     add_missing: bool,
 ) -> Result<StructArray, ArrowError> {
-    Ok(StructArray::new(
+    StructArray::try_new(
         fields.to_owned(),
         fields
             .iter()
@@ -155,7 +155,7 @@ fn cast_struct(
             })
             .collect::<Result<Vec<_>, _>>()?,
         struct_array.nulls().map(ToOwned::to_owned),
-    ))
+    )
 }
 
 fn cast_list<T: OffsetSizeTrait>(
@@ -164,7 +164,7 @@ fn cast_list<T: OffsetSizeTrait>(
     cast_options: &CastOptions,
     add_missing: bool,
 ) -> Result<GenericListArray<T>, ArrowError> {
-    let values = cast_field(array.values(), &field, cast_options, add_missing)?;
+    let values = cast_field(array.values(), field, cast_options, add_missing)?;
     GenericListArray::<T>::try_new(
         field.clone(),
         array.offsets().clone(),
@@ -301,15 +301,21 @@ pub fn cast_record_batch(
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
+
     use crate::kernel::{
         ArrayType as DeltaArrayType, DataType as DeltaDataType, StructField as DeltaStructField,
         StructType as DeltaStructType,
     };
     use crate::operations::cast::MetadataValue;
     use crate::operations::cast::{cast_record_batch, is_cast_required};
-    use arrow::array::ArrayData;
-    use arrow_array::{Array, ArrayRef, ListArray, RecordBatch};
-    use arrow_buffer::Buffer;
+    use arrow::array::types::Int32Type;
+    use arrow::array::{
+        new_empty_array, new_null_array, Array, ArrayData, ArrayRef, AsArray, Int32Array,
+        ListArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    };
+    use arrow::buffer::{Buffer, NullBuffer};
+    use arrow::datatypes::DataType::Struct;
     use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -451,5 +457,304 @@ mod tests {
         )));
 
         assert!(is_cast_required(&field1, &field2));
+    }
+
+    #[test]
+    fn test_add_missing_null_fields_with_no_missing_fields() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new("field2", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+            ],
+        )
+        .unwrap();
+        let result = cast_record_batch(&batch, schema.clone(), false, true).unwrap();
+        assert_eq!(result.schema(), schema);
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(
+            result.column(0).deref().as_primitive::<Int32Type>(),
+            &PrimitiveArray::<Int32Type>::from_iter([1, 2, 3])
+        );
+        assert_eq!(
+            result.column(1).deref().as_string(),
+            &StringArray::from(vec![Some("a"), None, Some("c")])
+        );
+    }
+
+    #[test]
+    fn test_add_missing_null_fields_with_missing_beginning() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field2",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                Some("a"),
+                None,
+                Some("c"),
+            ]))],
+        )
+        .unwrap();
+
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, true),
+            Field::new("field2", DataType::Utf8, true),
+        ]));
+        let result = cast_record_batch(&batch, new_schema.clone(), false, true).unwrap();
+        assert_eq!(result.schema(), new_schema);
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(
+            result.column(0).deref().as_primitive::<Int32Type>(),
+            new_null_array(&DataType::Int32, 3)
+                .deref()
+                .as_primitive::<Int32Type>()
+        );
+        assert_eq!(
+            result.column(1).deref().as_string(),
+            &StringArray::from(vec![Some("a"), None, Some("c")])
+        );
+    }
+
+    #[test]
+    fn test_add_missing_null_fields_with_missing_end() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field1",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new("field2", DataType::Utf8, true),
+        ]));
+        let result = cast_record_batch(&batch, new_schema.clone(), false, true).unwrap();
+        assert_eq!(result.schema(), new_schema);
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(
+            result.column(0).deref().as_primitive::<Int32Type>(),
+            &PrimitiveArray::<Int32Type>::from(vec![Some(1), Some(2), Some(3)])
+        );
+        assert_eq!(
+            result.column(1).deref().as_string::<i32>(),
+            new_null_array(&DataType::Utf8, 3).deref().as_string()
+        );
+    }
+
+    #[test]
+    fn test_add_missing_null_fields_error_on_missing_non_null() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field1",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new("field2", DataType::Utf8, false),
+        ]));
+        let result = cast_record_batch(&batch, new_schema.clone(), false, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_missing_null_fields_nested_struct_missing() {
+        let nested_fields = Fields::from(vec![Field::new("nested1", DataType::Utf8, true)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new("field2", DataType::Struct(nested_fields.clone()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StructArray::new(
+                    nested_fields,
+                    vec![Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])) as ArrayRef],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new(
+                "field2",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("nested1", DataType::Utf8, true),
+                    Field::new("nested2", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+        ]));
+        let result = cast_record_batch(&batch, new_schema.clone(), false, true).unwrap();
+        assert_eq!(result.schema(), new_schema);
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(
+            result.column(0).deref().as_primitive::<Int32Type>(),
+            &PrimitiveArray::<Int32Type>::from_iter([1, 2, 3])
+        );
+        let struct_column = result.column(1).deref().as_struct();
+        assert_eq!(struct_column.num_columns(), 2);
+        assert_eq!(
+            struct_column.column(0).deref().as_string(),
+            &StringArray::from(vec![Some("a"), None, Some("c")])
+        );
+        assert_eq!(
+            struct_column.column(1).deref().as_string::<i32>(),
+            new_null_array(&DataType::Utf8, 3).deref().as_string()
+        );
+    }
+
+    #[test]
+    fn test_add_missing_null_fields_nested_struct_missing_non_nullable() {
+        let nested_fields = Fields::from(vec![Field::new("nested1", DataType::Utf8, false)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new("field2", DataType::Struct(nested_fields.clone()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StructArray::new(
+                    nested_fields,
+                    vec![new_null_array(&DataType::Utf8, 3)],
+                    Some(NullBuffer::new_null(3)),
+                )),
+            ],
+        )
+        .unwrap();
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new(
+                "field2",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("nested1", DataType::Utf8, false),
+                    Field::new("nested2", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+        ]));
+        let result = cast_record_batch(&batch, new_schema.clone(), false, true).unwrap();
+        assert_eq!(result.schema(), new_schema);
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(
+            result.column(0).deref().as_primitive::<Int32Type>(),
+            &PrimitiveArray::<Int32Type>::from_iter([1, 2, 3])
+        );
+        let struct_column = result.column(1).deref().as_struct();
+        assert_eq!(struct_column.num_columns(), 2);
+        let expected: [Option<&str>; 3] = Default::default();
+        assert_eq!(
+            struct_column.column(0).deref().as_string(),
+            &StringArray::from(Vec::from(expected))
+        );
+        assert_eq!(
+            struct_column.column(1).deref().as_string::<i32>(),
+            new_null_array(&DataType::Utf8, 3).deref().as_string(),
+        );
+    }
+
+    #[test]
+    fn test_add_missing_null_fields_list_missing() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field1",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new(
+                "field2",
+                DataType::List(Arc::new(Field::new("nested1", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let result = cast_record_batch(&batch, new_schema.clone(), false, true).unwrap();
+        assert_eq!(result.schema(), new_schema);
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(
+            result.column(0).deref().as_primitive::<Int32Type>(),
+            &PrimitiveArray::<Int32Type>::from_iter([1, 2, 3])
+        );
+        let list_column = result.column(1).deref().as_list::<i32>();
+        assert_eq!(list_column.len(), 3);
+        assert_eq!(list_column.value_offsets(), &[0, 0, 0, 0]);
+        assert_eq!(
+            list_column.values().deref().as_string::<i32>(),
+            new_empty_array(&DataType::Utf8).deref().as_string()
+        )
+    }
+
+    #[test]
+    fn test_add_missing_null_fields_map_missing() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field1",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new("field1", DataType::Int32, false),
+            Field::new(
+                "field2",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, true),
+                            Field::new("value", DataType::Utf8, true),
+                        ])),
+                        true,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]));
+        let result = cast_record_batch(&batch, new_schema.clone(), false, true).unwrap();
+        assert_eq!(result.schema(), new_schema);
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(
+            result.column(0).deref().as_primitive::<Int32Type>(),
+            &PrimitiveArray::<Int32Type>::from_iter([1, 2, 3])
+        );
+        let map_column = result.column(1).deref().as_map();
+        assert_eq!(map_column.len(), 3);
+        assert_eq!(map_column.offsets().as_ref(), &[0; 4]);
+        assert_eq!(
+            map_column.keys().deref().as_string::<i32>(),
+            new_empty_array(&DataType::Utf8).deref().as_string()
+        );
+        assert_eq!(
+            map_column.values().deref().as_string::<i32>(),
+            new_empty_array(&DataType::Utf8).deref().as_string()
+        );
     }
 }

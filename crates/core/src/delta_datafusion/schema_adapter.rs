@@ -38,7 +38,7 @@ impl SchemaAdapter for DeltaSchemaAdapter {
         let mut projection = Vec::with_capacity(file_schema.fields().len());
 
         for (file_idx, file_field) in file_schema.fields.iter().enumerate() {
-            if let Some(_) = self.table_schema.fields().find(file_field.name()) {
+            if self.table_schema.fields().find(file_field.name()).is_some() {
                 projection.push(file_idx);
             }
         }
