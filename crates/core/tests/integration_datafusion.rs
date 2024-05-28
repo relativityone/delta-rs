@@ -901,17 +901,19 @@ mod local {
         let table = open_table("../test/tests/data/table_with_edge_timestamps")
             .await
             .unwrap();
+
         ctx.register_table("demo", Arc::new(table))?;
 
         let batches = ctx.sql("SELECT * FROM demo").await?.collect().await?;
 
+        // Without defining a schema of the select the default for a timestamp is ms UTC
         let expected = vec![
-            "+-------------------------------+---------------------+------------+",
-            "| BIG_DATE                      | NORMAL_DATE         | SOME_VALUE |",
-            "+-------------------------------+---------------------+------------+",
-            "| 1816-03-28T05:56:08.066277376 | 2022-02-01T00:00:00 | 2          |",
-            "| 1816-03-29T05:56:08.066277376 | 2022-01-01T00:00:00 | 1          |",
-            "+-------------------------------+---------------------+------------+",
+            "+-----------------------------+----------------------+------------+",
+            "| BIG_DATE                    | NORMAL_DATE          | SOME_VALUE |",
+            "+-----------------------------+----------------------+------------+",
+            "| 1816-03-28T05:56:08.066278Z | 2022-02-01T00:00:00Z | 2          |",
+            "| 1816-03-29T05:56:08.066278Z | 2022-01-01T00:00:00Z | 1          |",
+            "+-----------------------------+----------------------+------------+",
         ];
 
         assert_batches_sorted_eq!(&expected, &batches);
@@ -1092,6 +1094,8 @@ mod local {
             );
         let tbl = tbl.await.unwrap();
         let ctx = SessionContext::new();
+
+        // The results of this plan are int64 and nullable
         let plan = ctx
             .sql("SELECT 1 as id")
             .await
@@ -1118,7 +1122,7 @@ mod local {
             .unwrap();
         let batch = batches.pop().unwrap();
 
-        let expected_schema = Schema::new(vec![Field::new("id", ArrowDataType::Int32, true)]);
+        let expected_schema = Schema::new(vec![Field::new("id", ArrowDataType::Int64, false)]);
         assert_eq!(batch.schema().as_ref(), &expected_schema);
         Ok(())
     }

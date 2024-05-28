@@ -69,3 +69,13 @@ async-trait = { version = "0.1" }
 futures = { version = "0.3" }
 tokio = { version = "1" }
 num_cpus = { version = "1" }
+
+[patch.crates-io]
+datafusion = { git = "https://github.com/relativityone/datafusion.git", rev = "f944ed606df5c66ba169f13ee3ee2bed6403a7df" }
+datafusion-expr = { git = "https://github.com/relativityone/datafusion.git", rev = "f944ed606df5c66ba169f13ee3ee2bed6403a7df" }
+datafusion-common = { git = "https://github.com/relativityone/datafusion.git", rev = "f944ed606df5c66ba169f13ee3ee2bed6403a7df" }
+datafusion-proto = { git = "https://github.com/relativityone/datafusion.git", rev = "f944ed606df5c66ba169f13ee3ee2bed6403a7df" }
+datafusion-sql = { git = "https://github.com/relativityone/datafusion.git", rev = "f944ed606df5c66ba169f13ee3ee2bed6403a7df" }
+datafusion-physical-expr = { git = "https://github.com/relativityone/datafusion.git", rev = "f944ed606df5c66ba169f13ee3ee2bed6403a7df" }
+datafusion-functions = { git = "https://github.com/relativityone/datafusion.git", rev = "f944ed606df5c66ba169f13ee3ee2bed6403a7df" }
+datafusion-functions-array = { git = "https://github.com/relativityone/datafusion.git", rev = "f944ed606df5c66ba169f13ee3ee2bed6403a7df" }

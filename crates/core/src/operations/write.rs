@@ -816,9 +816,8 @@ impl std::future::IntoFuture for WriteBuilder {
 fn try_cast_batch(from_fields: &Fields, to_fields: &Fields) -> Result<(), ArrowError> {
     if from_fields.len() != to_fields.len() {
         return Err(ArrowError::SchemaError(format!(
-            "Cannot cast schema, number of fields does not match: {} vs {}",
-            from_fields.len(),
-            to_fields.len()
+            "Cannot cast schema, number of fields does not match. from: {:?} to: {:?}",
+            from_fields, to_fields
         )));
     }
 
