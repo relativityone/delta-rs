@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
 use arrow_arith::boolean::{is_not_null, or};
+use arrow_array::Int64Array;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
 };
@@ -21,15 +23,18 @@ use tracing::debug;
 
 use crate::kernel::arrow::extract::{self as ex, ProvidesColumnByName};
 use crate::kernel::arrow::json;
+use crate::kernel::Txn;
 use crate::{DeltaResult, DeltaTableConfig, DeltaTableError};
 
 use super::Snapshot;
 
 pin_project! {
-    pub struct ReplayStream<S> {
+    pub struct ReplayStream<'a, S> {
         scanner: LogReplayScanner,
 
         mapper: Arc<LogMapper>,
+
+        transactions: &'a mut HashMap<String, i64>,
 
         #[pin]
         commits: S,
@@ -39,8 +44,8 @@ pin_project! {
     }
 }
 
-impl<S> ReplayStream<S> {
-    pub(super) fn try_new(commits: S, checkpoint: S, snapshot: &Snapshot) -> DeltaResult<Self> {
+impl<'a, S> ReplayStream<'a, S> {
+    pub(super) fn try_new(commits: S, checkpoint: S, snapshot: &Snapshot, transactions: &'a mut HashMap<String, i64>) -> DeltaResult<Self> {
         let stats_schema = Arc::new((&snapshot.stats_schema()?).try_into()?);
         let mapper = Arc::new(LogMapper {
             stats_schema,
@@ -50,6 +55,7 @@ impl<S> ReplayStream<S> {
             commits,
             checkpoint,
             mapper,
+            transactions,
             scanner: LogReplayScanner::new(),
         })
     }
@@ -127,7 +133,7 @@ fn map_batch(
     Ok(batch)
 }
 
-impl<S> Stream for ReplayStream<S>
+impl<'a, S> Stream for ReplayStream<'a, S>
 where
     S: Stream<Item = DeltaResult<RecordBatch>>,
 {
@@ -137,7 +143,12 @@ where
         let this = self.project();
         let res = this.commits.poll_next(cx).map(|b| match b {
             Some(Ok(batch)) => match this.scanner.process_files_batch(&batch, true) {
-                Ok(filtered) => Some(this.mapper.map_batch(filtered)),
+                Ok((filtered, txns)) => {
+                    for txn in txns {
+                        this.transactions.insert(txn.app_id, txn.version);
+                    }
+                    Some(this.mapper.map_batch(filtered))
+                }
                 Err(e) => Some(Err(e)),
             },
             Some(Err(e)) => Some(Err(e)),
@@ -146,7 +157,12 @@ where
         if matches!(res, Poll::Ready(None)) {
             this.checkpoint.poll_next(cx).map(|b| match b {
                 Some(Ok(batch)) => match this.scanner.process_files_batch(&batch, false) {
-                    Ok(filtered) => Some(this.mapper.map_batch(filtered)),
+                    Ok((filtered, txns)) => {
+                        for txn in txns {
+                            this.transactions.insert(txn.app_id, txn.version);
+                        }
+                        Some(this.mapper.map_batch(filtered))
+                    }
                     Err(e) => Some(Err(e)),
                 },
                 Some(Err(e)) => Some(Err(e)),
@@ -204,6 +220,7 @@ pub(super) struct LogReplayScanner {
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
     seen: HashSet<String>,
+    seen_txns: HashSet<String>,
 }
 
 impl LogReplayScanner {
@@ -211,7 +228,45 @@ impl LogReplayScanner {
     pub fn new() -> Self {
         Self {
             seen: HashSet::new(),
+            seen_txns: HashSet::new(),
         }
+    }
+
+    fn extract_txns(&mut self, batch: &RecordBatch) -> DeltaResult<Vec<Txn>> {
+        if batch.column_by_name("txn").is_none() {
+            return Ok(Vec::new());
+        }
+
+        let txn_col = ex::extract_and_cast::<StructArray>(batch, "txn")?;
+        let filtered = filter_record_batch(batch, &is_not_null(txn_col)?)?;
+        let arr = ex::extract_and_cast::<StructArray>(&filtered, "txn")?;
+
+        let id = ex::extract_and_cast::<StringArray>(arr, "appId")?;
+        let version = ex::extract_and_cast::<Int64Array>(arr, "version")?;
+        let last_updated = ex::extract_and_cast_opt::<Int64Array>(arr, "lastUpdated");
+
+        let mut txns = Vec::new();
+        for idx in 0..id.len() {
+            if id.is_valid(idx) {
+                let app_id = ex::read_str(id, idx)?;
+                if self.seen_txns.contains(app_id) {
+                    continue;
+                }
+
+                self.seen_txns.insert(app_id.to_owned());
+                txns.push(
+                    Txn {
+                        app_id: app_id.into(),
+                        version: ex::read_primitive(version, idx)?,
+                        last_updated: last_updated.and_then(|arr| ex::read_primitive_opt(arr, idx)),
+                    }
+                );
+            }
+        }
+
+        dbg!(&txns);
+
+        Ok(txns)
     }
 
     /// Takes a record batch of add and protentially remove actions and returns a
@@ -220,7 +275,9 @@ impl LogReplayScanner {
         &mut self,
         batch: &RecordBatch,
         is_log_batch: bool,
-    ) -> DeltaResult<RecordBatch> {
+    ) -> DeltaResult<(RecordBatch, Vec<Txn>)> {
+        let txns = self.extract_txns(batch)?;
+
         let add_col = ex::extract_and_cast::<StructArray>(batch, "add")?;
         let maybe_remove_col = ex::extract_and_cast_opt::<StructArray>(batch, "remove");
         let filter = if let Some(remove_col) = maybe_remove_col {
@@ -283,7 +340,7 @@ impl LogReplayScanner {
             .collect::<Vec<_>>();
         let filtered = filtered.project(&projection)?;
 
-        Ok(filter_record_batch(&filtered, &BooleanArray::from(keep))?)
+        Ok((filter_record_batch(&filtered, &BooleanArray::from(keep))?, txns))
     }
 }
 
@@ -360,12 +417,12 @@ pub(super) mod tests {
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
         assert_eq!(batch.schema().fields().len(), 2);
-        let filtered = scanner.process_files_batch(&batch, true)?;
+        let (filtered, _txns) = scanner.process_files_batch(&batch, true)?;
         assert_eq!(filtered.schema().fields().len(), 1);
 
         // TODO enable once we do selection pushdown in parquet read
         // assert_eq!(batch.schema().fields().len(), 1);
-        let filtered = scanner.process_files_batch(&batch, true)?;
+        let (filtered, _txns) = scanner.process_files_batch(&batch, true)?;
         assert_eq!(filtered.schema().fields().len(), 1);
 
         let store = context
@@ -384,7 +441,7 @@ pub(super) mod tests {
         let arr_rm = batch.column_by_name("remove").unwrap();
         let rm_count = arr_rm.len() - arr_rm.null_count();
 
-        let filtered = scanner.process_files_batch(&batch, true)?;
+        let (filtered, _txns) = scanner.process_files_batch(&batch, true)?;
         let arr_add = filtered.column_by_name("add").unwrap();
         let add_count_after = arr_add.len() - arr_add.null_count();
         assert_eq!(arr_add.null_count(), 0);
