@@ -264,8 +264,6 @@ impl LogReplayScanner {
             }
         }
 
-        dbg!(&txns);
-
         Ok(txns)
     }
 
