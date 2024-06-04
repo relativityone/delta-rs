@@ -602,10 +602,7 @@ impl<'a> PostCommit<'a> {
             } else {
                 snapshot.advance(vec![&self.data])?;
             }
-            let state = DeltaTableState {
-                app_transaction_version: HashMap::new(),
-                snapshot,
-            };
+            let state = DeltaTableState { snapshot };
             // Execute each hook
             if self.create_checkpoint {
                 self.create_checkpoint(&state, &self.log_store, self.version)

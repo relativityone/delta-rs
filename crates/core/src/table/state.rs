@@ -25,7 +25,6 @@ use crate::{DeltaResult, DeltaTableError};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeltaTableState {
-    pub(crate) app_transaction_version: HashMap<String, i64>,
     pub(crate) snapshot: EagerSnapshot,
 }
 
@@ -38,10 +37,7 @@ impl DeltaTableState {
         version: Option<i64>,
     ) -> DeltaResult<Self> {
         let snapshot = EagerSnapshot::try_new(table_root, store.clone(), config, version).await?;
-        Ok(Self {
-            snapshot,
-            app_transaction_version: HashMap::new(),
-        })
+        Ok(Self { snapshot })
     }
 
     /// Return table version
@@ -89,7 +85,6 @@ impl DeltaTableState {
 
         let snapshot = EagerSnapshot::new_test(&commit_data).unwrap();
         Ok(Self {
-            app_transaction_version: Default::default(),
             snapshot,
         })
     }
@@ -158,7 +153,7 @@ impl DeltaTableState {
     /// HashMap containing the last txn version stored for every app id writing txn
     /// actions.
     pub fn app_transaction_version(&self) -> &HashMap<String, i64> {
-        &self.app_transaction_version
+        &self.snapshot.transactions()
     }
 
     /// The most recent protocol of the table.

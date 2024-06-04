@@ -15,6 +15,7 @@
 //!
 //!
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
 
@@ -200,9 +201,10 @@ impl Snapshot {
     }
 
     /// Get the files in the snapshot
-    pub fn files(
-        &self,
+    pub fn files<'a>(
+        &'a self,
         store: Arc<dyn ObjectStore>,
+        transactions: &'a mut HashMap<String, i64>,
     ) -> DeltaResult<ReplayStream<BoxStream<'_, DeltaResult<RecordBatch>>>> {
         let log_stream = self.log_segment.commit_stream(
             store.clone(),
@@ -214,7 +216,7 @@ impl Snapshot {
             &log_segment::CHECKPOINT_SCHEMA,
             &self.config,
         );
-        ReplayStream::try_new(log_stream, checkpoint_stream, self)
+        ReplayStream::try_new(log_stream, checkpoint_stream, self, transactions)
     }
 
     /// Get the commit infos in the snapshot
@@ -341,6 +343,7 @@ pub struct EagerSnapshot {
     // NOTE: this is a Vec of RecordBatch instead of a single RecordBatch because
     //       we do not yet enforce a consistent schema across all batches we read from the log.
     files: Vec<RecordBatch>,
+    transactions: HashMap<String, i64>,
 }
 
 impl EagerSnapshot {
@@ -352,8 +355,9 @@ impl EagerSnapshot {
         version: Option<i64>,
     ) -> DeltaResult<Self> {
         let snapshot = Snapshot::try_new(table_root, store.clone(), config, version).await?;
-        let files = snapshot.files(store)?.try_collect().await?;
-        Ok(Self { snapshot, files })
+        let mut transactions = HashMap::new();
+        let files = snapshot.files(store, &mut transactions)?.try_collect().await?;
+        Ok(Self { snapshot, files, transactions })
     }
 
     #[cfg(test)]
@@ -361,13 +365,18 @@ impl EagerSnapshot {
         let (snapshot, batch) = Snapshot::new_test(commits)?;
         let mut files = Vec::new();
         let mut scanner = LogReplayScanner::new();
-        files.push(scanner.process_files_batch(&batch, true)?);
+        let mut transactions = HashMap::new();
+        let (file_batch, txns) = scanner.process_files_batch(&batch, true)?;
+        for txn in txns {
+            transactions.insert(txn.app_id, txn.version);
+        }
+        files.push(file_batch);
         let mapper = LogMapper::try_new(&snapshot)?;
         files = files
             .into_iter()
             .map(|b| mapper.map_batch(b))
             .collect::<DeltaResult<Vec<_>>>()?;
-        Ok(Self { snapshot, files })
+        Ok(Self { snapshot, files, transactions })
     }
 
     /// Update the snapshot to the given version
@@ -402,7 +411,7 @@ impl EagerSnapshot {
                     .boxed()
             };
             let mapper = LogMapper::try_new(&self.snapshot)?;
-            let files = ReplayStream::try_new(log_stream, checkpoint_stream, &self.snapshot)?
+            let files = ReplayStream::try_new(log_stream, checkpoint_stream, &self.snapshot, &mut self.transactions)?
                 .map(|batch| batch.and_then(|b| mapper.map_batch(b)))
                 .try_collect()
                 .await?;
@@ -470,6 +479,11 @@ impl EagerSnapshot {
         Ok(self.files.iter().flat_map(|b| read_adds(b)).flatten())
     }
 
+    /// Collect transactions from snapshot
+    pub fn transactions(&self) -> &HashMap<String, i64> {
+        &self.transactions
+    }
+
     /// Get a file action iterator for the given version
     pub fn files(&self) -> impl Iterator<Item = LogicalFile<'_>> {
         self.log_data().into_iter()
@@ -525,7 +539,12 @@ impl EagerSnapshot {
                     .iter()
                     .flat_map(|batch| scanner.process_files_batch(batch, false)),
             )
-            .map(|b| mapper.map_batch(b))
+            .map(|(b, txns)| {
+                for txn in txns {
+                    self.transactions.insert(txn.app_id, txn.version);
+                }
+                mapper.map_batch(b)
+            })
             .collect::<DeltaResult<Vec<_>>>()?;
 
         if let Some(metadata) = metadata {
@@ -660,7 +679,7 @@ mod tests {
         assert_eq!(tombstones.len(), 31);
 
         let batches = snapshot
-            .files(store.clone())?
+            .files(store.clone(), &mut HashMap::new())?
             .try_collect::<Vec<_>>()
             .await?;
         let expected = [
@@ -690,7 +709,7 @@ mod tests {
             )
             .await?;
             let batches = snapshot
-                .files(store.clone())?
+                .files(store.clone(), &mut HashMap::new())?
                 .try_collect::<Vec<_>>()
                 .await?;
             let num_files = batches.iter().map(|b| b.num_rows() as i64).sum::<i64>();
