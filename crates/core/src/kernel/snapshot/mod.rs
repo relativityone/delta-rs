@@ -21,12 +21,10 @@ use std::sync::Arc;
 
 use ::serde::{Deserialize, Serialize};
 use arrow_array::RecordBatch;
-use datafusion_functions::string::ends_with;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::ObjectStore;
-use tracing::field::debug;
 
 use self::log_segment::{LogSegment, PathExt};
 use self::parse::{read_adds, read_removes};
