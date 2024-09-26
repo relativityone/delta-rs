@@ -7,3 +7,4 @@ mkdocs-material==9.4.5
 mkdocs-macros-plugin==1.0.4
 markdown-exec[ansi]==1.7.0
 mkdocs-simple-hooks==0.1.5
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
