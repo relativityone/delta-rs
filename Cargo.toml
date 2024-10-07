@@ -45,15 +45,15 @@ object_store = { version = "0.10.1" }
 parquet = { version = "52" }
 
 # datafusion
-datafusion = { version = "41" }
-datafusion-expr = { version = "41" }
-datafusion-common = { version = "41" }
-datafusion-proto = { version = "41" }
-datafusion-sql = { version = "41" }
-datafusion-physical-expr = { version = "41" }
-datafusion-physical-plan = { version = "41" }
-datafusion-functions = { version = "41" }
-datafusion-functions-aggregate = { version = "41" }
+datafusion = { version = "41", git = "https://github.com/relativityone/datafusion", rev = "aff29f2792ba8da9cac4d4fc08d2a9565751ba57" }
+datafusion-expr = { version = "41", git = "https://github.com/relativityone/datafusion", rev = "aff29f2792ba8da9cac4d4fc08d2a9565751ba57" }
+datafusion-common = { version = "41", git = "https://github.com/relativityone/datafusion", rev = "aff29f2792ba8da9cac4d4fc08d2a9565751ba57" }
+datafusion-proto = { version = "41", git = "https://github.com/relativityone/datafusion", rev = "aff29f2792ba8da9cac4d4fc08d2a9565751ba57" }
+datafusion-sql = { version = "41", git = "https://github.com/relativityone/datafusion", rev = "aff29f2792ba8da9cac4d4fc08d2a9565751ba57" }
+datafusion-physical-expr = { version = "41", git = "https://github.com/relativityone/datafusion", rev = "aff29f2792ba8da9cac4d4fc08d2a9565751ba57" }
+datafusion-physical-plan = { version = "41", git = "https://github.com/relativityone/datafusion", rev = "aff29f2792ba8da9cac4d4fc08d2a9565751ba57" }
+datafusion-functions = { version = "41", git = "https://github.com/relativityone/datafusion", rev = "aff29f2792ba8da9cac4d4fc08d2a9565751ba57" }
+datafusion-functions-aggregate = { version = "41", git = "https://github.com/relativityone/datafusion", rev = "aff29f2792ba8da9cac4d4fc08d2a9565751ba57" }
 
 # serde
 serde = { version = "1.0.194", features = ["derive"] }
