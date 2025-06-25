@@ -131,6 +131,8 @@ pub struct MergeBuilder {
     target_alias: Option<String>,
     /// A snapshot of the table's state. AKA the target table in the operation
     snapshot: DeltaTableState,
+    /// Schema to scan the target table with
+    target_scan_schema: Option<arrow_schema::SchemaRef>,
     /// The source data
     source: DataFrame,
     /// Whether the source is a streaming source (if true, stats deducing to prune target is disabled)
@@ -173,6 +175,7 @@ impl MergeBuilder {
             predicate,
             source,
             snapshot,
+            target_scan_schema: None,
             log_store,
             source_alias: None,
             target_alias: None,
@@ -420,6 +423,13 @@ impl MergeBuilder {
     /// Set a custom execute handler, for pre and post execution
     pub fn with_custom_execute_handler(mut self, handler: Arc<dyn CustomExecuteHandler>) -> Self {
         self.custom_execute_handler = Some(handler);
+        self
+    }
+
+    /// Set the target scan schema to use when scanning the target table.
+    pub fn with_target_scan_schema(
+        mut self, target_scan_schema: arrow_schema::SchemaRef) -> Self {
+        self.target_scan_schema = Some(target_scan_schema);
         self
     }
 }
@@ -725,7 +735,8 @@ async fn execute(
     mut source: DataFrame,
     log_store: LogStoreRef,
     snapshot: DeltaTableState,
-    _state: SessionState,
+    target_scan_schema: Option<arrow_schema::SchemaRef>,
+    state: SessionState,
     writer_properties: Option<WriterProperties>,
     mut commit_properties: CommitProperties,
     _safe_cast: bool,
@@ -755,7 +766,7 @@ async fn execute(
         extension_planner: MergeMetricExtensionPlanner {},
     };
 
-    let state = SessionStateBuilder::new_from_existing(_state)
+    let state = SessionStateBuilder::new_from_existing(state)
         .with_query_planner(Arc::new(merge_planner))
         .build();
 
@@ -806,10 +817,16 @@ async fn execute(
         }),
     });
 
+    let scan_schema = if let Some(scan_schema) = target_scan_schema {
+        scan_schema
+    } else {
+        snapshot.input_schema()?
+    };
+
     let scan_config = DeltaScanConfigBuilder::default()
         .with_file_column(true)
         .with_parquet_pushdown(false)
-        .with_schema(snapshot.input_schema()?)
+        .with_schema(scan_schema)
         .build(&snapshot)?;
 
     let target_provider = Arc::new(DeltaTableProvider::try_new(
@@ -1544,6 +1561,7 @@ impl std::future::IntoFuture for MergeBuilder {
                 this.source,
                 this.log_store.clone(),
                 this.snapshot,
+                this.target_scan_schema,
                 state,
                 this.writer_properties,
                 this.commit_properties,
