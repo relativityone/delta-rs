@@ -5,24 +5,20 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use async_trait::async_trait;
-use datafusion::logical_expr::{Expr, col};
-use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::{DataFrame, SessionContext};
 use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 
-use crate::table::state::DeltaTableState;
+use crate::delta_datafusion::DeltaSessionConfig;
+use crate::delta_datafusion::{register_store, DataFusionMixins};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::logstore::LogStoreRef;
-use crate::{DeltaResult, DeltaTable, DeltaTableError};
-use crate::delta_datafusion::planner::DeltaPlanner;
-use crate::delta_datafusion::physical::find_metric_node;
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::write::WriterStatsConfig;
-use crate::delta_datafusion::{register_store, DataFusionMixins};
-use crate::delta_datafusion::DeltaSessionConfig;
 use crate::protocol::SaveMode;
+use crate::table::state::DeltaTableState;
+use crate::{DeltaResult, DeltaTable, DeltaTableError};
 
 pub struct UpsertBuilder {
     /// The join keys used to identify conflicts
