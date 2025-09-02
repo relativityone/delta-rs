@@ -308,6 +308,21 @@ impl DeltaOps {
         )
     }
 
+    #[cfg(feature = "datafusion")]
+    #[must_use]
+    pub fn upsert(
+        self,
+        source: datafusion::prelude::DataFrame,
+        join_keys: Vec<String>
+    ) -> upsert::UpsertBuilder {
+        upsert::UpsertBuilder::new(
+            self.0.log_store,
+            self.0.state.unwrap(),
+            join_keys,
+            source,
+        )
+    }
+
     /// Add a check constraint to a table
     #[cfg(feature = "datafusion")]
     #[must_use]
