@@ -154,7 +154,7 @@ impl std::future::IntoFuture for UpsertBuilder {
                 Some(&this.snapshot),
                 state.clone(),
                 physical_plan,
-                this.snapshot.metadata().partition_columns().clone(),
+                vec!["workspace_id".to_string()],
                 this.log_store.object_store(None),
                 Some(this.snapshot.table_config().target_file_size() as usize),
                 None,
@@ -176,7 +176,7 @@ impl std::future::IntoFuture for UpsertBuilder {
 
             let operation = crate::protocol::DeltaOperation::Write {
                 mode: SaveMode::Append,
-                partition_by: Some(this.snapshot.metadata().partition_columns().clone()),
+                partition_by: Some(vec!["workspace_id".to_string()]),
                 predicate: None,
             };
 
