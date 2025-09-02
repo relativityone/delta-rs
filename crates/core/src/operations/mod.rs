@@ -67,6 +67,8 @@ pub mod set_tbl_properties;
 pub mod update;
 #[cfg(feature = "datafusion")]
 pub mod write;
+#[cfg(feature = "datafusion")]
+pub mod upsert;
 
 #[async_trait]
 pub trait CustomExecuteHandler: Send + Sync {
