@@ -37,6 +37,8 @@ pub struct UpsertBuilder {
     writer_properties: Option<WriterProperties>,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
+
+    workspace_id: Option<String>,
 }
 
 impl UpsertBuilder {
@@ -54,6 +56,7 @@ impl UpsertBuilder {
             state: None,
             writer_properties: None,
             commit_properties: CommitProperties::default(),
+            workspace_id: None,
         }
     }
 
@@ -72,6 +75,11 @@ impl UpsertBuilder {
 
     pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
         self.commit_properties = commit_properties;
+        self
+    }
+
+    pub fn with_workspace_id(mut self, workspace_id: &str) -> Self {
+        self.workspace_id = Some(workspace_id.to_string());
         self
     }
 }
@@ -110,25 +118,11 @@ impl std::future::IntoFuture for UpsertBuilder {
             // 1. Collect relevant workspace_id values from source
             // 2. Build a filter expression for target scan
             use datafusion::logical_expr::{col, lit, Expr};
-            let workspace_ids: Vec<String> = this
-                .source
-                .clone()
-                .select(vec![col("workspace_id")])?
-                .collect()
-                .await?
-                .iter()
-                .flat_map(|batch| {
-                    let column = batch.column(batch.schema().index_of("workspace_id").unwrap());
-                    column
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
-                        .unwrap()
-                        .iter()
-                        .flatten()
-                        .map(|v| v.to_string())
-                })
-                .unique()
-                .collect();
+
+            let workspace_ids: Vec<String> = match this.workspace_id {
+                Some(id) => vec![id],
+                None => vec![],
+            };
 
             let filter_expr = Expr::InList(InList {
                 expr: Box::new(col("workspace_id")),
