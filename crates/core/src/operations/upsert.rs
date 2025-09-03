@@ -38,7 +38,7 @@ pub struct UpsertBuilder {
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
 
-    workspace_id: Option<String>,
+    workspace_id: Option<i32>,
 }
 
 impl UpsertBuilder {
@@ -78,8 +78,8 @@ impl UpsertBuilder {
         self
     }
 
-    pub fn with_workspace_id(mut self, workspace_id: &str) -> Self {
-        self.workspace_id = Some(workspace_id.to_string());
+    pub fn with_workspace_id(mut self, workspace_id: i32) -> Self {
+        self.workspace_id = Some(workspace_id);
         self
     }
 }
@@ -119,7 +119,7 @@ impl std::future::IntoFuture for UpsertBuilder {
             // 2. Build a filter expression for target scan
             use datafusion::logical_expr::{col, lit, Expr};
 
-            let workspace_ids: Vec<String> = match this.workspace_id {
+            let workspace_ids: Vec<i32> = match this.workspace_id {
                 Some(id) => vec![id],
                 None => vec![],
             };
