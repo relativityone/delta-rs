@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion_expr::expr::InList;
 use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 
@@ -100,7 +101,18 @@ impl std::future::IntoFuture for UpsertBuilder {
                 session.state()
             });
 
-            let exec_start = Instant::now();
+            // 1. Collect relevant workspace_id values from source
+            let workspace_ids = vec![123];
+
+            // 2. Build a filter expression for target scan
+            use datafusion::logical_expr::{col, lit, Expr};
+            let filter_expr = Expr::InList(
+                InList {
+                    expr: Box::new(col("workspace_id")),
+                    list: workspace_ids.iter().map(|v| lit(v.clone())).collect(),
+                    negated: false,
+                }
+            );
 
             // --- 1. Load target as DataFrame ---
             let scan_config = crate::delta_datafusion::DeltaScanConfigBuilder::default()
@@ -117,10 +129,11 @@ impl std::future::IntoFuture for UpsertBuilder {
 
             let target = DataFrame::new(
                 state.clone(),
-                datafusion::logical_expr::LogicalPlanBuilder::scan(
+                datafusion::logical_expr::LogicalPlanBuilder::scan_with_filters(
                     datafusion::common::TableReference::bare("target"),
                     datafusion::datasource::provider_as_source(target_provider),
                     None,
+                    vec![filter_expr],
                 )?.build()?
             );
 
