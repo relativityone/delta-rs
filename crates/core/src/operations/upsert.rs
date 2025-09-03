@@ -8,6 +8,7 @@ use std::time::Instant;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion_expr::expr::InList;
+use datafusion_physical_expr::expressions::col;
 use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 
@@ -56,7 +57,10 @@ impl UpsertBuilder {
         }
     }
 
-    pub fn with_session_state(mut self, state: datafusion::execution::session_state::SessionState) -> Self {
+    pub fn with_session_state(
+        mut self,
+        state: datafusion::execution::session_state::SessionState,
+    ) -> Self {
         self.state = Some(state);
         self
     }
@@ -82,7 +86,7 @@ impl super::Operation<()> for UpsertBuilder {
 }
 
 impl std::future::IntoFuture for UpsertBuilder {
-    type Output = DeltaResult<(DeltaTable, usize /*num records written*/ )>;
+    type Output = DeltaResult<(DeltaTable, usize /*num records written*/)>;
     type IntoFuture = futures::future::BoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -95,24 +99,42 @@ impl std::future::IntoFuture for UpsertBuilder {
             }
 
             let state = this.state.unwrap_or_else(|| {
-                let config: datafusion::execution::context::SessionConfig = DeltaSessionConfig::default().into();
+                let config: datafusion::execution::context::SessionConfig =
+                    DeltaSessionConfig::default().into();
                 let session = SessionContext::new_with_config(config);
                 register_store(this.log_store.clone(), session.runtime_env());
                 session.state()
             });
 
+            // validate column exists
             // 1. Collect relevant workspace_id values from source
-            let workspace_ids = vec![123];
-
             // 2. Build a filter expression for target scan
             use datafusion::logical_expr::{col, lit, Expr};
-            let filter_expr = Expr::InList(
-                InList {
-                    expr: Box::new(col("workspace_id")),
-                    list: workspace_ids.iter().map(|v| lit(v.clone())).collect(),
-                    negated: false,
-                }
-            );
+            let workspace_ids: Vec<String> = this
+                .source
+                .clone()
+                .select(vec![col("workspace_id")])?
+                .collect()
+                .await?
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch.column(batch.schema().index_of("workspace_id").unwrap());
+                    column
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .unwrap()
+                        .iter()
+                        .flatten()
+                        .map(|v| v.to_string())
+                })
+                .unique()
+                .collect();
+
+            let filter_expr = Expr::InList(InList {
+                expr: Box::new(col("workspace_id")),
+                list: workspace_ids.iter().map(|v| lit(v.clone())).collect(),
+                negated: false,
+            });
 
             // --- 1. Load target as DataFrame ---
             let scan_config = crate::delta_datafusion::DeltaScanConfigBuilder::default()
@@ -134,7 +156,8 @@ impl std::future::IntoFuture for UpsertBuilder {
                     datafusion::datasource::provider_as_source(target_provider),
                     None,
                     vec![filter_expr],
-                )?.build()?
+                )?
+                .build()?,
             );
 
             // --- 2. Perform anti-join to filter out conflicting target records ---
@@ -143,16 +166,28 @@ impl std::future::IntoFuture for UpsertBuilder {
             //     .map(|key| (col(format!("target.{key}")), col(format!("source.{key}"))))
             //     .collect();
 
-            let source_df = this.source.clone().with_column("source_marker", datafusion::logical_expr::lit(true))?;
-            let target_df = target.with_column("target_marker", datafusion::logical_expr::lit(true))?;
+            let source_df = this
+                .source
+                .clone()
+                .with_column("source_marker", datafusion::logical_expr::lit(true))?;
+            let target_df =
+                target.with_column("target_marker", datafusion::logical_expr::lit(true))?;
 
             // Left anti join: target rows NOT in source (conflicting target rows removed)
             let target_no_conflict = target_df.join(
                 source_df.clone(),
                 datafusion::logical_expr::JoinType::LeftAnti,
-                &this.join_keys.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-                &this.join_keys.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-                None
+                &this
+                    .join_keys
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<&str>>(),
+                &this
+                    .join_keys
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<&str>>(),
+                None,
             )?;
 
             // --- 3. Union: (conflict-resolved source + non-conflicting target) ---
@@ -172,20 +207,21 @@ impl std::future::IntoFuture for UpsertBuilder {
                 Some(this.snapshot.table_config().target_file_size() as usize),
                 None,
                 this.writer_properties.clone(),
-                WriterStatsConfig::new(
-                    this.snapshot.table_config().num_indexed_cols(),
-                    None,
-                ),
+                WriterStatsConfig::new(this.snapshot.table_config().num_indexed_cols(), None),
                 None,
-                false
-            ).await?;
+                false,
+            )
+            .await?;
 
             //TODO fix this
             let num_records = 0;
 
             let app_metadata = &mut this.commit_properties.app_metadata;
             app_metadata.insert("readVersion".to_owned(), this.snapshot.version().into());
-            app_metadata.insert("operationMetrics".to_owned(), serde_json::json!({ "outputRows": num_records }));
+            app_metadata.insert(
+                "operationMetrics".to_owned(),
+                serde_json::json!({ "outputRows": num_records }),
+            );
 
             let operation = crate::protocol::DeltaOperation::Write {
                 mode: SaveMode::Append,
@@ -198,7 +234,10 @@ impl std::future::IntoFuture for UpsertBuilder {
                 .build(Some(&this.snapshot), this.log_store.clone(), operation)
                 .await?;
 
-            Ok((DeltaTable::new_with_state(this.log_store, commit.snapshot()), num_records))
+            Ok((
+                DeltaTable::new_with_state(this.log_store, commit.snapshot()),
+                num_records,
+            ))
         })
     }
 }

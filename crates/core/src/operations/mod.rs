@@ -68,9 +68,9 @@ pub mod set_tbl_properties;
 #[cfg(feature = "datafusion")]
 pub mod update;
 #[cfg(feature = "datafusion")]
-pub mod write;
-#[cfg(feature = "datafusion")]
 pub mod upsert;
+#[cfg(feature = "datafusion")]
+pub mod write;
 
 #[async_trait]
 pub trait CustomExecuteHandler: Send + Sync {
@@ -313,14 +313,9 @@ impl DeltaOps {
     pub fn upsert(
         self,
         source: datafusion::prelude::DataFrame,
-        join_keys: Vec<String>
+        join_keys: Vec<String>,
     ) -> upsert::UpsertBuilder {
-        upsert::UpsertBuilder::new(
-            self.0.log_store,
-            self.0.state.unwrap(),
-            join_keys,
-            source,
-        )
+        upsert::UpsertBuilder::new(self.0.log_store, self.0.state.unwrap(), join_keys, source)
     }
 
     /// Add a check constraint to a table
