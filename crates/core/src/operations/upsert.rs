@@ -2,19 +2,20 @@
 //! For each conflicting record (e.g., matching on primary key), only the source record is kept.
 //! All non-conflicting records are appended. This operation is memory bound and optimized for performance.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion_expr::expr::InList;
-use datafusion_physical_expr::expressions::col;
+use delta_kernel::expressions::Scalar;
 use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 
 use crate::delta_datafusion::DeltaSessionConfig;
 use crate::delta_datafusion::{register_store, DataFusionMixins};
-use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
+use crate::kernel::transaction::{CommitBuilder, CommitProperties, TableReference, PROTOCOL};
+use crate::kernel::{Action, Remove};
 use crate::logstore::LogStoreRef;
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::write::WriterStatsConfig;
@@ -131,6 +132,20 @@ impl std::future::IntoFuture for UpsertBuilder {
                 .unique()
                 .collect();
 
+            assert_eq!(workspace_ids.iter().count(), 1, "Only single workspace_id supported for upsert operation");
+            let workspace_id = workspace_ids[0];
+
+            let files_to_remove: Vec<_> = this.snapshot
+                .eager_snapshot()
+                .files()
+                .filter(|f| {
+                    f.partition_values().iter().flat_map( |pv|
+                        pv.get("workspace_id")
+                    ).filter(|x|x.clone().eq(&Scalar::Integer(workspace_id))).count() > 0
+                })
+                .collect();
+
+
             let filter_expr = Expr::InList(InList {
                 expr: Box::new(col("workspace_id")),
                 list: workspace_ids.iter().map(|v| lit(v.clone())).collect(),
@@ -214,6 +229,23 @@ impl std::future::IntoFuture for UpsertBuilder {
             )
             .await?;
 
+            let mut pv = HashMap::new();
+            pv.insert("workspace_id".to_string(), Some(workspace_id.to_string()));
+
+            let delete_actions:Vec<Action> = files_to_remove.iter()
+                .map(|f| Action::Remove(Remove {
+                    path: f.path().to_string(),
+                    data_change: true,
+                    extended_file_metadata: None,
+                    size: None,
+                    tags: None,
+                    deletion_vector: None,
+                    base_row_id: None,
+                    deletion_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+                    partition_values: Some(pv.clone()),
+                    default_row_commit_version: None,
+                })).collect();
+
             //TODO fix this
             let num_records = 0;
 
@@ -227,11 +259,14 @@ impl std::future::IntoFuture for UpsertBuilder {
             let operation = crate::protocol::DeltaOperation::Write {
                 mode: SaveMode::Overwrite,
                 partition_by: Some(vec!["workspace_id".to_string()]),
+                // predicate: Some(
+                //     serde_json::json!({"workspace_id": workspace_ids}).to_string(),
+                //),
                 predicate: None,
             };
 
             let commit = CommitBuilder::from(this.commit_properties)
-                .with_actions(actions)
+                .with_actions(actions.into_iter().chain(delete_actions).collect())
                 .build(Some(&this.snapshot), this.log_store.clone(), operation)
                 .await?;
 
