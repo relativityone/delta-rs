@@ -3,10 +3,12 @@
 //! All non-conflicting records are appended. This operation is memory bound and optimized for performance.
 
 use std::collections::HashMap;
+use std::ops::Not;
 use std::sync::Arc;
 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion_common::JoinType;
 use datafusion_expr::expr::InList;
 use delta_kernel::expressions::Scalar;
 use itertools::Itertools;
@@ -22,6 +24,7 @@ use crate::operations::write::WriterStatsConfig;
 use crate::protocol::SaveMode;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
+use datafusion::logical_expr::{col, lit, Expr};
 
 pub struct UpsertBuilder {
     /// The join keys used to identify conflicts
@@ -107,11 +110,7 @@ impl std::future::IntoFuture for UpsertBuilder {
                 session.state()
             });
 
-            // validate column exists
-            // 1. Collect relevant workspace_id values from source
-            // 2. Build a filter expression for target scan
-            use datafusion::logical_expr::{col, lit, Expr};
-
+            // Identify relevant workspace_id from source DataFrame
             let workspace_ids: Vec<i32> = this
                 .source
                 .clone()
@@ -135,23 +134,6 @@ impl std::future::IntoFuture for UpsertBuilder {
             assert_eq!(workspace_ids.iter().count(), 1, "Only single workspace_id supported for upsert operation");
             let workspace_id = workspace_ids[0];
 
-            let files_to_remove: Vec<_> = this.snapshot
-                .eager_snapshot()
-                .files()
-                .filter(|f| {
-                    f.partition_values().iter().flat_map( |pv|
-                        pv.get("workspace_id")
-                    ).filter(|x|x.clone().eq(&Scalar::Integer(workspace_id))).count() > 0
-                })
-                .collect();
-
-
-            let filter_expr = Expr::InList(InList {
-                expr: Box::new(col("workspace_id")),
-                list: workspace_ids.iter().map(|v| lit(v.clone())).collect(),
-                negated: false,
-            });
-
             // --- 1. Load target as DataFrame ---
             let scan_config = crate::delta_datafusion::DeltaScanConfigBuilder::default()
                 .with_file_column(false)
@@ -165,6 +147,12 @@ impl std::future::IntoFuture for UpsertBuilder {
                 scan_config.clone(),
             )?);
 
+            let filter_expr = Expr::InList(InList {
+                expr: Box::new(col("workspace_id")),
+                list: workspace_ids.iter().map(|v| lit(v.clone())).collect(),
+                negated: false,
+            });
+
             let target = DataFrame::new(
                 state.clone(),
                 datafusion::logical_expr::LogicalPlanBuilder::scan_with_filters(
@@ -173,8 +161,76 @@ impl std::future::IntoFuture for UpsertBuilder {
                     None,
                     vec![filter_expr],
                 )?
-                .build()?,
+                    .build()?,
             );
+
+            // Check if we need to handle conflicts
+            let key_cols = this.join_keys.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+
+            let target_keys = key_cols.iter().map(|k| col(*k).alias(&format!("target_{}", k))).collect::<Vec<_>>();
+            let source_keys = key_cols.iter().map(|k| col(*k).alias(&format!("source_{}", k))).collect::<Vec<_>>();
+
+            let target_df = target.clone().select(target_keys)?;
+            let source_df = this.source.clone().select(source_keys)?;
+
+            let key_col_s = this.join_keys.iter().map(|s| format!("source_{}", s)).collect::<Vec<String>>();
+            let key_col_t = this.join_keys.iter().map(|s| format!("target_{}", s)).collect::<Vec<String>>();
+
+            let has_conflicts = target_df.join(
+                source_df,
+                JoinType::Inner,
+                &key_col_s.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<&str>>(),
+                &key_col_t
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<&str>>(),
+                None,
+            )?
+                .limit(0, Some(1))?
+                .collect()
+                .await?
+                .is_empty().not();
+
+            let actions: Vec<Action>;
+
+            if has_conflicts.not() {
+                // No conflicts, just create add actions for source data
+                let logical_plan = this.source.clone().into_unoptimized_plan();
+                let physical_plan = state.create_physical_plan(&logical_plan).await?;
+                let (add_actions, metrics) = write_execution_plan_v2(
+                    Some(&this.snapshot),
+                    state.clone(),
+                    physical_plan,
+                    vec!["workspace_id".to_string()],
+                    this.log_store.object_store(None),
+                    Some(this.snapshot.table_config().target_file_size() as usize),
+                    None,
+                    this.writer_properties.clone(),
+                    WriterStatsConfig::new(this.snapshot.table_config().num_indexed_cols(), None),
+                    None,
+                    false,
+                ).await?;
+
+                actions = add_actions;
+            }
+            else {
+
+
+            // validate column exists
+            // 1. Collect relevant workspace_id values from source
+            // 2. Build a filter expression for target scan
+
+            let files_to_remove: Vec<_> = this.snapshot
+                .eager_snapshot()
+                .files()
+                .filter(|f| {
+                    f.partition_values().iter().flat_map( |pv|
+                        pv.get("workspace_id")
+                    ).filter(|x|x.clone().eq(&Scalar::Integer(workspace_id))).count() > 0
+                })
+                .collect();
 
             // --- 2. Perform anti-join to filter out conflicting target records ---
             // let join_exprs: Vec<(Expr, Expr)> = this.join_keys
@@ -214,7 +270,7 @@ impl std::future::IntoFuture for UpsertBuilder {
             let logical_plan = append_df.into_unoptimized_plan();
             let physical_plan = state.create_physical_plan(&logical_plan).await?;
 
-            let (actions, metrics) = write_execution_plan_v2(
+            let (add_actions, metrics) = write_execution_plan_v2(
                 Some(&this.snapshot),
                 state.clone(),
                 physical_plan,
@@ -246,6 +302,9 @@ impl std::future::IntoFuture for UpsertBuilder {
                     default_row_commit_version: None,
                 })).collect();
 
+                actions = add_actions.into_iter().chain(delete_actions).collect();
+            }
+
             //TODO fix this
             let num_records = 0;
 
@@ -266,7 +325,7 @@ impl std::future::IntoFuture for UpsertBuilder {
             };
 
             let commit = CommitBuilder::from(this.commit_properties)
-                .with_actions(actions.into_iter().chain(delete_actions).collect())
+                .with_actions(actions)
                 .build(Some(&this.snapshot), this.log_store.clone(), operation)
                 .await?;
 
