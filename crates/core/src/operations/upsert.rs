@@ -199,37 +199,59 @@ impl UpsertBuilder {
     }
     
     /// Extract partition values from source to optimize target scanning
-    async fn extract_partition_filters(&self) -> DeltaResult<Vec<String>> {
-        // TODO: Make this more generic - currently hardcoded to workspace_id
-        // This should be configurable based on table partitioning scheme
-        let source_partitions: Vec<String> = self
-            .source
-            .clone()
-            .select(vec![col("workspace_id")])?
-            .collect()
-            .await?
-            .iter()
-            .flat_map(|batch| {
-                let column = batch.column(batch.schema().index_of("workspace_id").unwrap());
-                column
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()
-                    .unwrap()
+    /// This method attempts to identify partition columns from the table schema
+    /// and extract unique values from the source data to limit the scan scope
+    async fn extract_partition_filters(&self) -> DeltaResult<HashMap<String, Vec<String>>> {
+        let mut partition_filters = HashMap::new();
+        
+        // Get partition columns from table metadata
+        let partition_columns = self.snapshot.metadata().partition_columns.clone();
+        
+        if partition_columns.is_empty() {
+            return Ok(partition_filters);
+        }
+        
+        // For each partition column, extract unique values from source
+        for partition_col in &partition_columns {
+            if let Ok(batches) = self.source.clone().select(vec![col(partition_col)])?.collect().await {
+                let values: Vec<String> = batches
                     .iter()
-                    .flatten()
-                    .map(|v| v.to_string())
-            })
-            .unique()
-            .collect();
-            
-        Ok(source_partitions)
+                    .flat_map(|batch| {
+                        if let Ok(column_index) = batch.schema().index_of(partition_col) {
+                            let column = batch.column(column_index);
+                            
+                            // Handle different data types for partition values
+                            if let Some(int_array) = column.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                                int_array.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>()
+                            } else if let Some(str_array) = column.as_any().downcast_ref::<arrow::array::StringArray>() {
+                                str_array.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>()
+                            } else if let Some(int64_array) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
+                                int64_array.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>()
+                            } else {
+                                // For other types, try to convert to string representation
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .unique()
+                    .collect();
+                    
+                if !values.is_empty() {
+                    partition_filters.insert(partition_col.to_string(), values);
+                }
+            }
+        }
+        
+        Ok(partition_filters)
     }
     
     /// Create a DataFrame for the target table with partition filtering
     fn create_target_dataframe(
         &self,
         state: &datafusion::execution::session_state::SessionState,
-        partition_filters: &[String],
+        partition_filters: &HashMap<String, Vec<String>>,
     ) -> DeltaResult<DataFrame> {
         let scan_config = crate::delta_datafusion::DeltaScanConfigBuilder::default()
             .with_file_column(false)
@@ -243,20 +265,28 @@ impl UpsertBuilder {
             scan_config,
         )?);
 
-        // Create partition filter to limit scan scope
-        let filter_expr = if !partition_filters.is_empty() {
-            Some(Expr::InList(InList {
-                expr: Box::new(col("workspace_id")),
-                list: partition_filters.iter().map(|v| lit(v.parse::<i32>().unwrap())).collect(),
-                negated: false,
-            }))
-        } else {
-            None
-        };
-
+        // Create partition filters to limit scan scope
         let mut filters = Vec::new();
-        if let Some(filter) = filter_expr {
-            filters.push(filter);
+        for (column, values) in partition_filters {
+            if !values.is_empty() {
+                let filter_values: Vec<Expr> = values.iter().map(|v| {
+                    // Try to parse as integer first, then as string
+                    if let Ok(int_val) = v.parse::<i32>() {
+                        lit(int_val)
+                    } else if let Ok(int64_val) = v.parse::<i64>() {
+                        lit(int64_val)
+                    } else {
+                        lit(v.clone())
+                    }
+                }).collect();
+                
+                let filter_expr = Expr::InList(InList {
+                    expr: Box::new(col(column)),
+                    list: filter_values,
+                    negated: false,
+                });
+                filters.push(filter_expr);
+            }
         }
 
         let target_df = DataFrame::new(
@@ -320,11 +350,14 @@ impl UpsertBuilder {
         let logical_plan = self.source.clone().into_unoptimized_plan();
         let physical_plan = state.create_physical_plan(&logical_plan).await?;
         
+        // Get partition columns for writing
+        let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns.clone();
+        
         let (add_actions, _write_metrics) = write_execution_plan_v2(
             Some(&self.snapshot),
             state.clone(),
             physical_plan,
-            vec!["workspace_id".to_string()],
+            partition_columns,
             self.log_store.object_store(None),
             Some(self.snapshot.table_config().target_file_size() as usize),
             None,
@@ -346,7 +379,7 @@ impl UpsertBuilder {
         &self,
         state: &datafusion::execution::session_state::SessionState,
         target_df: &DataFrame,
-        partition_filters: &[String],
+        partition_filters: &HashMap<String, Vec<String>>,
         metrics: &mut UpsertMetrics,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         // Find files to remove based on partition filters
@@ -362,11 +395,14 @@ impl UpsertBuilder {
         let logical_plan = result_df.into_unoptimized_plan();
         let physical_plan = state.create_physical_plan(&logical_plan).await?;
 
+        // Get partition columns for writing
+        let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns.clone();
+
         let (add_actions, _write_metrics) = write_execution_plan_v2(
             Some(&self.snapshot),
             state.clone(),
             physical_plan,
-            vec!["workspace_id".to_string()],
+            partition_columns,
             self.log_store.object_store(None),
             Some(self.snapshot.table_config().target_file_size() as usize),
             None,
@@ -393,64 +429,77 @@ impl UpsertBuilder {
     }
     
     /// Find files that need to be removed based on partition filters
-    fn find_files_to_remove(&self, partition_filters: &[String]) -> Vec<crate::kernel::Add> {
+    fn find_files_to_remove(&self, partition_filters: &HashMap<String, Vec<String>>) -> Vec<crate::kernel::Add> {
         use delta_kernel::expressions::Scalar;
         
-        // TODO: Make this more generic - currently hardcoded to workspace_id
+        if partition_filters.is_empty() {
+            // If no partition filters, we need to scan all files
+            return self.snapshot
+                .eager_snapshot()
+                .files()
+                .map(|f| self.logical_file_to_add(f))
+                .collect();
+        }
+        
         self.snapshot
             .eager_snapshot()
             .files()
             .filter(|f| {
+                // Check if file matches any of the partition filters
                 f.partition_values().iter().any(|pv| {
-                    pv.get("workspace_id")
-                        .map(|scalar| {
-                            partition_filters.iter().any(|filter| {
-                                match scalar {
-                                    Scalar::Integer(i) => {
-                                        filter == &i.to_string()
+                    partition_filters.iter().any(|(column, values)| {
+                        pv.get(column.as_str())
+                            .map(|scalar| {
+                                values.iter().any(|filter_value| {
+                                    match scalar {
+                                        Scalar::Integer(i) => filter_value == &i.to_string(),
+                                        Scalar::String(s) => filter_value == s,
+                                        Scalar::Long(l) => filter_value == &l.to_string(),
+                                        _ => false,
                                     }
-                                    Scalar::String(s) => {
-                                        filter == s
-                                    }
-                                    _ => false,
-                                }
+                                })
                             })
-                        })
-                        .unwrap_or(false)
+                            .unwrap_or(false)
+                    })
                 })
             })
-            .map(|f| {
-                // Convert LogicalFile to Add action
-                // First, convert partition values from delta_kernel format to the expected HashMap
-                let partition_values = f.partition_values()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|(k, v)| {
-                        let value = match v {
-                            Scalar::Integer(i) => Some(i.to_string()),
-                            Scalar::String(s) => Some(s.clone()),
-                            _ => None,
-                        };
-                        (k.to_string(), value)
-                    })
-                    .collect();
-                    
-                crate::kernel::Add {
-                    path: f.path().to_string(),
-                    size: f.size(),
-                    modification_time: f.modification_time(),
-                    data_change: true,
-                    stats: None, // TODO: preserve stats if needed
-                    partition_values,
-                    tags: None,
-                    deletion_vector: None,
-                    base_row_id: None,
-                    default_row_commit_version: None,
-                    clustering_provider: None,
-                    stats_parsed: None,
-                }
-            })
+            .map(|f| self.logical_file_to_add(f))
             .collect()
+    }
+    
+    /// Convert a LogicalFile to an Add action
+    fn logical_file_to_add(&self, f: crate::kernel::LogicalFile) -> crate::kernel::Add {
+        use delta_kernel::expressions::Scalar;
+        
+        // Convert partition values from delta_kernel format to the expected HashMap
+        let partition_values = f.partition_values()
+            .unwrap_or_default()
+            .iter()
+            .map(|(k, v)| {
+                let value = match v {
+                    Scalar::Integer(i) => Some(i.to_string()),
+                    Scalar::String(s) => Some(s.clone()),
+                    Scalar::Long(l) => Some(l.to_string()),
+                    _ => None,
+                };
+                (k.to_string(), value)
+            })
+            .collect();
+            
+        crate::kernel::Add {
+            path: f.path().to_string(),
+            size: f.size(),
+            modification_time: f.modification_time(),
+            data_change: true,
+            stats: None, // TODO: preserve stats if needed
+            partition_values,
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            stats_parsed: None,
+        }
     }
     
     /// Get target rows that don't conflict with source (using anti-join)
@@ -486,14 +535,8 @@ impl UpsertBuilder {
     fn create_remove_actions(
         &self,
         files_to_remove: &[crate::kernel::Add],
-        partition_filters: &[String],
+        _partition_filters: &HashMap<String, Vec<String>>,
     ) -> Vec<Action> {
-        // TODO: Make partition values more generic
-        let mut partition_values = HashMap::new();
-        if let Some(filter) = partition_filters.first() {
-            partition_values.insert("workspace_id".to_string(), Some(filter.clone()));
-        }
-
         files_to_remove
             .iter()
             .map(|f| {
@@ -506,7 +549,7 @@ impl UpsertBuilder {
                     deletion_vector: None,
                     base_row_id: None,
                     deletion_timestamp: Some(chrono::Utc::now().timestamp_millis()),
-                    partition_values: Some(partition_values.clone()),
+                    partition_values: Some(f.partition_values.clone()),
                     default_row_commit_version: None,
                 })
             })
@@ -530,9 +573,12 @@ impl UpsertBuilder {
         let mut commit_properties = self.commit_properties.clone();
         commit_properties.app_metadata = app_metadata;
 
+        // Get partition columns for the operation metadata
+        let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns.clone();
+
         let operation = crate::protocol::DeltaOperation::Write {
             mode: SaveMode::Overwrite,
-            partition_by: Some(vec!["workspace_id".to_string()]),
+            partition_by: if partition_columns.is_empty() { None } else { Some(partition_columns) },
             predicate: None,
         };
 
