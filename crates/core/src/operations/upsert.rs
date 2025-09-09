@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion_common::JoinType;
@@ -32,18 +31,8 @@ pub struct UpsertMetrics {
     pub num_added_files: usize,
     /// Number of files removed from the target table
     pub num_removed_files: usize,
-    /// Number of rows inserted from source
-    pub num_source_rows: usize,
-    /// Number of rows in target before upsert
-    pub num_target_rows_scanned: usize,
-    /// Number of conflicting rows that were replaced
-    pub num_target_rows_updated: usize,
-    /// Number of target rows that were copied without changes
-    pub num_target_rows_copied: usize,
-    /// Total number of rows in the result
-    pub num_output_rows: usize,
     /// Time taken to execute the entire operation
-    pub execution_time_ms: u64,
+    pub write_time_ms: u64,
     /// Time taken to scan the target files
     pub scan_time_ms: u64,
 }
@@ -111,7 +100,7 @@ impl super::Operation<()> for UpsertBuilder {
     fn log_store(&self) -> &LogStoreRef {
         &self.log_store
     }
-    
+
     fn get_custom_execute_handler(&self) -> Option<Arc<dyn super::CustomExecuteHandler>> {
         None
     }
@@ -123,24 +112,18 @@ impl std::future::IntoFuture for UpsertBuilder {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let execution_start = Instant::now();
-            let mut metrics = UpsertMetrics::default();
-            
             // Validate table state and protocol
             Self::validate_table_state(&self.snapshot)?;
-            
+
             // Get or create session state
             let state = self.get_or_create_session_state();
-            
+
             // Execute the upsert operation
-            let (actions, updated_metrics) = self.execute_upsert(state, &mut metrics).await?;
-            metrics = updated_metrics;
-            
+            let (actions, metrics) = self.execute_upsert(state).await?;
+
             // Commit the changes
-            let table = self.commit_changes(actions, &mut metrics).await?;
-            
-            metrics.execution_time_ms = execution_start.elapsed().as_millis() as u64;
-            
+            let table = self.commit_changes(actions, &metrics).await?;
+
             Ok((table, metrics))
         })
     }
@@ -150,14 +133,14 @@ impl UpsertBuilder {
     /// Validate that the table is in a valid state for upsert operations
     fn validate_table_state(snapshot: &DeltaTableState) -> DeltaResult<()> {
         PROTOCOL.can_write_to(&snapshot.snapshot)?;
-        
+
         if !snapshot.load_config().require_files {
             return Err(DeltaTableError::NotInitializedWithFiles("UPSERT".into()));
         }
-        
+
         Ok(())
     }
-    
+
     /// Get the existing session state or create a new one
     fn get_or_create_session_state(&self) -> datafusion::execution::session_state::SessionState {
         match &self.state {
@@ -171,62 +154,82 @@ impl UpsertBuilder {
             }
         }
     }
-    
+
     /// Execute the main upsert logic
     async fn execute_upsert(
         &self,
         state: datafusion::execution::session_state::SessionState,
-        metrics: &mut UpsertMetrics,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
-        let scan_start = Instant::now();
-        
         // Get unique partition values from source to limit scan scope
         let partition_filters = self.extract_partition_filters().await?;
-        
+
         // Create target DataFrame with partition filtering
         let target_df = self.create_target_dataframe(&state, &partition_filters)?;
-        
-        metrics.scan_time_ms = scan_start.elapsed().as_millis() as u64;
-        
+
         // Check for conflicts between source and target
         let has_conflicts = self.check_for_conflicts(&target_df).await?;
-        
+
         if has_conflicts {
-            self.execute_upsert_with_conflicts(&state, &target_df, &partition_filters, metrics).await
+            self.execute_upsert_with_conflicts(&state, &target_df, &partition_filters)
+                .await
         } else {
-            self.execute_simple_append(&state, metrics).await
+            self.execute_simple_append(&state).await
         }
     }
-    
+
     /// Extract partition values from source to optimize target scanning
     /// This method attempts to identify partition columns from the table schema
     /// and extract unique values from the source data to limit the scan scope
     async fn extract_partition_filters(&self) -> DeltaResult<HashMap<String, Vec<String>>> {
         let mut partition_filters = HashMap::new();
-        
+
         // Get partition columns from table metadata
         let partition_columns = self.snapshot.metadata().partition_columns.clone();
-        
+
         if partition_columns.is_empty() {
             return Ok(partition_filters);
         }
-        
+
         // For each partition column, extract unique values from source
         for partition_col in &partition_columns {
-            if let Ok(batches) = self.source.clone().select(vec![col(partition_col)])?.collect().await {
+            if let Ok(batches) = self
+                .source
+                .clone()
+                .select(vec![col(partition_col)])?
+                .collect()
+                .await
+            {
                 let values: Vec<String> = batches
                     .iter()
                     .flat_map(|batch| {
                         if let Ok(column_index) = batch.schema().index_of(partition_col) {
                             let column = batch.column(column_index);
-                            
+
                             // Handle different data types for partition values
-                            if let Some(int_array) = column.as_any().downcast_ref::<arrow::array::Int32Array>() {
-                                int_array.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>()
-                            } else if let Some(str_array) = column.as_any().downcast_ref::<arrow::array::StringArray>() {
-                                str_array.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>()
-                            } else if let Some(int64_array) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
-                                int64_array.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>()
+                            if let Some(int_array) =
+                                column.as_any().downcast_ref::<arrow::array::Int32Array>()
+                            {
+                                int_array
+                                    .iter()
+                                    .flatten()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>()
+                            } else if let Some(str_array) =
+                                column.as_any().downcast_ref::<arrow::array::StringArray>()
+                            {
+                                str_array
+                                    .iter()
+                                    .flatten()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>()
+                            } else if let Some(int64_array) =
+                                column.as_any().downcast_ref::<arrow::array::Int64Array>()
+                            {
+                                int64_array
+                                    .iter()
+                                    .flatten()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>()
                             } else {
                                 // For other types, try to convert to string representation
                                 Vec::new()
@@ -237,16 +240,16 @@ impl UpsertBuilder {
                     })
                     .unique()
                     .collect();
-                    
+
                 if !values.is_empty() {
                     partition_filters.insert(partition_col.to_string(), values);
                 }
             }
         }
-        
+
         Ok(partition_filters)
     }
-    
+
     /// Create a DataFrame for the target table with partition filtering
     fn create_target_dataframe(
         &self,
@@ -269,17 +272,20 @@ impl UpsertBuilder {
         let mut filters = Vec::new();
         for (column, values) in partition_filters {
             if !values.is_empty() {
-                let filter_values: Vec<Expr> = values.iter().map(|v| {
-                    // Try to parse as integer first, then as string
-                    if let Ok(int_val) = v.parse::<i32>() {
-                        lit(int_val)
-                    } else if let Ok(int64_val) = v.parse::<i64>() {
-                        lit(int64_val)
-                    } else {
-                        lit(v.clone())
-                    }
-                }).collect();
-                
+                let filter_values: Vec<Expr> = values
+                    .iter()
+                    .map(|v| {
+                        // Try to parse as integer first, then as string
+                        if let Ok(int_val) = v.parse::<i32>() {
+                            lit(int_val)
+                        } else if let Ok(int64_val) = v.parse::<i64>() {
+                            lit(int64_val)
+                        } else {
+                            lit(v.clone())
+                        }
+                    })
+                    .collect();
+
                 let filter_expr = Expr::InList(InList {
                     expr: Box::new(col(column)),
                     list: filter_values,
@@ -302,14 +308,16 @@ impl UpsertBuilder {
 
         Ok(target_df)
     }
-    
+
     /// Check if there are any conflicts between source and target data
     async fn check_for_conflicts(&self, target_df: &DataFrame) -> DeltaResult<bool> {
-        let target_keys: Vec<_> = self.join_keys
+        let target_keys: Vec<_> = self
+            .join_keys
             .iter()
             .map(|k| col(k).alias(&format!("target_{}", k)))
             .collect();
-        let source_keys: Vec<_> = self.join_keys
+        let source_keys: Vec<_> = self
+            .join_keys
             .iter()
             .map(|k| col(k).alias(&format!("source_{}", k)))
             .collect();
@@ -317,11 +325,13 @@ impl UpsertBuilder {
         let target_subset = target_df.clone().select(target_keys)?;
         let source_subset = self.source.clone().select(source_keys)?;
 
-        let source_key_cols: Vec<_> = self.join_keys
+        let source_key_cols: Vec<_> = self
+            .join_keys
             .iter()
             .map(|s| format!("source_{}", s))
             .collect();
-        let target_key_cols: Vec<_> = self.join_keys
+        let target_key_cols: Vec<_> = self
+            .join_keys
             .iter()
             .map(|s| format!("target_{}", s))
             .collect();
@@ -330,8 +340,14 @@ impl UpsertBuilder {
             .join(
                 source_subset,
                 JoinType::Inner,
-                &source_key_cols.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-                &target_key_cols.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
+                &source_key_cols
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<&str>>(),
+                &target_key_cols
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<&str>>(),
                 None,
             )?
             .limit(0, Some(1))?
@@ -340,20 +356,19 @@ impl UpsertBuilder {
 
         Ok(!conflicts.is_empty())
     }
-    
+
     /// Execute upsert when there are no conflicts - simple append
     async fn execute_simple_append(
         &self,
         state: &datafusion::execution::session_state::SessionState,
-        metrics: &mut UpsertMetrics,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         let logical_plan = self.source.clone().into_unoptimized_plan();
         let physical_plan = state.create_physical_plan(&logical_plan).await?;
-        
+
         // Get partition columns for writing
         let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns.clone();
-        
-        let (add_actions, _write_metrics) = write_execution_plan_v2(
+
+        let (add_actions, write_metrics) = write_execution_plan_v2(
             Some(&self.snapshot),
             state.clone(),
             physical_plan,
@@ -365,32 +380,35 @@ impl UpsertBuilder {
             WriterStatsConfig::new(self.snapshot.table_config().num_indexed_cols(), None),
             None,
             false,
-        ).await?;
+        )
+        .await?;
+
+        let mut metrics = UpsertMetrics::default();
 
         metrics.num_added_files = add_actions.len();
         metrics.num_removed_files = 0;
-        // TODO: Extract actual row counts from write metrics
-        
+        metrics.scan_time_ms = write_metrics.scan_time_ms;
+        metrics.write_time_ms = write_metrics.write_time_ms;
+
         Ok((add_actions, metrics.clone()))
     }
-    
+
     /// Execute upsert when conflicts exist - need to remove old files and write new ones
     async fn execute_upsert_with_conflicts(
         &self,
         state: &datafusion::execution::session_state::SessionState,
         target_df: &DataFrame,
         partition_filters: &HashMap<String, Vec<String>>,
-        metrics: &mut UpsertMetrics,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         // Find files to remove based on partition filters
         let files_to_remove = self.find_files_to_remove(partition_filters);
-        
+
         // Perform anti-join to get target rows that don't conflict with source
         let non_conflicting_target = self.get_non_conflicting_target_rows(target_df)?;
-        
+
         // Union source with non-conflicting target rows
         let result_df = self.union_source_with_target(&non_conflicting_target)?;
-        
+
         // Write the combined data
         let logical_plan = result_df.into_unoptimized_plan();
         let physical_plan = state.create_physical_plan(&logical_plan).await?;
@@ -398,7 +416,7 @@ impl UpsertBuilder {
         // Get partition columns for writing
         let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns.clone();
 
-        let (add_actions, _write_metrics) = write_execution_plan_v2(
+        let (add_actions, write_metrics) = write_execution_plan_v2(
             Some(&self.snapshot),
             state.clone(),
             physical_plan,
@@ -410,37 +428,44 @@ impl UpsertBuilder {
             WriterStatsConfig::new(self.snapshot.table_config().num_indexed_cols(), None),
             None,
             false,
-        ).await?;
+        )
+        .await?;
 
         // Create remove actions for old files
         let remove_actions = self.create_remove_actions(&files_to_remove, partition_filters);
-        
+
         // Store metrics before moving add_actions
+        let mut metrics = UpsertMetrics::default();
+
         metrics.num_added_files = add_actions.len();
         metrics.num_removed_files = files_to_remove.len();
-        
+        metrics.scan_time_ms = write_metrics.scan_time_ms;
+        metrics.write_time_ms = write_metrics.write_time_ms;
+
         // Combine add and remove actions
         let mut all_actions = add_actions;
         all_actions.extend(remove_actions);
-        
-        // TODO: Extract actual row counts from write metrics
 
         Ok((all_actions, metrics.clone()))
     }
-    
+
     /// Find files that need to be removed based on partition filters
-    fn find_files_to_remove(&self, partition_filters: &HashMap<String, Vec<String>>) -> Vec<crate::kernel::Add> {
+    fn find_files_to_remove(
+        &self,
+        partition_filters: &HashMap<String, Vec<String>>,
+    ) -> Vec<crate::kernel::Add> {
         use delta_kernel::expressions::Scalar;
-        
+
         if partition_filters.is_empty() {
             // If no partition filters, we need to scan all files
-            return self.snapshot
+            return self
+                .snapshot
                 .eager_snapshot()
                 .files()
                 .map(|f| self.logical_file_to_add(f))
                 .collect();
         }
-        
+
         self.snapshot
             .eager_snapshot()
             .files()
@@ -450,13 +475,11 @@ impl UpsertBuilder {
                     partition_filters.iter().any(|(column, values)| {
                         pv.get(column.as_str())
                             .map(|scalar| {
-                                values.iter().any(|filter_value| {
-                                    match scalar {
-                                        Scalar::Integer(i) => filter_value == &i.to_string(),
-                                        Scalar::String(s) => filter_value == s,
-                                        Scalar::Long(l) => filter_value == &l.to_string(),
-                                        _ => false,
-                                    }
+                                values.iter().any(|filter_value| match scalar {
+                                    Scalar::Integer(i) => filter_value == &i.to_string(),
+                                    Scalar::String(s) => filter_value == s,
+                                    Scalar::Long(l) => filter_value == &l.to_string(),
+                                    _ => false,
                                 })
                             })
                             .unwrap_or(false)
@@ -466,13 +489,14 @@ impl UpsertBuilder {
             .map(|f| self.logical_file_to_add(f))
             .collect()
     }
-    
+
     /// Convert a LogicalFile to an Add action
     fn logical_file_to_add(&self, f: crate::kernel::LogicalFile) -> crate::kernel::Add {
         use delta_kernel::expressions::Scalar;
-        
+
         // Convert partition values from delta_kernel format to the expected HashMap
-        let partition_values = f.partition_values()
+        let partition_values = f
+            .partition_values()
             .unwrap_or_default()
             .iter()
             .map(|(k, v)| {
@@ -485,7 +509,7 @@ impl UpsertBuilder {
                 (k.to_string(), value)
             })
             .collect();
-            
+
         crate::kernel::Add {
             path: f.path().to_string(),
             size: f.size(),
@@ -501,27 +525,35 @@ impl UpsertBuilder {
             stats_parsed: None,
         }
     }
-    
+
     /// Get target rows that don't conflict with source (using anti-join)
     fn get_non_conflicting_target_rows(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
         // Left anti join: target rows NOT in source (non-conflicting target rows)
         let non_conflicting_target = target_df.clone().join(
             self.source.clone(),
             JoinType::LeftAnti,
-            &self.join_keys.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-            &self.join_keys.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
+            &self
+                .join_keys
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>(),
+            &self
+                .join_keys
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>(),
             None,
         )?;
 
         Ok(non_conflicting_target)
     }
-    
+
     /// Union source data with non-conflicting target rows
     fn union_source_with_target(&self, target_no_conflict: &DataFrame) -> DeltaResult<DataFrame> {
         let result_df = self.source.clone().union(target_no_conflict.clone())?;
         Ok(result_df)
     }
-    
+
     /// Create remove actions for files that need to be deleted
     fn create_remove_actions(
         &self,
@@ -546,17 +578,17 @@ impl UpsertBuilder {
             })
             .collect()
     }
-    
+
     /// Commit all changes to the Delta log
     async fn commit_changes(
         &self,
         actions: Vec<Action>,
-        metrics: &mut UpsertMetrics,
+        metrics: &UpsertMetrics,
     ) -> DeltaResult<DeltaTable> {
         // Add metrics to commit metadata
         let mut app_metadata = self.commit_properties.app_metadata.clone();
         app_metadata.insert("readVersion".to_owned(), self.snapshot.version().into());
-        
+
         if let Ok(metrics_json) = serde_json::to_value(metrics) {
             app_metadata.insert("operationMetrics".to_owned(), metrics_json);
         }
@@ -569,7 +601,11 @@ impl UpsertBuilder {
 
         let operation = crate::protocol::DeltaOperation::Write {
             mode: SaveMode::Overwrite,
-            partition_by: if partition_columns.is_empty() { None } else { Some(partition_columns) },
+            partition_by: if partition_columns.is_empty() {
+                None
+            } else {
+                Some(partition_columns)
+            },
             predicate: None,
         };
 
@@ -578,21 +614,35 @@ impl UpsertBuilder {
             .build(Some(&self.snapshot), self.log_store.clone(), operation)
             .await?;
 
-        Ok(DeltaTable::new_with_state(self.log_store.clone(), commit.snapshot()))
+        Ok(DeltaTable::new_with_state(
+            self.log_store.clone(),
+            commit.snapshot(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::arrow::datatypes::Schema;
-use super::*;
+    use super::*;
     use crate::DeltaOps;
     use arrow::array::{Int32Array, StringArray};
     use arrow::record_batch::RecordBatch;
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_array::ArrayRef;
+    use arrow_schema::{ArrowError, DataType, Field, Schema as ArrowSchema};
     use datafusion::prelude::SessionContext;
-    use std::sync::Arc;
     use delta_kernel::schema::{PrimitiveType, StructField};
+    use std::sync::Arc;
+
+    fn create_batch(data: Vec<ArrayRef>) -> Result<RecordBatch, ArrowError> {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("value", DataType::Int32, false),
+                Field::new("workspace_id", DataType::Int32, false),
+            ])),
+            data,
+        )
+    }
 
     async fn setup_test_table() -> DeltaTable {
         let schema = vec![
@@ -613,34 +663,22 @@ use super::*;
             ),
         ];
 
-        let arrow_schema= Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-            Field::new("workspace_id", DataType::Int32, false),
-        ]));
-
         let table = DeltaOps::new_in_memory()
             .create()
             .with_columns(schema)
-            //.with_columns(&table_schema.fields.clone())
             .with_partition_columns(["workspace_id"])
             .await
             .unwrap();
 
-
         // Add some initial data
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![
-                Arc::new(StringArray::from(vec!["A", "B", "C"])),
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(Int32Array::from(vec![1, 1, 2])),
-            ],
-        ).unwrap();
+        let batch = create_batch(vec![
+            Arc::new(StringArray::from(vec!["A", "B", "C"])),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![1, 1, 1])),
+        ])
+        .unwrap();
 
-        DeltaOps(table)
-            .write([batch])
-            .await.unwrap()
+        DeltaOps(table).write([batch]).await.unwrap()
     }
 
     async fn get_table_data(table: DeltaTable) -> Vec<RecordBatch> {
@@ -653,35 +691,27 @@ use super::*;
     async fn test_upsert_no_conflicts() {
         let table = setup_test_table().await;
 
-        // Create source data with no conflicts (different workspace_id)
-        let source_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-            Field::new("workspace_id", DataType::Int32, false),
-        ]));
-
-        let source_batch = RecordBatch::try_new(
-            source_schema,
-            vec![
-                Arc::new(StringArray::from(vec!["D", "E"])),
-                Arc::new(Int32Array::from(vec![4, 5])),
-                Arc::new(Int32Array::from(vec![3, 3])),
-            ],
-        ).unwrap();
+        let source_batch = create_batch(vec![
+            Arc::new(StringArray::from(vec!["D", "E"])),
+            Arc::new(Int32Array::from(vec![4, 5])),
+            Arc::new(Int32Array::from(vec![1, 1])),
+        ])
+        .unwrap();
 
         let ctx = SessionContext::new();
         let source_df = ctx.read_batch(source_batch).unwrap();
 
         let (updated_table, metrics) = DeltaOps(table)
-            .upsert(source_df, vec!["workspace_id".to_string(), "id".to_string()])
+            .upsert(
+                source_df,
+                vec!["workspace_id".to_string(), "id".to_string()],
+            )
             .await
             .unwrap();
 
         // Should have added files but no removed files since no conflicts
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 0);
-        assert!(metrics.execution_time_ms > 0);
-        assert!(metrics.scan_time_ms >= 0);
 
         // Should have 5 total rows (3 original + 2 new)
         let data = get_table_data(updated_table).await;
@@ -693,120 +723,45 @@ use super::*;
     async fn test_upsert_with_conflicts() {
         let table = setup_test_table().await;
 
-        // Create source data with conflicts (same id as existing records)
-        let source_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-            Field::new("workspace_id", DataType::Int32, false),
-        ]));
-
-        let source_batch = RecordBatch::try_new(
-            source_schema,
-            vec![
-                Arc::new(StringArray::from(vec!["A", "D"])), // "A" conflicts, "D" doesn't
-                Arc::new(Int32Array::from(vec![10, 4])),     // Updated value for A
-                Arc::new(Int32Array::from(vec![1, 1])),      // Same workspace as existing A
-            ],
-        ).unwrap();
+        let source_batch = create_batch(vec![
+            Arc::new(StringArray::from(vec!["A", "D"])), // "A" conflicts, "D" doesn't
+            Arc::new(Int32Array::from(vec![10, 4])),     // Updated value for A
+            Arc::new(Int32Array::from(vec![1, 1])),      // Same workspace as existing A
+        ])
+        .unwrap();
 
         let ctx = SessionContext::new();
         let source_df = ctx.read_batch(source_batch).unwrap();
 
         let (updated_table, metrics) = DeltaOps(table)
-            .upsert(source_df, vec!["workspace_id".to_string(), "id".to_string()])
+            .upsert(
+                source_df,
+                vec!["workspace_id".to_string(), "id".to_string()],
+            )
             .await
             .unwrap();
 
         // Should have both added and removed files due to conflicts
         assert_eq!(metrics.num_added_files, 2);
         assert_eq!(metrics.num_removed_files, 1);
-        assert!(metrics.execution_time_ms > 0);
-        assert!(metrics.scan_time_ms >= 0);
 
         // Should still have some rows
         let data = get_table_data(updated_table).await;
         let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
-        assert!(total_rows > 0);
+        assert_eq!(total_rows, 4);
     }
-
-    // #[tokio::test]
-    // async fn test_upsert_multiple_join_keys() {
-    //     let table_schema = Arc::new(ArrowSchema::new(vec![
-    //         Field::new("id", DataType::Utf8, false),
-    //         Field::new("category", DataType::Utf8, false),
-    //         Field::new("value", DataType::Int32, false),
-    //         Field::new("workspace_id", DataType::Int32, false),
-    //     ]));
-    //
-    //     let table = DeltaOps::new_in_memory()
-    //         .create()
-    //         .with_columns(&table_schema.fields.clone())
-    //         .with_partition_columns(["workspace_id"])
-    //         .await
-    //         .unwrap();
-    //
-    //     // Add initial data
-    //     let initial_batch = RecordBatch::try_new(
-    //         table_schema.clone(),
-    //         vec![
-    //             Arc::new(StringArray::from(vec!["A", "B"])),
-    //             Arc::new(StringArray::from(vec!["X", "Y"])),
-    //             Arc::new(Int32Array::from(vec![1, 2])),
-    //             Arc::new(Int32Array::from(vec![1, 1])),
-    //         ],
-    //     ).unwrap();
-    //
-    //     let table = DeltaOps(table)
-    //         .write([initial_batch])
-    //         .await
-    //         .unwrap();
-    //
-    //     // Create source data with composite key conflicts
-    //     let source_batch = RecordBatch::try_new(
-    //         table_schema,
-    //         vec![
-    //             Arc::new(StringArray::from(vec!["A", "C"])), // A+X conflicts, C+Z doesn't
-    //             Arc::new(StringArray::from(vec!["X", "Z"])),
-    //             Arc::new(Int32Array::from(vec![10, 3])),     // Updated value for A+X
-    //             Arc::new(Int32Array::from(vec![1, 1])),
-    //         ],
-    //     ).unwrap();
-    //
-    //     let ctx = SessionContext::new();
-    //     let source_df = ctx.read_batch(source_batch).unwrap();
-    //
-    //     let (updated_table, metrics) = DeltaOps(table)
-    //         .upsert(source_df, vec!["id".to_string(), "category".to_string()])
-    //         .await
-    //         .unwrap();
-    //
-    //     assert!(metrics.num_added_files > 0);
-    //     assert!(metrics.execution_time_ms > 0);
-    //
-    //     let data = get_table_data(&updated_table).await;
-    //     let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
-    //     assert!(total_rows > 0);
-    // }
 
     #[tokio::test]
     async fn test_upsert_empty_source() {
         let table = setup_test_table().await;
 
-        let source_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-            Field::new("workspace_id", DataType::Int32, false),
-        ]));
-
         // Create empty source data
-        let source_batch = RecordBatch::try_new(
-            source_schema,
-            vec![
-                Arc::new(StringArray::from(Vec::<String>::new())),
-                Arc::new(Int32Array::from(Vec::<i32>::new())),
-                Arc::new(Int32Array::from(Vec::<i32>::new())),
-            ],
-        ).unwrap();
+        let source_batch = create_batch(vec![
+            Arc::new(StringArray::from(Vec::<String>::new())),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+        ])
+        .unwrap();
 
         let ctx = SessionContext::new();
         let source_df = ctx.read_batch(source_batch).unwrap();
@@ -819,7 +774,6 @@ use super::*;
         // No changes should be made for empty source
         assert_eq!(metrics.num_added_files, 0);
         assert_eq!(metrics.num_removed_files, 0);
-        assert!(metrics.execution_time_ms >= 0);
 
         // Original data should remain unchanged
         let data = get_table_data(updated_table).await;
@@ -828,71 +782,29 @@ use super::*;
     }
 
     #[tokio::test]
-    async fn test_upsert_metrics_are_meaningful() {
-        let table = setup_test_table().await;
-
-        let source_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-            Field::new("workspace_id", DataType::Int32, false),
-        ]));
-
-        let source_batch = RecordBatch::try_new(
-            source_schema,
-            vec![
-                Arc::new(StringArray::from(vec!["A", "B", "D", "E"])),
-                Arc::new(Int32Array::from(vec![10, 20, 4, 5])),
-                Arc::new(Int32Array::from(vec![1, 1, 1, 2])),
-            ],
-        ).unwrap();
-
-        let ctx = SessionContext::new();
-        let source_df = ctx.read_batch(source_batch).unwrap();
-
-        let (_, metrics) = DeltaOps(table)
-            .upsert(source_df, vec!["workspace_id".to_string(), "id".to_string()])
-            .await
-            .unwrap();
-
-        // Verify all metrics are populated with reasonable values
-        assert!(metrics.num_added_files > 0);
-        assert!(metrics.execution_time_ms > 0);
-        assert!(metrics.scan_time_ms >= 0);
-
-        // For this test, we expect some files to be removed due to conflicts
-        assert!(metrics.num_removed_files > 0);
-
-        // Source rows should be tracked
-        assert_eq!(metrics.num_source_rows, 0); // TODO: this should be populated
-    }
-
-    #[tokio::test]
     async fn test_upsert_with_custom_properties() {
         let table = setup_test_table().await;
 
-        let source_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-            Field::new("workspace_id", DataType::Int32, false),
-        ]));
-
-        let source_batch = RecordBatch::try_new(
-            source_schema,
-            vec![
-                Arc::new(StringArray::from(vec!["F"])),
-                Arc::new(Int32Array::from(vec![6])),
-                Arc::new(Int32Array::from(vec![1])),
-            ],
-        ).unwrap();
+        let source_batch = create_batch(vec![
+            Arc::new(StringArray::from(vec!["F"])),
+            Arc::new(Int32Array::from(vec![6])),
+            Arc::new(Int32Array::from(vec![1])),
+        ])
+        .unwrap();
 
         let ctx = SessionContext::new();
         let source_df = ctx.read_batch(source_batch).unwrap();
 
         let mut commit_props = CommitProperties::default();
-        commit_props.app_metadata.insert("test_key".to_string(), serde_json::json!("test_value"));
+        commit_props
+            .app_metadata
+            .insert("test_key".to_string(), serde_json::json!("test_value"));
 
         let (updated_table, _) = DeltaOps(table)
-            .upsert(source_df, vec!["workspace_id".to_string(), "id".to_string()])
+            .upsert(
+                source_df,
+                vec!["workspace_id".to_string(), "id".to_string()],
+            )
             .with_commit_properties(commit_props)
             .await
             .unwrap();
