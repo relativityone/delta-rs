@@ -196,50 +196,37 @@ impl UpsertBuilder {
                 .collect()
                 .await
             {
-                let values: Vec<String> = batches
-                    .iter()
-                    .flat_map(|batch| {
-                        if let Ok(column_index) = batch.schema().index_of(partition_col) {
-                            let column = batch.column(column_index);
+                // Collect all values from all batches into a single Vec<String>
+                let mut all_values = Vec::new();
+                for batch in batches {
+                    if let Ok(column_index) = batch.schema().index_of(partition_col) {
+                        let column = batch.column(column_index);
 
-                            // Handle different data types for partition values
-                            if let Some(int_array) =
-                                column.as_any().downcast_ref::<arrow::array::Int32Array>()
-                            {
-                                int_array
-                                    .iter()
-                                    .flatten()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                            } else if let Some(str_array) =
-                                column.as_any().downcast_ref::<arrow::array::StringArray>()
-                            {
-                                str_array
-                                    .iter()
-                                    .flatten()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                            } else if let Some(int64_array) =
-                                column.as_any().downcast_ref::<arrow::array::Int64Array>()
-                            {
-                                int64_array
-                                    .iter()
-                                    .flatten()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                            } else {
-                                // For other types, try to convert to string representation
-                                Vec::new()
-                            }
+                        if let Some(int_array) = column.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                            all_values.extend(int_array.iter().flatten().map(|v| v.to_string()));
+                        } else if let Some(str_array) = column.as_any().downcast_ref::<arrow::array::StringArray>() {
+                            all_values.extend(str_array.iter().flatten().map(|v| v.to_string()));
+                        } else if let Some(int64_array) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
+                            all_values.extend(int64_array.iter().flatten().map(|v| v.to_string()));
+                        } else if let Some(uint32_array) = column.as_any().downcast_ref::<arrow::array::UInt32Array>() {
+                            all_values.extend(uint32_array.iter().flatten().map(|v| v.to_string()));
+                        } else if let Some(uint64_array) = column.as_any().downcast_ref::<arrow::array::UInt64Array>() {
+                            all_values.extend(uint64_array.iter().flatten().map(|v| v.to_string()));
                         } else {
-                            Vec::new()
+                            return Err(DeltaTableError::Generic(format!(
+                                "Unsupported partition column type for '{}'",
+                                partition_col
+                            )));
                         }
-                    })
-                    .unique()
-                    .collect();
+                    }
+                }
+
+                // Deduplicate values across all batches
+                let values: Vec<String> = all_values.into_iter().unique().collect();
 
                 if !values.is_empty() {
                     partition_filters.insert(partition_col.to_string(), values);
+                    println!("Extracted partition filter for column '{}': {:?}", partition_col, partition_filters[partition_col]);
                 }
             }
         }
@@ -544,31 +531,6 @@ impl UpsertBuilder {
     fn union_source_with_target(&self, target_no_conflict: &DataFrame) -> DeltaResult<DataFrame> {
         let result_df = self.source.clone().union(target_no_conflict.clone())?;
         Ok(result_df)
-    }
-
-    /// Create remove actions for files that need to be deleted
-    fn create_remove_actions(
-        &self,
-        files_to_remove: &[crate::kernel::Add],
-        _partition_filters: &HashMap<String, Vec<String>>,
-    ) -> Vec<Action> {
-        files_to_remove
-            .iter()
-            .map(|f| {
-                Action::Remove(Remove {
-                    path: f.path.clone(),
-                    data_change: true,
-                    extended_file_metadata: None,
-                    size: None,
-                    tags: None,
-                    deletion_vector: None,
-                    base_row_id: None,
-                    deletion_timestamp: Some(chrono::Utc::now().timestamp_millis()),
-                    partition_values: Some(f.partition_values.clone()),
-                    default_row_commit_version: None,
-                })
-            })
-            .collect()
     }
 
     /// Commit all changes to the Delta log
