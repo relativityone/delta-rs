@@ -1,6 +1,6 @@
 //! Upsert data from a source DataFrame into a target Delta Table.
 //! For each conflicting record (e.g., matching on primary key), only the source record is kept.
-//! All non-conflicting records are appended. This operation is memory bound and optimized for performance.
+//! All non-conflicting records are appended.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -401,7 +401,7 @@ impl UpsertBuilder {
         partition_filters: &HashMap<String, Vec<String>>,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         // Find files to remove based on partition filters
-        let files_to_remove = self.find_files_to_remove(partition_filters);
+        let remove_actions = self.find_files_to_remove(partition_filters);
 
         // Perform anti-join to get target rows that don't conflict with source
         let non_conflicting_target = self.get_non_conflicting_target_rows(target_df)?;
@@ -431,14 +431,11 @@ impl UpsertBuilder {
         )
         .await?;
 
-        // Create remove actions for old files
-        let remove_actions = self.create_remove_actions(&files_to_remove, partition_filters);
-
         // Store metrics before moving add_actions
         let mut metrics = UpsertMetrics::default();
 
         metrics.num_added_files = add_actions.len();
-        metrics.num_removed_files = files_to_remove.len();
+        metrics.num_removed_files = remove_actions.len();
         metrics.scan_time_ms = write_metrics.scan_time_ms;
         metrics.write_time_ms = write_metrics.write_time_ms;
 
@@ -453,7 +450,7 @@ impl UpsertBuilder {
     fn find_files_to_remove(
         &self,
         partition_filters: &HashMap<String, Vec<String>>,
-    ) -> Vec<crate::kernel::Add> {
+    ) -> Vec<Action> {
         use delta_kernel::expressions::Scalar;
 
         if partition_filters.is_empty() {
@@ -491,7 +488,7 @@ impl UpsertBuilder {
     }
 
     /// Convert a LogicalFile to an Add action
-    fn logical_file_to_add(&self, f: crate::kernel::LogicalFile) -> crate::kernel::Add {
+    fn logical_file_to_add(&self, f: crate::kernel::LogicalFile) -> Action {
         use delta_kernel::expressions::Scalar;
 
         // Convert partition values from delta_kernel format to the expected HashMap
@@ -510,20 +507,18 @@ impl UpsertBuilder {
             })
             .collect();
 
-        crate::kernel::Add {
+        Action::Remove(Remove {
             path: f.path().to_string(),
-            size: f.size(),
-            modification_time: f.modification_time(),
             data_change: true,
-            stats: None, // TODO: preserve stats if needed
-            partition_values,
+            extended_file_metadata: None,
+            size: None,
             tags: None,
             deletion_vector: None,
             base_row_id: None,
+            deletion_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            partition_values: Some(partition_values),
             default_row_commit_version: None,
-            clustering_provider: None,
-            stats_parsed: None,
-        }
+        })
     }
 
     /// Get target rows that don't conflict with source (using anti-join)
