@@ -226,7 +226,6 @@ impl UpsertBuilder {
 
                 if !values.is_empty() {
                     partition_filters.insert(partition_col.to_string(), values);
-                    println!("Extracted partition filter for column '{}': {:?}", partition_col, partition_filters[partition_col]);
                 }
             }
         }
