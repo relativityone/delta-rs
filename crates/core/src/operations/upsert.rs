@@ -48,7 +48,7 @@ pub struct UpsertBuilder {
     /// Delta log store for handling data files
     log_store: LogStoreRef,
     /// Datafusion session state for executing the plans
-    state: Option<datafusion::execution::session_state::SessionState>,
+    state: Option<Arc<datafusion::execution::session_state::SessionState>>,
     /// Properties for Parquet writer configuration
     writer_properties: Option<WriterProperties>,
     /// Additional information to add to the commit
@@ -77,7 +77,7 @@ impl UpsertBuilder {
     /// Set the Datafusion session state to use for plan execution
     pub fn with_session_state(
         mut self,
-        state: datafusion::execution::session_state::SessionState,
+        state: Arc<datafusion::execution::session_state::SessionState>,
     ) -> Self {
         self.state = Some(state);
         self
@@ -142,15 +142,15 @@ impl UpsertBuilder {
     }
 
     /// Get the existing session state or create a new one
-    fn get_or_create_session_state(&self) -> datafusion::execution::session_state::SessionState {
+    fn get_or_create_session_state(&self) -> Arc<datafusion::execution::session_state::SessionState> {
         match &self.state {
-            Some(state) => state.clone(),
+            Some(state) => Arc::clone(state),
             None => {
                 let config: datafusion::execution::context::SessionConfig =
                     DeltaSessionConfig::default().into();
                 let session = SessionContext::new_with_config(config);
                 register_store(self.log_store.clone(), session.runtime_env());
-                session.state()
+                Arc::new(session.state())
             }
         }
     }
@@ -158,7 +158,7 @@ impl UpsertBuilder {
     /// Execute the main upsert logic
     async fn execute_upsert(
         &self,
-        state: datafusion::execution::session_state::SessionState,
+        state: Arc<datafusion::execution::session_state::SessionState>,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         // Get unique partition values from source to limit scan scope
         let partition_filters = self.extract_partition_filters().await?;
@@ -182,20 +182,17 @@ impl UpsertBuilder {
     /// and extract unique values from the source data to limit the scan scope
     async fn extract_partition_filters(&self) -> DeltaResult<HashMap<String, Vec<String>>> {
         let mut partition_filters = HashMap::new();
-
-        // Get partition columns from table metadata
-        let partition_columns = self.snapshot.metadata().partition_columns.clone();
+        let partition_columns = &self.snapshot.metadata().partition_columns;
 
         if partition_columns.is_empty() {
             return Ok(partition_filters);
         }
 
-        // For each partition column, extract unique values from source
-        for partition_col in &partition_columns {
+        for partition_col in partition_columns {
             if let Ok(batches) = self
                 .source
                 .clone()
-                .select(vec![col(partition_col)])?
+                .select(vec![col(partition_col)])? // No clone needed
                 .collect()
                 .await
             {
