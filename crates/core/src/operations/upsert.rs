@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use datafusion::execution::SessionState;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion_common::JoinType;
@@ -35,6 +36,8 @@ pub struct UpsertMetrics {
     pub write_time_ms: u64,
     /// Time taken to scan the target files
     pub scan_time_ms: u64,
+    /// Total execution time for the upsert operation
+    pub execution_time_ms: u64,
 }
 
 /// Builder for configuring and executing an upsert operation
@@ -112,6 +115,8 @@ impl std::future::IntoFuture for UpsertBuilder {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
+            let exec_start = Instant::now();
+
             // Validate table state and protocol
             Self::validate_table_state(&self.snapshot)?;
 
@@ -119,11 +124,12 @@ impl std::future::IntoFuture for UpsertBuilder {
             let state = self.get_or_create_session_state();
 
             // Execute the upsert operation
-            let (actions, metrics) = self.execute_upsert(state).await?;
+            let (actions, mut metrics) = self.execute_upsert(state).await?;
 
             // Commit the changes
             let table = self.commit_changes(actions, &metrics).await?;
 
+            metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
             Ok((table, metrics))
         })
     }
