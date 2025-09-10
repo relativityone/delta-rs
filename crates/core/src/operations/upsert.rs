@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-
+use datafusion::execution::SessionState;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion_common::JoinType;
 use datafusion_expr::expr::InList;
@@ -48,7 +48,7 @@ pub struct UpsertBuilder {
     /// Delta log store for handling data files
     log_store: LogStoreRef,
     /// Datafusion session state for executing the plans
-    state: Option<Arc<datafusion::execution::session_state::SessionState>>,
+    state: Option<Arc<SessionState>>,
     /// Properties for Parquet writer configuration
     writer_properties: Option<WriterProperties>,
     /// Additional information to add to the commit
@@ -77,9 +77,9 @@ impl UpsertBuilder {
     /// Set the Datafusion session state to use for plan execution
     pub fn with_session_state(
         mut self,
-        state: Arc<datafusion::execution::session_state::SessionState>,
+        state: SessionState,
     ) -> Self {
-        self.state = Some(state);
+        self.state = Some(Arc::from(state));
         self
     }
 
@@ -142,7 +142,7 @@ impl UpsertBuilder {
     }
 
     /// Get the existing session state or create a new one
-    fn get_or_create_session_state(&self) -> Arc<datafusion::execution::session_state::SessionState> {
+    fn get_or_create_session_state(&self) -> Arc<SessionState> {
         match &self.state {
             Some(state) => Arc::clone(state),
             None => {
@@ -158,7 +158,7 @@ impl UpsertBuilder {
     /// Execute the main upsert logic
     async fn execute_upsert(
         &self,
-        state: Arc<datafusion::execution::session_state::SessionState>,
+        state: Arc<SessionState>,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         // Get unique partition values from source to limit scan scope
         let partition_filters = self.extract_partition_filters().await?;
@@ -250,7 +250,7 @@ impl UpsertBuilder {
     /// Create a DataFrame for the target table with partition filtering
     fn create_target_dataframe(
         &self,
-        state: &datafusion::execution::session_state::SessionState,
+        state: &SessionState,
         partition_filters: &HashMap<String, Vec<String>>,
     ) -> DeltaResult<DataFrame> {
         let scan_config = crate::delta_datafusion::DeltaScanConfigBuilder::default()
@@ -357,7 +357,7 @@ impl UpsertBuilder {
     /// Execute upsert when there are no conflicts - simple append
     async fn execute_simple_append(
         &self,
-        state: &datafusion::execution::session_state::SessionState,
+        state: &SessionState,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         let logical_plan = self.source.clone().into_unoptimized_plan();
         let physical_plan = state.create_physical_plan(&logical_plan).await?;
@@ -393,7 +393,7 @@ impl UpsertBuilder {
     /// Execute upsert when conflicts exist - need to remove old files and write new ones
     async fn execute_upsert_with_conflicts(
         &self,
-        state: &datafusion::execution::session_state::SessionState,
+        state: &SessionState,
         target_df: &DataFrame,
         partition_filters: &HashMap<String, Vec<String>>,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
