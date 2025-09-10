@@ -390,7 +390,7 @@ impl UpsertBuilder {
         metrics.scan_time_ms = write_metrics.scan_time_ms;
         metrics.write_time_ms = write_metrics.write_time_ms;
 
-        Ok((add_actions, metrics.clone()))
+        Ok((add_actions, metrics))
     }
 
     /// Execute upsert when conflicts exist - need to remove old files and write new ones
@@ -443,7 +443,7 @@ impl UpsertBuilder {
         let mut all_actions = add_actions;
         all_actions.extend(remove_actions);
 
-        Ok((all_actions, metrics.clone()))
+        Ok((all_actions, metrics))
     }
 
     /// Find files that need to be removed based on partition filters
