@@ -741,6 +741,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upsert_with_another_partition() {
+        let table = setup_test_table().await;
+
+        let source_batch = create_batch(vec![
+            Arc::new(StringArray::from(vec!["A", "D"])),
+            Arc::new(Int32Array::from(vec![1, 4])),
+            Arc::new(Int32Array::from(vec![2, 2])), // Different workspace
+        ])
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        let source_df = ctx.read_batch(source_batch).unwrap();
+
+        let (updated_table, metrics) = DeltaOps(table)
+            .upsert(
+                source_df,
+                vec!["workspace_id".to_string(), "id".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // Should have both added and removed files due to conflicts
+        assert_eq!(metrics.num_added_files, 1);
+        assert_eq!(metrics.num_removed_files, 0);
+
+        // Should still have some rows
+        let data = get_table_data(updated_table).await;
+        let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+    }
+
+    #[tokio::test]
     async fn test_upsert_with_custom_properties() {
         let table = setup_test_table().await;
 
