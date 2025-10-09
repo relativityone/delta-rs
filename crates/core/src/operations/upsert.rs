@@ -2,9 +2,8 @@
 //! For each conflicting record (e.g., matching on primary key), only the source record is kept.
 //! All non-conflicting records are appended.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
+use arrow_array::cast::AsArray;
+use arrow_array::Array;
 use datafusion::execution::SessionState;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion_common::JoinType;
@@ -12,6 +11,9 @@ use datafusion_expr::expr::InList;
 use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::delta_datafusion::DeltaSessionConfig;
 use crate::delta_datafusion::{register_store, DataFusionMixins};
@@ -78,10 +80,7 @@ impl UpsertBuilder {
     }
 
     /// Set the Datafusion session state to use for plan execution
-    pub fn with_session_state(
-        mut self,
-        state: SessionState,
-    ) -> Self {
+    pub fn with_session_state(mut self, state: SessionState) -> Self {
         self.state = Some(Arc::from(state));
         self
     }
@@ -129,11 +128,14 @@ impl std::future::IntoFuture for UpsertBuilder {
             // Commit the changes
             let table = self.commit_changes(actions, &metrics).await?;
 
-            metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
+            metrics.execution_time_ms =
+                Instant::now().duration_since(exec_start).as_millis() as u64;
             Ok((table, metrics))
         })
     }
 }
+
+const FILE_PATH_COLUMN: &'static str = "__delta_rs_path";
 
 impl UpsertBuilder {
     /// Validate that the table is in a valid state for upsert operations
@@ -173,11 +175,16 @@ impl UpsertBuilder {
         let target_df = self.create_target_dataframe(&state, &partition_filters)?;
 
         // Check for conflicts between source and target
-        let has_conflicts = self.check_for_conflicts(&target_df).await?;
+        let conflicts_df = self.check_for_conflicts(&target_df).await?.cache().await?;
 
-        if has_conflicts {
-            self.execute_upsert_with_conflicts(&state, &target_df, &partition_filters)
-                .await
+        if &conflicts_df.clone().count().await? > &0 {
+            self.execute_upsert_with_conflicts(
+                &state,
+                &target_df,
+                &partition_filters,
+                &conflicts_df,
+            )
+            .await
         } else {
             self.execute_simple_append(&state).await
         }
@@ -208,15 +215,25 @@ impl UpsertBuilder {
                     if let Ok(column_index) = batch.schema().index_of(partition_col) {
                         let column = batch.column(column_index);
 
-                        if let Some(int_array) = column.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                        if let Some(int_array) =
+                            column.as_any().downcast_ref::<arrow::array::Int32Array>()
+                        {
                             all_values.extend(int_array.iter().flatten().map(|v| v.to_string()));
-                        } else if let Some(str_array) = column.as_any().downcast_ref::<arrow::array::StringArray>() {
+                        } else if let Some(str_array) =
+                            column.as_any().downcast_ref::<arrow::array::StringArray>()
+                        {
                             all_values.extend(str_array.iter().flatten().map(|v| v.to_string()));
-                        } else if let Some(int64_array) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
+                        } else if let Some(int64_array) =
+                            column.as_any().downcast_ref::<arrow::array::Int64Array>()
+                        {
                             all_values.extend(int64_array.iter().flatten().map(|v| v.to_string()));
-                        } else if let Some(uint32_array) = column.as_any().downcast_ref::<arrow::array::UInt32Array>() {
+                        } else if let Some(uint32_array) =
+                            column.as_any().downcast_ref::<arrow::array::UInt32Array>()
+                        {
                             all_values.extend(uint32_array.iter().flatten().map(|v| v.to_string()));
-                        } else if let Some(uint64_array) = column.as_any().downcast_ref::<arrow::array::UInt64Array>() {
+                        } else if let Some(uint64_array) =
+                            column.as_any().downcast_ref::<arrow::array::UInt64Array>()
+                        {
                             all_values.extend(uint64_array.iter().flatten().map(|v| v.to_string()));
                         } else {
                             return Err(DeltaTableError::Generic(format!(
@@ -246,7 +263,7 @@ impl UpsertBuilder {
         partition_filters: &HashMap<String, Vec<String>>,
     ) -> DeltaResult<DataFrame> {
         let scan_config = crate::delta_datafusion::DeltaScanConfigBuilder::default()
-            .with_file_column(false)
+            .with_file_column(true)
             .with_parquet_pushdown(true)
             .with_schema(self.snapshot.input_schema().unwrap())
             .build(&self.snapshot)?;
@@ -299,12 +316,10 @@ impl UpsertBuilder {
     }
 
     /// Check if there are any conflicts between source and target data
-    async fn check_for_conflicts(&self, target_df: &DataFrame) -> DeltaResult<bool> {
-        let target_keys: Vec<_> = self
-            .join_keys
-            .iter()
-            .map(|k| col(k).alias(&format!("target_{}", k)))
-            .collect();
+    async fn check_for_conflicts(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
+        let mut target_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
+        target_keys.push(col(FILE_PATH_COLUMN));
+
         let source_keys: Vec<_> = self
             .join_keys
             .iter()
@@ -319,11 +334,7 @@ impl UpsertBuilder {
             .iter()
             .map(|s| format!("source_{}", s))
             .collect();
-        let target_key_cols: Vec<_> = self
-            .join_keys
-            .iter()
-            .map(|s| format!("target_{}", s))
-            .collect();
+        let target_key_cols: Vec<_> = self.join_keys.iter().map(|s| format!("{}", s)).collect();
 
         let conflicts = target_subset
             .join(
@@ -339,11 +350,19 @@ impl UpsertBuilder {
                     .collect::<Vec<&str>>(),
                 None,
             )?
-            .limit(0, Some(1))?
-            .collect()
-            .await?;
+            //select only target columns (including file path)
+            .select(
+                target_key_cols
+                    .iter()
+                    .map(|s| col(s))
+                    .chain(std::iter::once(col(FILE_PATH_COLUMN)))
+                    .collect::<Vec<Expr>>(),
+            )
+            .map_err(|e| {
+                DeltaTableError::Generic(format!("Error during conflict detection join: {}", e))
+            });
 
-        Ok(!conflicts.is_empty())
+        conflicts
     }
 
     /// Execute upsert when there are no conflicts - simple append
@@ -388,14 +407,65 @@ impl UpsertBuilder {
         state: &SessionState,
         target_df: &DataFrame,
         partition_filters: &HashMap<String, Vec<String>>,
+        conflicts_df: &DataFrame,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
-        // Find files to remove based on partition filters
-        let remove_actions = self.find_files_to_remove(partition_filters);
+        // Find files to remove based on join key values (conflicting files only)
+        let conflicting_file_names = conflicts_df
+            .clone()
+            .select([col(FILE_PATH_COLUMN)])?
+            .distinct()?
+            .collect()
+            .await?
+            .iter()
+            .flat_map(|batch| {
+                let array = batch.column(0);
+                if let Some(dict_array) = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
+                {
+                    let keys = dict_array.keys();
+                    let values = dict_array.values();
+                    if let Some(str_values) =
+                        values.as_any().downcast_ref::<arrow::array::StringArray>()
+                    {
+                        return keys
+                            .iter()
+                            .flatten()
+                            .map(|key| str_values.value(key as usize).to_string())
+                            .collect::<Vec<String>>();
+                    }
+                } else if let Some(str_array) =
+                    array.as_any().downcast_ref::<arrow::array::StringArray>()
+                {
+                    return str_array
+                        .iter()
+                        .flatten()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>();
+                }
+                Vec::new()
+            })
+            .collect::<Vec<String>>();
 
-        // Perform anti-join to get target rows that don't conflict with source
-        let non_conflicting_target = self.get_non_conflicting_target_rows(target_df)?;
+        let remove_actions = self
+            .snapshot
+            .eager_snapshot()
+            .files()
+            .filter(|f| conflicting_file_names.contains(&f.path().to_string()))
+            .map(|f| self.logical_file_to_add(f))
+            .collect::<Vec<_>>();
 
-        // Union source with non-conflicting target rows
+        let filtered_target_df = target_df
+            .clone()
+            .filter(col(FILE_PATH_COLUMN).in_list(
+                conflicting_file_names.iter().map(|p| lit(p)).collect(),
+                false,
+            ))?
+            .drop_columns(&[FILE_PATH_COLUMN])?;
+
+        let non_conflicting_target =
+            self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_df)?;
+
         let result_df = self.union_source_with_target(&non_conflicting_target)?;
 
         // Write the combined data
@@ -511,10 +581,14 @@ impl UpsertBuilder {
     }
 
     /// Get target rows that don't conflict with source (using anti-join)
-    fn get_non_conflicting_target_rows(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
+    fn get_non_conflicting_target_rows(
+        &self,
+        target_df: &DataFrame,
+        conflicts_df: &DataFrame,
+    ) -> DeltaResult<DataFrame> {
         // Left anti join: target rows NOT in source (non-conflicting target rows)
         let non_conflicting_target = target_df.clone().join(
-            self.source.clone(),
+            conflicts_df.clone(),
             JoinType::LeftAnti,
             &self
                 .join_keys
@@ -630,14 +704,23 @@ mod tests {
             .unwrap();
 
         // Add some initial data
-        let batch = create_batch(vec![
+        let batch_1 = create_batch(vec![
             Arc::new(StringArray::from(vec!["A", "B", "C"])),
             Arc::new(Int32Array::from(vec![1, 2, 3])),
             Arc::new(Int32Array::from(vec![1, 1, 1])),
         ])
         .unwrap();
 
-        DeltaOps(table).write([batch]).await.unwrap()
+        // Add some initial data, second batch
+        let batch_2 = create_batch(vec![
+            Arc::new(StringArray::from(vec!["D"])),
+            Arc::new(Int32Array::from(vec![4])),
+            Arc::new(Int32Array::from(vec![1])),
+        ])
+        .unwrap();
+
+        DeltaOps(table.clone()).write([batch_1]).await.unwrap();
+        DeltaOps(table.clone()).write([batch_2]).await.unwrap()
     }
 
     async fn get_table_data(table: DeltaTable) -> Vec<RecordBatch> {
@@ -651,7 +734,7 @@ mod tests {
         let table = setup_test_table().await;
 
         let source_batch = create_batch(vec![
-            Arc::new(StringArray::from(vec!["D", "E"])),
+            Arc::new(StringArray::from(vec!["E", "F"])),
             Arc::new(Int32Array::from(vec![4, 5])),
             Arc::new(Int32Array::from(vec![1, 1])),
         ])
@@ -672,10 +755,10 @@ mod tests {
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 0);
 
-        // Should have 5 total rows (3 original + 2 new)
+        // Should have 6 total rows (4 original + 2 new)
         let data = get_table_data(updated_table).await;
         let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
-        assert_eq!(total_rows, 5);
+        assert_eq!(total_rows, 6);
     }
 
     #[tokio::test]
@@ -683,7 +766,7 @@ mod tests {
         let table = setup_test_table().await;
 
         let source_batch = create_batch(vec![
-            Arc::new(StringArray::from(vec!["A", "D"])), // "A" conflicts, "D" doesn't
+            Arc::new(StringArray::from(vec!["A", "E"])), // "A" conflicts, "E" doesn't
             Arc::new(Int32Array::from(vec![10, 4])),     // Updated value for A
             Arc::new(Int32Array::from(vec![1, 1])),      // Same workspace as existing A
         ])
@@ -707,7 +790,7 @@ mod tests {
         // Should still have some rows
         let data = get_table_data(updated_table).await;
         let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
-        assert_eq!(total_rows, 4);
+        assert_eq!(total_rows, 5);
     }
 
     #[tokio::test]
@@ -737,7 +820,7 @@ mod tests {
         // Original data should remain unchanged
         let data = get_table_data(updated_table).await;
         let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
-        assert_eq!(total_rows, 3); // Original 3 rows
+        assert_eq!(total_rows, 4); // Original 4 rows
     }
 
     #[tokio::test]
@@ -745,11 +828,11 @@ mod tests {
         let table = setup_test_table().await;
 
         let source_batch = create_batch(vec![
-            Arc::new(StringArray::from(vec!["A", "D"])),
+            Arc::new(StringArray::from(vec!["A", "E"])),
             Arc::new(Int32Array::from(vec![1, 4])),
             Arc::new(Int32Array::from(vec![2, 2])), // Different workspace
         ])
-            .unwrap();
+        .unwrap();
 
         let ctx = SessionContext::new();
         let source_df = ctx.read_batch(source_batch).unwrap();
@@ -769,7 +852,7 @@ mod tests {
         // Should still have some rows
         let data = get_table_data(updated_table).await;
         let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
-        assert_eq!(total_rows, 5);
+        assert_eq!(total_rows, 6);
     }
 
     #[tokio::test]
