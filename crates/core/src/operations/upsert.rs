@@ -2,7 +2,6 @@
 //! For each conflicting record (e.g., matching on primary key), only the source record is kept.
 //! All non-conflicting records are appended.
 
-use arrow_array::cast::AsArray;
 use arrow_array::Array;
 use datafusion::execution::SessionState;
 use datafusion::prelude::{DataFrame, SessionContext};
@@ -175,16 +174,11 @@ impl UpsertBuilder {
         let target_df = self.create_target_dataframe(&state, &partition_filters)?;
 
         // Check for conflicts between source and target
-        let conflicts_df = self.check_for_conflicts(&target_df).await?.cache().await?;
+        let conflicts_df = self.find_conflicts(&target_df).await?.cache().await?;
 
         if &conflicts_df.clone().count().await? > &0 {
-            self.execute_upsert_with_conflicts(
-                &state,
-                &target_df,
-                &partition_filters,
-                &conflicts_df,
-            )
-            .await
+            self.execute_upsert_with_conflicts(&state, &target_df, &conflicts_df)
+                .await
         } else {
             self.execute_simple_append(&state).await
         }
@@ -315,8 +309,23 @@ impl UpsertBuilder {
         Ok(target_df)
     }
 
-    /// Check if there are any conflicts between source and target data
-    async fn check_for_conflicts(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
+    /// Looks for conflicts between source and target data using an inner join on the join keys.
+    ///
+    /// Returns a `DataFrame` containing only the conflicting target rows, including the file path column.
+    ///
+    /// **Schema of returned DataFrame:**
+    /// - Each join key column (e\.g\. `"workspace_id"`, `"id"`)
+    /// - `__delta_rs_path` \(file path of the conflicting row\)
+    ///
+    /// **Example:**
+    /// If join keys are `["workspace_id", "id"]`, the resulting DataFrame schema:
+    /// ```
+    /// workspace_id: Int32
+    /// id: Utf8
+    /// __delta_rs_path: Utf8
+    /// ```
+    /// Each row represents a target record that conflicts with a source record \(i\.e\. same join key values\)\.
+    async fn find_conflicts(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
         let mut target_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
         target_keys.push(col(FILE_PATH_COLUMN));
 
@@ -406,66 +415,13 @@ impl UpsertBuilder {
         &self,
         state: &SessionState,
         target_df: &DataFrame,
-        partition_filters: &HashMap<String, Vec<String>>,
         conflicts_df: &DataFrame,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
-        // Find files to remove based on join key values (conflicting files only)
-        let conflicting_file_names = conflicts_df
-            .clone()
-            .select([col(FILE_PATH_COLUMN)])?
-            .distinct()?
-            .collect()
-            .await?
-            .iter()
-            .flat_map(|batch| {
-                let array = batch.column(0);
-                if let Some(dict_array) = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
-                {
-                    let keys = dict_array.keys();
-                    let values = dict_array.values();
-                    if let Some(str_values) =
-                        values.as_any().downcast_ref::<arrow::array::StringArray>()
-                    {
-                        return keys
-                            .iter()
-                            .flatten()
-                            .map(|key| str_values.value(key as usize).to_string())
-                            .collect::<Vec<String>>();
-                    }
-                } else if let Some(str_array) =
-                    array.as_any().downcast_ref::<arrow::array::StringArray>()
-                {
-                    return str_array
-                        .iter()
-                        .flatten()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>();
-                }
-                Vec::new()
-            })
-            .collect::<Vec<String>>();
-
-        let remove_actions = self
-            .snapshot
-            .eager_snapshot()
-            .files()
-            .filter(|f| conflicting_file_names.contains(&f.path().to_string()))
-            .map(|f| self.logical_file_to_add(f))
-            .collect::<Vec<_>>();
-
-        let filtered_target_df = target_df
-            .clone()
-            .filter(col(FILE_PATH_COLUMN).in_list(
-                conflicting_file_names.iter().map(|p| lit(p)).collect(),
-                false,
-            ))?
-            .drop_columns(&[FILE_PATH_COLUMN])?;
-
+        let conflicting_file_names = Self::conflicting_filenames(conflicts_df).await?;
+        let remove_actions = self.files_to_remove(&conflicting_file_names);
+        let filtered_target_df = Self::filter_conflicting_files(target_df, conflicting_file_names)?;
         let non_conflicting_target =
             self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_df)?;
-
         let result_df = self.union_source_with_target(&non_conflicting_target)?;
 
         // Write the combined data
@@ -505,49 +461,76 @@ impl UpsertBuilder {
         Ok((all_actions, metrics))
     }
 
-    /// Find files that need to be removed based on partition filters
-    fn find_files_to_remove(
-        &self,
-        partition_filters: &HashMap<String, Vec<String>>,
-    ) -> Vec<Action> {
-        use delta_kernel::expressions::Scalar;
+    fn filter_conflicting_files(
+        target_df: &DataFrame,
+        conflicting_file_names: Vec<String>,
+    ) -> Result<DataFrame, DeltaTableError> {
+        let filtered_target_df = target_df
+            .clone()
+            .filter(col(FILE_PATH_COLUMN).in_list(
+                conflicting_file_names.iter().map(|p| lit(p)).collect(),
+                false,
+            ))?
+            .drop_columns(&[FILE_PATH_COLUMN])?;
+        Ok(filtered_target_df)
+    }
 
-        if partition_filters.is_empty() {
-            // If no partition filters, we need to scan all files
-            return self
-                .snapshot
-                .eager_snapshot()
-                .files()
-                .map(|f| self.logical_file_to_add(f))
-                .collect();
-        }
-
-        self.snapshot
+    fn files_to_remove(&self, conflicting_file_names: &Vec<String>) -> Vec<Action> {
+        let remove_actions = self
+            .snapshot
             .eager_snapshot()
             .files()
-            .filter(|f| {
-                // Check if file matches any of the partition filters
-                f.partition_values().iter().any(|pv| {
-                    partition_filters.iter().any(|(column, values)| {
-                        pv.get(column.as_str())
-                            .map(|scalar| {
-                                values.iter().any(|filter_value| match scalar {
-                                    Scalar::Integer(i) => filter_value == &i.to_string(),
-                                    Scalar::String(s) => filter_value == s,
-                                    Scalar::Long(l) => filter_value == &l.to_string(),
-                                    _ => false,
-                                })
-                            })
-                            .unwrap_or(false)
-                    })
-                })
-            })
-            .map(|f| self.logical_file_to_add(f))
+            .filter(|f| conflicting_file_names.contains(&f.path().to_string()))
+            .map(|f| self.logical_file_to_remove(f))
+            .collect::<Vec<_>>();
+        remove_actions
+    }
+
+    async fn conflicting_filenames(
+        conflicts_df: &DataFrame,
+    ) -> Result<Vec<String>, DeltaTableError> {
+        // Find files to remove based on join key values (conflicting files only)
+        let conflicting_file_names = conflicts_df
+            .clone()
+            .select([col(FILE_PATH_COLUMN)])?
+            .distinct()?
             .collect()
+            .await?
+            .iter()
+            .flat_map(|batch| {
+                let array = batch.column(0);
+                if let Some(dict_array) = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
+                {
+                    let keys = dict_array.keys();
+                    let values = dict_array.values();
+                    if let Some(str_values) =
+                        values.as_any().downcast_ref::<arrow::array::StringArray>()
+                    {
+                        return keys
+                            .iter()
+                            .flatten()
+                            .map(|key| str_values.value(key as usize).to_string())
+                            .collect::<Vec<String>>();
+                    }
+                } else if let Some(str_array) =
+                    array.as_any().downcast_ref::<arrow::array::StringArray>()
+                {
+                    return str_array
+                        .iter()
+                        .flatten()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>();
+                }
+                Vec::new()
+            })
+            .collect::<Vec<String>>();
+        Ok(conflicting_file_names)
     }
 
     /// Convert a LogicalFile to an Add action
-    fn logical_file_to_add(&self, f: crate::kernel::LogicalFile) -> Action {
+    fn logical_file_to_remove(&self, f: crate::kernel::LogicalFile) -> Action {
         use delta_kernel::expressions::Scalar;
 
         // Convert partition values from delta_kernel format to the expected HashMap
