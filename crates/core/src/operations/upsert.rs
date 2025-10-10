@@ -712,6 +712,23 @@ mod tests {
         df.collect().await.unwrap()
     }
 
+    fn assert_record(data: &Vec<RecordBatch>, expected: (&str, i32)) {
+        // Check that the expected record was updated correctly
+        let (expected_id, expected_value) = expected;
+        let mut found = false;
+        for batch in data {
+            let id_array = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let value_array = batch.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+            for i in 0..batch.num_rows() {
+                if id_array.value(i) == expected_id {
+                    found = true;
+                    assert_eq!(value_array.value(i), expected_value, "Record value mismatch for id '{}'", expected_id);
+                }
+            }
+        }
+        assert!(found, "Expected record '{}' not found", expected_id);
+    }
+
     #[tokio::test]
     async fn test_upsert_no_conflicts() {
         let table = setup_test_table().await;
@@ -753,7 +770,7 @@ mod tests {
             Arc::new(Int32Array::from(vec![10, 4])),     // Updated value for A
             Arc::new(Int32Array::from(vec![1, 1])),      // Same workspace as existing A
         ])
-        .unwrap();
+            .unwrap();
 
         let ctx = SessionContext::new();
         let source_df = ctx.read_batch(source_batch).unwrap();
@@ -773,6 +790,10 @@ mod tests {
         // Should still have some rows
         let data = get_table_data(updated_table).await;
         let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
+
+        assert_record(&data, ("A", 10)); // Updated record
+        assert_record(&data, ("E", 4));  // New record
+
         assert_eq!(total_rows, 5);
     }
 
