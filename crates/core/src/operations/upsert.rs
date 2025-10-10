@@ -257,7 +257,7 @@ impl UpsertBuilder {
         partition_filters: &HashMap<String, Vec<String>>,
     ) -> DeltaResult<DataFrame> {
         let scan_config = crate::delta_datafusion::DeltaScanConfigBuilder::default()
-            .with_file_column(true)
+            .with_file_column_name(&FILE_PATH_COLUMN.to_string())
             .with_parquet_pushdown(true)
             .with_schema(self.snapshot.input_schema().unwrap())
             .build(&self.snapshot)?;
