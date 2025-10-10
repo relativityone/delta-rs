@@ -616,7 +616,7 @@ impl UpsertBuilder {
         let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns.clone();
 
         let operation = crate::protocol::DeltaOperation::Write {
-            mode: SaveMode::Overwrite,
+            mode: SaveMode::Append,
             partition_by: if partition_columns.is_empty() {
                 None
             } else {
