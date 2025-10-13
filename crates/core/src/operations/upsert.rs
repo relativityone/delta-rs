@@ -696,9 +696,9 @@ mod tests {
 
         // Add some initial data, second batch
         let batch_2 = create_batch(vec![
-            Arc::new(StringArray::from(vec!["D"])),
-            Arc::new(Int32Array::from(vec![4])),
-            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["D", "E"])),
+            Arc::new(Int32Array::from(vec![4, 5])),
+            Arc::new(Int32Array::from(vec![1, 1])),
         ])
         .unwrap();
 
@@ -732,10 +732,11 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_no_conflicts() {
         let table = setup_test_table().await;
+        let input_rows = table_rows(&get_table_data(table.clone()).await);
 
         let source_batch = create_batch(vec![
-            Arc::new(StringArray::from(vec!["E", "F"])),
-            Arc::new(Int32Array::from(vec![4, 5])),
+            Arc::new(StringArray::from(vec!["F", "G"])),
+            Arc::new(Int32Array::from(vec![6, 7])),
             Arc::new(Int32Array::from(vec![1, 1])),
         ])
         .unwrap();
@@ -757,17 +758,18 @@ mod tests {
 
         // Should have 6 total rows (4 original + 2 new)
         let data = get_table_data(updated_table).await;
-        let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
-        assert_eq!(total_rows, 6);
+        let total_rows: usize = table_rows(&data);
+        assert_eq!(total_rows, input_rows + 2); // Original 5 rows + 2 new rows
     }
 
     #[tokio::test]
     async fn test_upsert_with_conflicts() {
         let table = setup_test_table().await;
+        let input_rows = table_rows(&get_table_data(table.clone()).await);
 
         let source_batch = create_batch(vec![
-            Arc::new(StringArray::from(vec!["A", "E"])), // "A" conflicts, "E" doesn't
-            Arc::new(Int32Array::from(vec![10, 4])),     // Updated value for A
+            Arc::new(StringArray::from(vec!["A", "F"])), // "A" conflicts, "F" doesn't
+            Arc::new(Int32Array::from(vec![10, 6])),     // Updated value for A
             Arc::new(Int32Array::from(vec![1, 1])),      // Same workspace as existing A
         ])
             .unwrap();
@@ -789,17 +791,60 @@ mod tests {
 
         // Should still have some rows
         let data = get_table_data(updated_table).await;
-        let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
+        let total_rows: usize = table_rows(&data);
 
         assert_record(&data, ("A", 10)); // Updated record
-        assert_record(&data, ("E", 4));  // New record
+        assert_record(&data, ("F", 6));  // New record
 
-        assert_eq!(total_rows, 5);
+        assert_eq!(total_rows, input_rows + 1); // Original 5 rows + 1 new row
+    }
+
+    #[tokio::test]
+    async fn test_upsert_with_multifile_conflicts() {
+        let table = setup_test_table().await;
+        let input_rows = table_rows(&get_table_data(table.clone()).await);
+
+        let source_batch = create_batch(vec![
+            Arc::new(StringArray::from(vec!["A", "E", "F"])), // "A" conflicts file 1, "E" conflicts file 2, "F" doesn't
+            Arc::new(Int32Array::from(vec![10, 50, 6])),     // Updated value for A and E
+            Arc::new(Int32Array::from(vec![1, 1, 1])),      // Same workspace
+        ])
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        let source_df = ctx.read_batch(source_batch).unwrap();
+
+        let (updated_table, metrics) = DeltaOps(table)
+            .upsert(
+                source_df,
+                vec!["workspace_id".to_string(), "id".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // Should have both added and removed files due to conflicts
+        assert_eq!(metrics.num_added_files, 2);
+        assert_eq!(metrics.num_removed_files, 2);
+
+        // Should still have some rows
+        let data = get_table_data(updated_table).await;
+        let total_rows: usize = table_rows(&data);
+
+        assert_record(&data, ("A", 10)); // Updated record
+        assert_record(&data, ("E", 50)); // Updated record
+        assert_record(&data, ("F", 6));  // New record
+
+        assert_eq!(total_rows, input_rows + 1); // Original 5 rows + 1 new row
+    }
+
+    fn table_rows(data: &Vec<RecordBatch>) -> usize {
+        data.iter().map(|batch| batch.num_rows()).sum()
     }
 
     #[tokio::test]
     async fn test_upsert_empty_source() {
         let table = setup_test_table().await;
+        let input_rows = table_rows(&get_table_data(table.clone()).await);
 
         // Create empty source data
         let source_batch = create_batch(vec![
@@ -823,13 +868,14 @@ mod tests {
 
         // Original data should remain unchanged
         let data = get_table_data(updated_table).await;
-        let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
-        assert_eq!(total_rows, 4); // Original 4 rows
+        let total_rows: usize = table_rows(&data);
+        assert_eq!(total_rows, input_rows); // Original 4 rows
     }
 
     #[tokio::test]
     async fn test_upsert_with_another_partition() {
         let table = setup_test_table().await;
+        let input_rows = table_rows(&get_table_data(table.clone()).await);
 
         let source_batch = create_batch(vec![
             Arc::new(StringArray::from(vec!["A", "E"])),
@@ -855,13 +901,14 @@ mod tests {
 
         // Should still have some rows
         let data = get_table_data(updated_table).await;
-        let total_rows: usize = data.iter().map(|batch| batch.num_rows()).sum();
-        assert_eq!(total_rows, 6);
+        let total_rows: usize = table_rows(&data);
+        assert_eq!(total_rows, input_rows + 2); // Original 5 rows + 2 new rows
     }
 
     #[tokio::test]
     async fn test_upsert_with_custom_properties() {
         let table = setup_test_table().await;
+        let input_rows = table_rows(&get_table_data(table.clone()).await);
 
         let source_batch = create_batch(vec![
             Arc::new(StringArray::from(vec!["F"])),
