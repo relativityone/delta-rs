@@ -712,6 +712,10 @@ mod tests {
         df.collect().await.unwrap()
     }
 
+    fn table_rows(data: &Vec<RecordBatch>) -> usize {
+        data.iter().map(|batch| batch.num_rows()).sum()
+    }
+
     fn assert_record(data: &Vec<RecordBatch>, expected: (&str, i32)) {
         // Check that the expected record was updated correctly
         let (expected_id, expected_value) = expected;
@@ -835,10 +839,6 @@ mod tests {
         assert_record(&data, ("F", 6));  // New record
 
         assert_eq!(total_rows, input_rows + 1); // Original 5 rows + 1 new row
-    }
-
-    fn table_rows(data: &Vec<RecordBatch>) -> usize {
-        data.iter().map(|batch| batch.num_rows()).sum()
     }
 
     #[tokio::test]
