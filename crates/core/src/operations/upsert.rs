@@ -660,7 +660,7 @@ mod tests {
         )
     }
 
-    async fn setup_test_table() -> DeltaTable {
+    async fn setup_with_bathces(batches: Vec<RecordBatch>) -> DeltaTable {
         let schema = vec![
             StructField::new(
                 "id".to_string(),
@@ -686,6 +686,14 @@ mod tests {
             .await
             .unwrap();
 
+        let mut tbl = table.clone();
+        for batch in batches {
+            tbl = DeltaOps(tbl).write([batch]).await.unwrap();
+        }
+        tbl
+    }
+
+    async fn setup_test_table() -> DeltaTable {
         // Add some initial data
         let batch_1 = create_batch(vec![
             Arc::new(StringArray::from(vec!["A", "B", "C"])),
@@ -702,8 +710,7 @@ mod tests {
         ])
         .unwrap();
 
-        DeltaOps(table.clone()).write([batch_1]).await.unwrap();
-        DeltaOps(table.clone()).write([batch_2]).await.unwrap()
+        setup_with_bathces(vec![batch_1, batch_2]).await
     }
 
     async fn get_table_data(table: DeltaTable) -> Vec<RecordBatch> {
@@ -839,6 +846,51 @@ mod tests {
         assert_record(&data, ("F", 6));  // New record
 
         assert_eq!(total_rows, input_rows + 1); // Original 5 rows + 1 new row
+    }
+
+    #[tokio::test]
+    async fn test_upsert_with_duplicate_conflicts() {
+        let table = setup_with_bathces(vec![
+            create_batch(vec![
+                Arc::new(StringArray::from(vec!["A", "B"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![1, 1])),
+            ])
+            .unwrap(),
+            create_batch(vec![
+                Arc::new(StringArray::from(vec!["A", "C"])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+                Arc::new(Int32Array::from(vec![1, 1])),
+            ])
+            .unwrap(),
+        ])
+        .await;
+
+        let input_rows = table_rows(&get_table_data(table.clone()).await);
+
+        let source_batch = create_batch(vec![
+            Arc::new(StringArray::from(vec!["A"])), // "A" conflicts with multiple files
+            Arc::new(Int32Array::from(vec![10])),     // Updated value for A
+            Arc::new(Int32Array::from(vec![1])),      // Same workspace as existing A
+        ]).unwrap();
+        
+        let ctx = SessionContext::new();
+        let source_df = ctx.read_batch(source_batch).unwrap();
+        let (updated_table, metrics) = DeltaOps(table)
+            .upsert(
+                source_df,
+                vec!["workspace_id".to_string(), "id".to_string()],
+            )
+            .await
+            .unwrap();
+        // Should have both added and removed files due to conflicts
+        assert_eq!(metrics.num_added_files, 2);
+        assert_eq!(metrics.num_removed_files, 2);
+        // Should still have some rows
+        let data = get_table_data(updated_table).await;
+        let total_rows: usize = table_rows(&data);
+        assert_record(&data, ("A", 10)); // Updated record
+        assert_eq!(total_rows, input_rows - 1); // Original 4 rows - 1 duplicate row + 1 updated row
     }
 
     #[tokio::test]
