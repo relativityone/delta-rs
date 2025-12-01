@@ -1128,4 +1128,49 @@ mod tests {
         let total_rows = table_rows(&data);
         assert_eq!(total_rows, input_rows + 1); // One new row added
     }
+
+    #[tokio::test]
+    async fn test_upsert_with_source_column_order_difference() {
+        // Existing table (target) schema order: date, id, value, workspace_id
+        let table = setup_test_table().await;
+        let input_rows = table_rows(&get_table_data(table.clone()).await);
+
+        // Source batch with DIFFERENT column order: workspace_id, value, id, date
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        let reordered_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("workspace_id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("date", DataType::Utf8, false),
+        ]));
+
+        // Update id "A" (conflict) and add new id "Z" (no conflict)
+        let source_batch = RecordBatch::try_new(
+            reordered_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),      // workspace_id
+                Arc::new(Int32Array::from(vec![10, 99])),    // value
+                Arc::new(StringArray::from(vec!["A", "Z"])), // id
+                Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-01"])), // date
+            ],
+        )
+        .unwrap();
+
+        let ctx = SessionContext::new();
+        let source_df = ctx.read_batch(source_batch).unwrap();
+
+        // Attempt upsert
+        let result = DeltaOps(table)
+            .upsert(
+                source_df,
+                vec!["workspace_id".to_string(), "id".to_string()],
+            )
+            .await;
+
+        let (updated_table, _) = result.unwrap();
+        let data = get_table_data(updated_table).await;
+        assert_record(&data, ("A", 10));
+        assert_record(&data, ("Z", 99));
+        assert_eq!(table_rows(&data), input_rows + 1);
+    }
 }
