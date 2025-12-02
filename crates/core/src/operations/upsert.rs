@@ -168,7 +168,13 @@ impl UpsertBuilder {
         state: Arc<SessionState>,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         // Get unique partition values from source to limit scan scope
-        let partition_filters = self.extract_partition_filters().await?;
+        // Only consider partition columns that are also join keys
+        let partition_filters: HashMap<String, Vec<String>> = self
+            .extract_partition_filters()
+            .await?
+            .into_iter()
+            .filter(|(k, _)| self.join_keys.contains(k))
+            .collect();
 
         // Create target DataFrame with partition filtering
         let target_df = self.create_target_dataframe(&state, &partition_filters)?;
@@ -1102,11 +1108,7 @@ mod tests {
         let (updated_table, metrics) = DeltaOps(table)
             .upsert(
                 source_df,
-                vec![
-                    "workspace_id".to_string(),
-                    "date".to_string(),
-                    "id".to_string(),
-                ],
+                vec!["workspace_id".to_string(), "id".to_string()],
             )
             .await
             .unwrap();
