@@ -1093,12 +1093,18 @@ mod tests {
 
         let input_rows = table_rows(&get_table_data(table.clone()).await);
 
-        // Source updates A (conflict in date=2023-01-01 partition) and adds F (new row in date=2023-01-02 partition)
+        // Source updates A (conflict in date=2023-01-01 partition),
+        // moves B to partition date=2023-01-01
+        // and adds F (new row in date=2023-01-02 partition)
         let source_batch = create_batch(vec![
-            Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-02"])),
-            Arc::new(StringArray::from(vec!["A", "F"])),
-            Arc::new(Int32Array::from(vec![10, 6])), // Updated value for A, new value for F
-            Arc::new(Int32Array::from(vec![1, 1])),  // Same workspace
+            Arc::new(StringArray::from(vec![
+                "2023-01-01",
+                "2023-01-01",
+                "2023-01-01",
+            ])),
+            Arc::new(StringArray::from(vec!["A", "B", "F"])),
+            Arc::new(Int32Array::from(vec![10, 11, 6])), // Updated value for A, new value for F
+            Arc::new(Int32Array::from(vec![1, 1, 1])),   // Same workspace
         ])
         .unwrap();
 
@@ -1114,17 +1120,13 @@ mod tests {
             .unwrap();
 
         // Expect one removed file (partition containing A) and added files for rewritten + new data
-        assert_eq!(metrics.num_removed_files, 1);
-        assert!(metrics.num_added_files >= 1);
+        assert_eq!(metrics.num_removed_files, 2); // One for A, one for B's original partition
+        assert_eq!(metrics.num_added_files, 1);
 
         let data = get_table_data(updated_table).await;
 
-        println!("Upserted data:");
-        for batch in &data {
-            println!("{:?}", batch);
-        }
-
         assert_record(&data, ("A", 10)); // Updated
+        assert_record(&data, ("B", 11)); // Moved with updated value
         assert_record(&data, ("F", 6)); // New
 
         let total_rows = table_rows(&data);
