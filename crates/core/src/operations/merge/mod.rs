@@ -920,10 +920,10 @@ async fn execute(
         None => LogicalPlanBuilder::scan(target_name.clone(), target_provider, None)?.build()?,
     };
 
-    // STREAMING NOTE: DataFusion DataFrames are lazy by default. The operations below
-    // (with_column, join, filter, etc.) only build a logical plan and do NOT execute
-    // or materialize data. Execution happens later in write_execution_plan_v2 via
-    // streaming execution (execute_stream_partitioned).
+    // STREAMING NOTE: DataFusion DataFrames are lazy by default. The operations in this
+    // section (with_column, join, select, filter, etc.) only build a logical plan and do
+    // NOT execute or materialize data. Execution happens later in write_execution_plan_v2
+    // via streaming execution (execute_stream_partitioned).
     let source = DataFrame::new(state.clone(), source.clone());
     let source = source.with_column(SOURCE_COLUMN, lit(true))?;
 
@@ -1421,8 +1421,8 @@ async fn execute(
     // execute_stream_partitioned to process data in a streaming manner without materializing
     // large DataFrames in memory. It processes record batches as they arrive from the source
     // and target tables, performs the merge logic, and writes results to Parquet files.
-    // No intermediate data is cached or collected except for the final Add/Remove actions
-    // which are small metadata objects.
+    // The function returns small metadata objects (Add/Remove actions) but does not cache or
+    // collect any of the actual record data from source or target tables.
     let (mut actions, write_plan_metrics) = write_execution_plan_v2(
         Some(&snapshot),
         &state,
