@@ -395,8 +395,7 @@ impl UpsertBuilder {
     /// Create a conflict detection DataFrame for anti-join purposes.
     /// This returns only the join key columns from source that match target, keeping the query lazy.
     /// Used for filtering out conflicting rows from the target DataFrame via anti-join.
-    /// Input target_df should already have __delta_rs_path column dropped.
-    fn find_conflicts_keys_only(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
+    fn find_conflicts_keys_only(&self) -> DeltaResult<DataFrame> {
         // Simply select join keys from source - we'll use this for the anti-join
         let source_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
         let source_subset = self.source.clone().select(source_keys).map_err(|e| {
@@ -456,9 +455,8 @@ impl UpsertBuilder {
         let filtered_target_df = Self::filter_conflicting_files(target_df, conflicting_file_names)?;
         
         // Create a conflicts query for the anti-join (only join keys, no file path)
-        // We use filtered_target_df (which has the file path dropped) for the anti-join
         // This ensures schema consistency
-        let conflicts_for_antijoin = self.find_conflicts_keys_only(&filtered_target_df)?;
+        let conflicts_for_antijoin = self.find_conflicts_keys_only()?;
         
         let non_conflicting_target =
             self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_for_antijoin)?;
