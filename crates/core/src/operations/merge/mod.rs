@@ -855,6 +855,13 @@ async fn execute(
     // Attempt to construct an early filter that we can apply to the Add action list and the delta scan.
     // In the case where there are partition columns in the join predicate, we can scan the source table
     // to get the distinct list of partitions affected and constrain the search to those.
+    //
+    // STREAMING NOTE: The try_construct_early_filter function may materialize a small amount of data
+    // (distinct partition values and min/max statistics) from the source to build partition filters.
+    // This materialization is acceptable because:
+    // 1. It only collects partition metadata (small result set)
+    // 2. It enables file pruning which significantly reduces memory pressure
+    // 3. The main source/target DataFrames remain lazy and are not materialized here
 
     let target_subset_filter: Option<Expr> = if !not_match_source_operations.is_empty() {
         // It's only worth trying to create an early filter where there are no `when_not_matched_source` operators, since
@@ -913,6 +920,10 @@ async fn execute(
         None => LogicalPlanBuilder::scan(target_name.clone(), target_provider, None)?.build()?,
     };
 
+    // STREAMING NOTE: DataFusion DataFrames are lazy by default. The operations below
+    // (with_column, join, filter, etc.) only build a logical plan and do NOT execute
+    // or materialize data. Execution happens later in write_execution_plan_v2 via
+    // streaming execution (execute_stream_partitioned).
     let source = DataFrame::new(state.clone(), source.clone());
     let source = source.with_column(SOURCE_COLUMN, lit(true))?;
 
@@ -929,6 +940,9 @@ async fn execute(
     let target = DataFrame::new(state.clone(), target);
     let target = target.with_column(TARGET_COLUMN, lit(true))?;
 
+    // STREAMING NOTE: The join operation below is lazy - it constructs a logical plan for a full
+    // outer join between source and target, but does not execute it. DataFusion will execute this
+    // join in a streaming manner when the physical plan is executed later.
     let join = source.join(target, JoinType::Full, &[], &[], Some(predicate.clone()))?;
     let join_schema_df = join.schema().to_owned();
 
@@ -1380,6 +1394,9 @@ async fn execute(
         }
     }
 
+    // STREAMING NOTE: Converting to physical plan does not execute the query.
+    // It translates the logical plan into a physical execution plan that will be
+    // executed in a streaming manner by write_execution_plan_v2.
     let merge_final = &projected.into_unoptimized_plan();
     let write = state.create_physical_plan(merge_final).await?;
 
@@ -1400,6 +1417,12 @@ async fn execute(
             .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
     );
 
+    // STREAMING NOTE: This is where actual execution happens. write_execution_plan_v2 uses
+    // execute_stream_partitioned to process data in a streaming manner without materializing
+    // large DataFrames in memory. It processes record batches as they arrive from the source
+    // and target tables, performs the merge logic, and writes results to Parquet files.
+    // No intermediate data is cached or collected except for the final Add/Remove actions
+    // which are small metadata objects.
     let (mut actions, write_plan_metrics) = write_execution_plan_v2(
         Some(&snapshot),
         &state,
@@ -1422,6 +1445,9 @@ async fn execute(
     metrics.scan_time_ms = write_plan_metrics.scan_time_ms;
     metrics.num_target_files_added = actions.len();
 
+    // MATERIALIZATION NOTE: The survivors HashSet contains file paths that need to be removed.
+    // This is a small collection of strings (file paths) not actual data, so it's safe to
+    // keep in memory. We iterate through log_data to create Remove actions for affected files.
     let survivors = barrier
         .as_any()
         .downcast_ref::<MergeBarrierExec>()

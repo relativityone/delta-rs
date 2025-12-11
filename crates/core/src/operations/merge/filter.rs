@@ -396,6 +396,14 @@ pub(crate) async fn try_construct_early_filter(
     }
 }
 
+/// Executes a plan and collects the results into a single RecordBatch.
+///
+/// MATERIALIZATION NOTE: This function intentionally materializes data from the execution plan.
+/// However, this is acceptable because:
+/// 1. It is ONLY used for collecting partition filter values and statistics (min/max)
+/// 2. The result set is always small (distinct partition values, not actual table data)
+/// 3. This enables file pruning which dramatically reduces memory usage for the actual merge
+/// 4. The main source and target DataFrames are NOT materialized through this function
 async fn execute_plan_to_batch(
     state: &dyn Session,
     plan: Arc<dyn ExecutionPlan>,

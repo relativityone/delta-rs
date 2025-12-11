@@ -295,6 +295,13 @@ pub(crate) async fn write_execution_plan_v2(
 
     // Write data to disk
     // We drive partition streams concurrently and centralize writes via an mpsc channel.
+    //
+    // STREAMING EXECUTION: This function implements true streaming execution:
+    // 1. execute_stream_partitioned creates record batch streams (not materialized data)
+    // 2. Worker tasks process batches as they arrive from the streams
+    // 3. Batches are validated and written to Parquet files incrementally
+    // 4. No large intermediate DataFrames are held in memory
+    // 5. Memory usage is bounded by the number of concurrent partition streams and channel size
     if !contains_cdc {
         let config = WriterConfig::new(
             schema.clone(),

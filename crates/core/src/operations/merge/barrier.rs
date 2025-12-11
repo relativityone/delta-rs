@@ -8,6 +8,10 @@
 //!
 //! Bookkeeping is maintained to determine which files have modifications, so
 //! they can be removed from the delta log.
+//!
+//! STREAMING NOTE: The barrier operates on record batch streams and processes data
+//! incrementally. The only state maintained in memory is the set of file paths
+//! (survivors) that have been modified, which is a small collection of strings.
 
 use std::{
     collections::HashMap,
