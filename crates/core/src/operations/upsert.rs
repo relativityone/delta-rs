@@ -183,7 +183,7 @@ impl UpsertBuilder {
         // We create a conflicts query with file paths to extract the list of affected files
         // We cache this small result (join keys + file paths) to avoid schema inconsistencies
         // and because it's used multiple times (once for file paths, once for anti-join)
-        let conflicts_with_paths = self.find_conflicts(&target_df).await?;
+        let conflicts_with_paths = self.find_conflicts(&target_df).await?.cache().await?;
         let conflicting_file_names = Self::conflicting_filenames(&conflicts_with_paths).await?;
 
         if !conflicting_file_names.is_empty() {
