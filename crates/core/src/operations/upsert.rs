@@ -180,11 +180,19 @@ impl UpsertBuilder {
         let target_df = self.create_target_dataframe(&state, &partition_filters)?;
 
         // Check for conflicts between source and target
-        let conflicts_df = self.find_conflicts(&target_df).await?.cache().await?;
+        // We create a conflicts query with file paths to extract the list of affected files
+        // We cache this small result (join keys + file paths) to avoid schema inconsistencies
+        // and because it's used multiple times (once for file paths, once for anti-join)
+        let conflicts_with_paths = self.find_conflicts(&target_df).await?.cache().await?;
+        let conflicting_file_names = Self::conflicting_filenames(&conflicts_with_paths).await?;
 
-        if &conflicts_df.clone().count().await? > &0 {
-            self.execute_upsert_with_conflicts(&state, &target_df, &conflicts_df)
-                .await
+        if !conflicting_file_names.is_empty() {
+            self.execute_upsert_with_conflicts_impl(
+                &state,
+                &target_df,
+                conflicting_file_names,
+            )
+            .await
         } else {
             self.execute_simple_append(&state).await
         }
@@ -332,8 +340,12 @@ impl UpsertBuilder {
     /// ```
     /// Each row represents a target record that conflicts with a source record \(i\.e\. same join key values\)\.
     async fn find_conflicts(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
+        // Cast __delta_rs_path to Utf8 to normalize schema (it may be Dictionary encoded)
+        use datafusion_expr::cast;
+        use arrow_schema::DataType;
+        
         let mut target_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
-        target_keys.push(col(FILE_PATH_COLUMN));
+        target_keys.push(cast(col(FILE_PATH_COLUMN), DataType::Utf8).alias(FILE_PATH_COLUMN));
 
         let source_keys: Vec<_> = self
             .join_keys
@@ -380,6 +392,20 @@ impl UpsertBuilder {
         conflicts
     }
 
+    /// Create a conflict detection DataFrame for anti-join purposes.
+    /// This returns only the join key columns from source that match target, keeping the query lazy.
+    /// Used for filtering out conflicting rows from the target DataFrame via anti-join.
+    /// Input target_df should already have __delta_rs_path column dropped.
+    fn find_conflicts_keys_only(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
+        // Simply select join keys from source - we'll use this for the anti-join
+        let source_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
+        let source_subset = self.source.clone().select(source_keys).map_err(|e| {
+            DeltaTableError::Generic(format!("Error selecting source keys: {}", e))
+        })?;
+
+        Ok(source_subset)
+    }
+
     /// Execute upsert when there are no conflicts - simple append
     async fn execute_simple_append(
         &self,
@@ -417,17 +443,25 @@ impl UpsertBuilder {
     }
 
     /// Execute upsert when conflicts exist - need to remove old files and write new ones
-    async fn execute_upsert_with_conflicts(
+    async fn execute_upsert_with_conflicts_impl(
         &self,
         state: &SessionState,
         target_df: &DataFrame,
-        conflicts_df: &DataFrame,
+        conflicting_file_names: Vec<String>,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
-        let conflicting_file_names = Self::conflicting_filenames(conflicts_df).await?;
         let remove_actions = self.files_to_remove(&conflicting_file_names);
+        
+        // Filter to only conflicting files and drop the file path column
+        // The filtered_target_df now only contains table columns (no __delta_rs_path)
         let filtered_target_df = Self::filter_conflicting_files(target_df, conflicting_file_names)?;
+        
+        // Create a conflicts query for the anti-join (only join keys, no file path)
+        // We use filtered_target_df (which has the file path dropped) for the anti-join
+        // This ensures schema consistency
+        let conflicts_for_antijoin = self.find_conflicts_keys_only(&filtered_target_df)?;
+        
         let non_conflicting_target =
-            self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_df)?;
+            self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_for_antijoin)?;
         let result_df = self.union_source_with_target(&non_conflicting_target)?;
 
         // Write the combined data
@@ -471,12 +505,17 @@ impl UpsertBuilder {
         target_df: &DataFrame,
         conflicting_file_names: Vec<String>,
     ) -> Result<DataFrame, DeltaTableError> {
+        // Cast __delta_rs_path to Utf8 to normalize the schema (it may be Dictionary encoded)
+        use datafusion_expr::cast;
+        use arrow_schema::DataType;
+        
         let filtered_target_df = target_df
             .clone()
             .filter(col(FILE_PATH_COLUMN).in_list(
                 conflicting_file_names.iter().map(|p| lit(p)).collect(),
                 false,
             ))?
+            .with_column(FILE_PATH_COLUMN, cast(col(FILE_PATH_COLUMN), DataType::Utf8))?
             .drop_columns(&[FILE_PATH_COLUMN])?;
         Ok(filtered_target_df)
     }
@@ -495,10 +534,14 @@ impl UpsertBuilder {
     async fn conflicting_filenames(
         conflicts_df: &DataFrame,
     ) -> Result<Vec<String>, DeltaTableError> {
+        // Cast __delta_rs_path to Utf8 to normalize schema (it may be Dictionary encoded)
+        use datafusion_expr::cast;
+        use arrow_schema::DataType;
+        
         // Find files to remove based on join key values (conflicting files only)
         let conflicting_file_names = conflicts_df
             .clone()
-            .select([col(FILE_PATH_COLUMN)])?
+            .select([cast(col(FILE_PATH_COLUMN), DataType::Utf8)])?
             .distinct()?
             .collect()
             .await?
