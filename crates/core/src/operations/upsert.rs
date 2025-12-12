@@ -496,7 +496,7 @@ impl UpsertBuilder {
                 .collect::<Vec<&str>>(),
             None,
         )?;
-        
+
         let conflicting_paths = conflicts
             .clone()
             .select([col(FILE_PATH_COLUMN).cast_to(
@@ -507,7 +507,6 @@ impl UpsertBuilder {
             .collect()
             .await?;
 
-        // Extract distinct file paths from the materialized conflicts
         let mut conflicting_files = HashSet::new();
         for batch in &conflicting_paths {
             let file_path_col = batch.column(0);
