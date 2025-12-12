@@ -316,9 +316,9 @@ impl UpsertBuilder {
         Ok(target_df)
     }
 
-    /// Create a conflict detection DataFrame for anti-join purposes.
-    /// This returns only the join key columns from source that match target, keeping the query lazy.
-    /// Used for filtering out conflicting rows from the target DataFrame via anti-join.
+    /// Prepare a DataFrame containing only the join key columns from the source.
+    /// This does not perform any matching or filtering against the target; it simply selects the relevant columns.
+    /// The resulting DataFrame is used later in an anti-join operation to filter out conflicting rows from the target DataFrame.
     fn find_conflicts_keys_only(&self) -> DeltaResult<DataFrame> {
         // Simply select join keys from source - we'll use this for the anti-join
         let source_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
@@ -377,7 +377,8 @@ impl UpsertBuilder {
 
         // Filter to only conflicting files and drop the file path column
         // The filtered_target_df now only contains table columns (no __delta_rs_path)
-        let filtered_target_df = Self::filter_conflicting_files(target_df, conflicting_file_names)?;
+        let filtered_target_df =
+            Self::filter_conflicting_files(target_df, &conflicting_file_names)?;
 
         // Create a conflicts query for the anti-join (only join keys, no file path)
         // This ensures schema consistency
@@ -426,22 +427,14 @@ impl UpsertBuilder {
 
     fn filter_conflicting_files(
         target_df: &DataFrame,
-        conflicting_file_names: Vec<String>,
+        conflicting_file_names: &Vec<String>,
     ) -> Result<DataFrame, DeltaTableError> {
-        // Cast __delta_rs_path to Utf8 to normalize the schema (it may be Dictionary encoded)
-        use arrow_schema::DataType;
-        use datafusion_expr::cast;
-
         let filtered_target_df = target_df
             .clone()
             .filter(col(FILE_PATH_COLUMN).in_list(
                 conflicting_file_names.iter().map(|p| lit(p)).collect(),
                 false,
             ))?
-            .with_column(
-                FILE_PATH_COLUMN,
-                cast(col(FILE_PATH_COLUMN), DataType::Utf8),
-            )?
             .drop_columns(&[FILE_PATH_COLUMN])?;
         Ok(filtered_target_df)
     }
@@ -492,11 +485,11 @@ impl UpsertBuilder {
         let conflicts = target_subset.join(
             source_subset,
             JoinType::Inner,
-            &source_key_cols
+            &target_key_cols
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<&str>>(),
-            &target_key_cols
+            &source_key_cols
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<&str>>(),
@@ -532,6 +525,10 @@ impl UpsertBuilder {
                 for value in str_array.iter().flatten() {
                     conflicting_files.insert(value.to_string());
                 }
+            } else {
+                return Err(DeltaTableError::Generic(
+                    "Unsupported file path column type during conflict extraction".into(),
+                ));
             }
         }
 
