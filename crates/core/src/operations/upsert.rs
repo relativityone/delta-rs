@@ -180,10 +180,8 @@ impl UpsertBuilder {
         let target_df = self.create_target_dataframe(&state, &partition_filters)?;
 
         // Check for conflicts between source and target
-        // We create a conflicts query with file paths to extract the list of affected files
-        // Cache is necessary to materialize the DataFrame and normalize Dictionary-encoded schemas
-        let conflicts_with_paths = self.find_conflicts(&target_df).await?.cache().await?;
-        let conflicting_file_names = Self::conflicting_filenames(&conflicts_with_paths).await?;
+        // Extract conflicting file names directly to avoid caching large DataFrames
+        let conflicting_file_names = Self::extract_conflicting_filenames(&target_df, &self.source, &self.join_keys).await?;
 
         if !conflicting_file_names.is_empty() {
             self.execute_upsert_with_conflicts_impl(
@@ -320,75 +318,6 @@ impl UpsertBuilder {
         );
 
         Ok(target_df)
-    }
-
-    /// Looks for conflicts between source and target data using an inner join on the join keys.
-    ///
-    /// Returns a `DataFrame` containing only the conflicting target rows, including the file path column.
-    ///
-    /// **Schema of returned DataFrame:**
-    /// - Each join key column (e\.g\. `"workspace_id"`, `"id"`)
-    /// - `__delta_rs_path` \(file path of the conflicting row\)
-    ///
-    /// **Example:**
-    /// If join keys are `["workspace_id", "id"]`, the resulting DataFrame schema:
-    /// ```
-    /// workspace_id: Int32
-    /// id: Utf8
-    /// __delta_rs_path: Utf8
-    /// ```
-    /// Each row represents a target record that conflicts with a source record \(i\.e\. same join key values\)\.
-    async fn find_conflicts(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
-        // Cast __delta_rs_path to Utf8 to normalize schema (it may be Dictionary encoded)
-        use datafusion_expr::cast;
-        use arrow_schema::DataType;
-        
-        let mut target_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
-        target_keys.push(cast(col(FILE_PATH_COLUMN), DataType::Utf8).alias(FILE_PATH_COLUMN));
-
-        let source_keys: Vec<_> = self
-            .join_keys
-            .iter()
-            .map(|k| col(k).alias(&format!("source_{}", k)))
-            .collect();
-
-        let target_subset = target_df.clone().select(target_keys)?;
-        let source_subset = self.source.clone().select(source_keys)?;
-
-        let source_key_cols: Vec<_> = self
-            .join_keys
-            .iter()
-            .map(|s| format!("source_{}", s))
-            .collect();
-        let target_key_cols: Vec<_> = self.join_keys.iter().map(|s| format!("{}", s)).collect();
-
-        let conflicts = target_subset
-            .join(
-                source_subset,
-                JoinType::Inner,
-                &source_key_cols
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<&str>>(),
-                &target_key_cols
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<&str>>(),
-                None,
-            )?
-            //select only target columns (including file path)
-            .select(
-                target_key_cols
-                    .iter()
-                    .map(|s| col(s))
-                    .chain(std::iter::once(col(FILE_PATH_COLUMN)))
-                    .collect::<Vec<Expr>>(),
-            )
-            .map_err(|e| {
-                DeltaTableError::Generic(format!("Error during conflict detection join: {}", e))
-            });
-
-        conflicts
     }
 
     /// Create a conflict detection DataFrame for anti-join purposes.
@@ -528,51 +457,92 @@ impl UpsertBuilder {
         remove_actions
     }
 
-    async fn conflicting_filenames(
-        conflicts_df: &DataFrame,
+    /// Extract conflicting file names directly without caching intermediate DataFrames.
+    /// This method combines conflict detection and file name extraction into a single
+    /// operation that immediately materializes only the small result (file paths).
+    /// 
+    /// To work around DataFusion's Dictionary encoding schema mismatch issues, we collect
+    /// the file paths from target before the join, then filter based on join results.
+    async fn extract_conflicting_filenames(
+        target_df: &DataFrame,
+        source: &DataFrame,
+        join_keys: &[String],
     ) -> Result<Vec<String>, DeltaTableError> {
-        // Cast __delta_rs_path to Utf8 to normalize schema (it may be Dictionary encoded)
-        use datafusion_expr::cast;
-        use arrow_schema::DataType;
+        // First, collect all file paths with their join key values from target
+        // This is still a small result (one row per file with conflicts)
+        let mut target_keys: Vec<_> = join_keys.iter().map(|k| col(k)).collect();
+        target_keys.push(col(FILE_PATH_COLUMN));
+
+        let target_with_paths = target_df.clone().select(target_keys)?.collect().await?;
+
+        // Select join keys from source
+        let source_keys: Vec<_> = join_keys.iter().map(|k| col(k)).collect();
+        let source_subset = source.clone().select(source_keys)?.distinct()?.collect().await?;
+
+        // Extract source key values into a HashSet for efficient lookup
+        use std::collections::HashSet;
+        let mut source_key_set: HashSet<Vec<String>> = HashSet::new();
         
-        // Find files to remove based on join key values (conflicting files only)
-        let conflicting_file_names = conflicts_df
-            .clone()
-            .select([cast(col(FILE_PATH_COLUMN), DataType::Utf8)])?
-            .distinct()?
-            .collect()
-            .await?
-            .iter()
-            .flat_map(|batch| {
-                let array = batch.column(0);
-                if let Some(dict_array) = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
-                {
-                    let keys = dict_array.keys();
-                    let values = dict_array.values();
-                    if let Some(str_values) =
-                        values.as_any().downcast_ref::<arrow::array::StringArray>()
-                    {
-                        return keys
-                            .iter()
-                            .flatten()
-                            .map(|key| str_values.value(key as usize).to_string())
-                            .collect::<Vec<String>>();
-                    }
-                } else if let Some(str_array) =
-                    array.as_any().downcast_ref::<arrow::array::StringArray>()
-                {
-                    return str_array
-                        .iter()
-                        .flatten()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>();
+        for batch in &source_subset {
+            for row_idx in 0..batch.num_rows() {
+                let mut key_values = Vec::new();
+                for (col_idx, _) in join_keys.iter().enumerate() {
+                    let col_array = batch.column(col_idx);
+                    // Convert the value to string for comparison
+                    let value = arrow::util::display::ArrayFormatter::try_new(col_array, &Default::default())
+                        .ok()
+                        .and_then(|formatter| {
+                            let display = formatter.value(row_idx);
+                            Some(display.to_string())
+                        })
+                        .unwrap_or_default();
+                    key_values.push(value);
                 }
-                Vec::new()
-            })
-            .collect::<Vec<String>>();
-        Ok(conflicting_file_names)
+                source_key_set.insert(key_values);
+            }
+        }
+
+        // Now find file paths from target that have matching keys in source
+        let mut conflicting_files = HashSet::new();
+        
+        for batch in &target_with_paths {
+            for row_idx in 0..batch.num_rows() {
+                let mut key_values = Vec::new();
+                for (col_idx, _) in join_keys.iter().enumerate() {
+                    let col_array = batch.column(col_idx);
+                    let value = arrow::util::display::ArrayFormatter::try_new(col_array, &Default::default())
+                        .ok()
+                        .and_then(|formatter| {
+                            let display = formatter.value(row_idx);
+                            Some(display.to_string())
+                        })
+                        .unwrap_or_default();
+                    key_values.push(value);
+                }
+                
+                // If this key combination exists in source, it's a conflict
+                if source_key_set.contains(&key_values) {
+                    // Extract the file path from the last column
+                    let file_path_col = batch.column(join_keys.len());
+                    if let Some(dict_array) = file_path_col
+                        .as_any()
+                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
+                    {
+                        if let Some(key) = dict_array.keys().value(row_idx).try_into().ok() {
+                            if let Some(str_values) = dict_array.values().as_any().downcast_ref::<arrow::array::StringArray>() {
+                                conflicting_files.insert(str_values.value(key).to_string());
+                            }
+                        }
+                    } else if let Some(str_array) = file_path_col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                        if !str_array.is_null(row_idx) {
+                            conflicting_files.insert(str_array.value(row_idx).to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(conflicting_files.into_iter().collect())
     }
 
     /// Convert a LogicalFile to an Add action
