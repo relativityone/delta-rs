@@ -2,18 +2,6 @@
 //! For each conflicting record (e.g., matching on primary key), only the source record is kept.
 //! All non-conflicting records are appended.
 
-use arrow_array::Array;
-use datafusion::execution::SessionState;
-use datafusion::prelude::{DataFrame, SessionContext};
-use datafusion_common::JoinType;
-use datafusion_expr::expr::InList;
-use itertools::Itertools;
-use parquet::file::properties::WriterProperties;
-use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
-
 use crate::delta_datafusion::DeltaSessionConfig;
 use crate::delta_datafusion::{register_store, DataFusionMixins};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, TableReference, PROTOCOL};
@@ -24,7 +12,20 @@ use crate::operations::write::WriterStatsConfig;
 use crate::protocol::SaveMode;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
+use arrow_array::Array;
+use arrow_schema::DataType::{UInt16, Utf8};
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::{col, lit, Expr};
+use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion_common::JoinType;
+use datafusion_expr::expr::InList;
+use datafusion_expr::ExprSchemable;
+use itertools::Itertools;
+use parquet::file::properties::WriterProperties;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Default, Debug, Clone, Serialize)]
 /// Metrics collected during the Upsert operation
@@ -495,14 +496,20 @@ impl UpsertBuilder {
                 .collect::<Vec<&str>>(),
             None,
         )?;
-
-        // Materialize this SMALL result to work around DataFusion's Dictionary encoding issue
-        // This is acceptable because conflicts are typically a tiny subset of the data
-        let conflicts_materialized = conflicts.select([col(FILE_PATH_COLUMN)])?.collect().await?;
+        
+        let conflicting_paths = conflicts
+            .clone()
+            .select([col(FILE_PATH_COLUMN).cast_to(
+                &arrow_schema::DataType::Dictionary(Box::new(UInt16), Box::new(Utf8)),
+                conflicts.schema(),
+            )?])?
+            .distinct()?
+            .collect()
+            .await?;
 
         // Extract distinct file paths from the materialized conflicts
         let mut conflicting_files = HashSet::new();
-        for batch in &conflicts_materialized {
+        for batch in &conflicting_paths {
             let file_path_col = batch.column(0);
 
             if let Some(dict_array) = file_path_col
