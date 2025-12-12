@@ -180,16 +180,12 @@ impl UpsertBuilder {
         let target_df = self.create_target_dataframe(&state, &partition_filters)?;
 
         // Check for conflicts between source and target
-        // Extract conflicting file names directly to avoid caching large DataFrames
-        let conflicting_file_names = Self::extract_conflicting_filenames(&target_df, &self.source, &self.join_keys).await?;
+        let conflicting_file_names =
+            Self::extract_conflicting_filenames(&target_df, &self.source, &self.join_keys).await?;
 
         if !conflicting_file_names.is_empty() {
-            self.execute_upsert_with_conflicts_impl(
-                &state,
-                &target_df,
-                conflicting_file_names,
-            )
-            .await
+            self.execute_upsert_with_conflicts(&state, &target_df, conflicting_file_names)
+                .await
         } else {
             self.execute_simple_append(&state).await
         }
@@ -326,9 +322,10 @@ impl UpsertBuilder {
     fn find_conflicts_keys_only(&self) -> DeltaResult<DataFrame> {
         // Simply select join keys from source - we'll use this for the anti-join
         let source_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
-        let source_subset = self.source.clone().select(source_keys).map_err(|e| {
-            DeltaTableError::Generic(format!("Error selecting source keys: {}", e))
-        })?;
+        let source_subset =
+            self.source.clone().select(source_keys).map_err(|e| {
+                DeltaTableError::Generic(format!("Error selecting source keys: {}", e))
+            })?;
 
         Ok(source_subset)
     }
@@ -370,22 +367,22 @@ impl UpsertBuilder {
     }
 
     /// Execute upsert when conflicts exist - need to remove old files and write new ones
-    async fn execute_upsert_with_conflicts_impl(
+    async fn execute_upsert_with_conflicts(
         &self,
         state: &SessionState,
         target_df: &DataFrame,
         conflicting_file_names: Vec<String>,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         let remove_actions = self.files_to_remove(&conflicting_file_names);
-        
+
         // Filter to only conflicting files and drop the file path column
         // The filtered_target_df now only contains table columns (no __delta_rs_path)
         let filtered_target_df = Self::filter_conflicting_files(target_df, conflicting_file_names)?;
-        
+
         // Create a conflicts query for the anti-join (only join keys, no file path)
         // This ensures schema consistency
         let conflicts_for_antijoin = self.find_conflicts_keys_only()?;
-        
+
         let non_conflicting_target =
             self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_for_antijoin)?;
         let result_df = self.union_source_with_target(&non_conflicting_target)?;
@@ -432,16 +429,19 @@ impl UpsertBuilder {
         conflicting_file_names: Vec<String>,
     ) -> Result<DataFrame, DeltaTableError> {
         // Cast __delta_rs_path to Utf8 to normalize the schema (it may be Dictionary encoded)
-        use datafusion_expr::cast;
         use arrow_schema::DataType;
-        
+        use datafusion_expr::cast;
+
         let filtered_target_df = target_df
             .clone()
             .filter(col(FILE_PATH_COLUMN).in_list(
                 conflicting_file_names.iter().map(|p| lit(p)).collect(),
                 false,
             ))?
-            .with_column(FILE_PATH_COLUMN, cast(col(FILE_PATH_COLUMN), DataType::Utf8))?
+            .with_column(
+                FILE_PATH_COLUMN,
+                cast(col(FILE_PATH_COLUMN), DataType::Utf8),
+            )?
             .drop_columns(&[FILE_PATH_COLUMN])?;
         Ok(filtered_target_df)
     }
@@ -458,11 +458,11 @@ impl UpsertBuilder {
     }
 
     /// Extract conflicting file names by performing a join and collecting the small result.
-    /// 
+    ///
     /// This method performs an inner join between target and source on join keys, which produces
     /// a SMALL DataFrame containing only rows that conflict (same join key values in both source
     /// and target). The result contains only join keys + file path - NOT full row data.
-    /// 
+    ///
     /// Memory footprint: Only conflicting rows with minimal columns (join keys + file path).
     /// For a table with billions of rows but only thousands of conflicts, this is tiny.
     async fn extract_conflicting_filenames(
@@ -484,52 +484,51 @@ impl UpsertBuilder {
             .collect();
         let source_subset = source.clone().select(source_keys)?;
 
-        let source_key_cols: Vec<_> = join_keys
-            .iter()
-            .map(|s| format!("source_{}", s))
-            .collect();
+        let source_key_cols: Vec<_> = join_keys.iter().map(|s| format!("source_{}", s)).collect();
         let target_key_cols: Vec<_> = join_keys.iter().map(|s| s.to_string()).collect();
 
         // Perform inner join to find conflicts
         // The result is SMALL: only rows where join keys match (actual conflicts)
-        let conflicts = target_subset
-            .join(
-                source_subset,
-                JoinType::Inner,
-                &source_key_cols.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-                &target_key_cols.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-                None,
-            )?;
-
-        // Select only target columns (join keys + file path), dropping source columns
-        let target_cols: Vec<Expr> = target_key_cols
-            .iter()
-            .map(|s| col(s))
-            .chain(std::iter::once(col(FILE_PATH_COLUMN)))
-            .collect();
+        let conflicts = target_subset.join(
+            source_subset,
+            JoinType::Inner,
+            &source_key_cols
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>(),
+            &target_key_cols
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>(),
+            None,
+        )?;
 
         // Materialize this SMALL result to work around DataFusion's Dictionary encoding issue
         // This is acceptable because conflicts are typically a tiny subset of the data
-        let conflicts_materialized = conflicts.select(target_cols)?.collect().await?;
+        let conflicts_materialized = conflicts.select([col(FILE_PATH_COLUMN)])?.collect().await?;
 
         // Extract distinct file paths from the materialized conflicts
         let mut conflicting_files = HashSet::new();
         for batch in &conflicts_materialized {
-            // File path is the last column
-            let file_path_col = batch.column(join_keys.len());
-            
+            let file_path_col = batch.column(0);
+
             if let Some(dict_array) = file_path_col
                 .as_any()
                 .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
             {
                 let keys = dict_array.keys();
                 let values = dict_array.values();
-                if let Some(str_values) = values.as_any().downcast_ref::<arrow::array::StringArray>() {
+                if let Some(str_values) =
+                    values.as_any().downcast_ref::<arrow::array::StringArray>()
+                {
                     for key in keys.iter().flatten() {
                         conflicting_files.insert(str_values.value(key as usize).to_string());
                     }
                 }
-            } else if let Some(str_array) = file_path_col.as_any().downcast_ref::<arrow::array::StringArray>() {
+            } else if let Some(str_array) = file_path_col
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+            {
                 for value in str_array.iter().flatten() {
                     conflicting_files.insert(value.to_string());
                 }
