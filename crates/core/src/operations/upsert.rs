@@ -388,7 +388,7 @@ impl UpsertBuilder {
         let remove_actions = self.files_to_remove(&conflicting_file_names);
 
         // Count the number of conflicting records
-        let num_conflicting_records = conflicts_df.clone().count().await?;
+        let num_conflicting_records = conflicts_df.count().await?;
 
         // Filter to only conflicting files and drop the file path column
         // The filtered_target_df now only contains table columns (no __delta_rs_path)
