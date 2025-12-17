@@ -503,14 +503,14 @@ impl UpsertBuilder {
 
         // Perform inner join to find conflicts
         // The result is SMALL: only rows where join keys match (actual conflicts)
-        let conflicts = target_subset.join(
-            source_subset,
+        let conflicts = source_subset.join(
+            target_subset,
             JoinType::Inner,
-            &target_key_cols
+            &source_key_cols
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<&str>>(),
-            &source_key_cols
+            &target_key_cols
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<&str>>(),
