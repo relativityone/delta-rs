@@ -581,10 +581,10 @@ impl UpsertBuilder {
         target_df: &DataFrame,
         conflicts_df: &DataFrame,
     ) -> DeltaResult<DataFrame> {
-        // Left anti join: target rows NOT in source (non-conflicting target rows)
-        let non_conflicting_target = target_df.clone().join(
-            conflicts_df.clone(),
-            JoinType::LeftAnti,
+        // Anti join: target rows NOT in source (non-conflicting target rows)
+        let non_conflicting_target = conflicts_df.clone().join(
+            target_df.clone(),
+            JoinType::RightAnti,
             &self
                 .join_keys
                 .iter()
