@@ -24,6 +24,7 @@ use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::ops::Not;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -182,20 +183,23 @@ impl UpsertBuilder {
         // Create target DataFrame with partition filtering
         let target_df = self.create_target_dataframe(&state, &partition_filters)?;
 
-        // Check for conflicts between source and target
-        // Extract a DataFrame with everything needed for further upsert operations
+        // Check for conflicts between source and target and cache the result for reuse
         let conflicts_df =
-            Self::extract_conflicts_dataframe(&target_df, &self.source, &self.join_keys).await?;
+            Self::extract_conflicts_dataframe(&target_df, &self.source, &self.join_keys)
+                .await?
+                .cache()
+                .await?;
 
-        // Cache the conflicts DataFrame as it will be used in multiple places
-        let conflicts_df = conflicts_df.cache().await?;
+        let has_conflicts = conflicts_df
+            .clone()
+            .limit(0, Some(1))?
+            .collect()
+            .await?
+            .is_empty()
+            .not();
 
-        // Extract the file names from the conflicts DataFrame
-        let conflicting_file_names =
-            Self::extract_file_paths_from_conflicts(&conflicts_df).await?;
-
-        if !conflicting_file_names.is_empty() {
-            self.execute_upsert_with_conflicts(&state, &target_df, conflicts_df, conflicting_file_names)
+        if has_conflicts {
+            self.execute_upsert_with_conflicts(&state, &target_df, conflicts_df)
                 .await
         } else {
             self.execute_simple_append(&state).await
@@ -383,8 +387,9 @@ impl UpsertBuilder {
         state: &SessionState,
         target_df: &DataFrame,
         conflicts_df: DataFrame,
-        conflicting_file_names: Vec<String>,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
+        // Extract the file names from the conflicts DataFrame
+        let conflicting_file_names = Self::extract_file_paths_from_conflicts(&conflicts_df).await?;
         let remove_actions = self.files_to_remove(&conflicting_file_names);
 
         // Count the number of conflicting records
@@ -988,7 +993,8 @@ mod tests {
         // Should have both added and removed files due to conflicts
         assert_eq!(metrics.num_added_files, 2);
         assert_eq!(metrics.num_removed_files, 2);
-        // Should still have some rows
+        assert_eq!(metrics.num_conflicting_records, 2); // Duplicate "A" records conflict
+                                                        // Should still have some rows
         let data = get_table_data(updated_table).await;
         let total_rows: usize = table_rows(&data);
         assert_record(&data, ("A", 10)); // Updated record
@@ -1020,6 +1026,7 @@ mod tests {
         // No changes should be made for empty source
         assert_eq!(metrics.num_added_files, 0);
         assert_eq!(metrics.num_removed_files, 0);
+        assert_eq!(metrics.num_conflicting_records, 0);
 
         // Original data should remain unchanged
         let data = get_table_data(updated_table).await;
@@ -1064,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_with_custom_properties() {
         let table = setup_test_table().await;
-        let input_rows = table_rows(&get_table_data(table.clone()).await);
+        let _input_rows = table_rows(&get_table_data(table.clone()).await);
 
         let source_batch = create_batch(vec![
             Arc::new(StringArray::from(vec!["2023-01-01"])),
