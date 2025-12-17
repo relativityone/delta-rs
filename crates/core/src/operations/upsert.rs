@@ -188,14 +188,14 @@ impl UpsertBuilder {
             Self::extract_conflicts_dataframe(&target_df, &self.source, &self.join_keys).await?;
 
         // Cache the conflicts DataFrame as it will be used in multiple places
-        let conflicts_df = conflicts_df.cache().await?;
+        let cached_conflicts_df = conflicts_df.cache().await?;
 
         // Extract the file names from the conflicts DataFrame
         let conflicting_file_names =
-            Self::extract_file_paths_from_conflicts(&conflicts_df).await?;
+            Self::extract_file_paths_from_conflicts(&cached_conflicts_df).await?;
 
         if !conflicting_file_names.is_empty() {
-            self.execute_upsert_with_conflicts(&state, &target_df, conflicts_df, conflicting_file_names)
+            self.execute_upsert_with_conflicts(&state, &target_df, cached_conflicts_df, conflicting_file_names)
                 .await
         } else {
             self.execute_simple_append(&state).await
