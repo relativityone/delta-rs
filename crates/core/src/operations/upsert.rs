@@ -2,18 +2,6 @@
 //! For each conflicting record (e.g., matching on primary key), only the source record is kept.
 //! All non-conflicting records are appended.
 
-use arrow_array::Array;
-use datafusion::execution::SessionState;
-use datafusion::prelude::{DataFrame, SessionContext};
-use datafusion_common::JoinType;
-use datafusion_expr::expr::InList;
-use itertools::Itertools;
-use parquet::file::properties::WriterProperties;
-use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
-
 use crate::delta_datafusion::DeltaSessionConfig;
 use crate::delta_datafusion::{register_store, DataFusionMixins};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, TableReference, PROTOCOL};
@@ -24,7 +12,21 @@ use crate::operations::write::WriterStatsConfig;
 use crate::protocol::SaveMode;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
+use arrow_array::Array;
+use arrow_schema::DataType::{UInt16, Utf8};
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::{col, lit, Expr};
+use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion_common::JoinType;
+use datafusion_expr::expr::InList;
+use datafusion_expr::ExprSchemable;
+use itertools::Itertools;
+use parquet::file::properties::WriterProperties;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::ops::Not;
+use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Default, Debug, Clone, Serialize)]
 /// Metrics collected during the Upsert operation
@@ -33,6 +35,8 @@ pub struct UpsertMetrics {
     pub num_added_files: usize,
     /// Number of files removed from the target table
     pub num_removed_files: usize,
+    /// Number of conflicting records detected
+    pub num_conflicting_records: usize,
     /// Time taken to execute the entire operation
     pub write_time_ms: u64,
     /// Time taken to scan the target files
@@ -179,11 +183,23 @@ impl UpsertBuilder {
         // Create target DataFrame with partition filtering
         let target_df = self.create_target_dataframe(&state, &partition_filters)?;
 
-        // Check for conflicts between source and target
-        let conflicts_df = self.find_conflicts(&target_df).await?.cache().await?;
+        // Check for conflicts between source and target and cache the result for reuse
+        let conflicts_df =
+            Self::extract_conflicts_dataframe(&target_df, &self.source, &self.join_keys)
+                .await?
+                .cache()
+                .await?;
 
-        if &conflicts_df.clone().count().await? > &0 {
-            self.execute_upsert_with_conflicts(&state, &target_df, &conflicts_df)
+        let has_conflicts = conflicts_df
+            .clone()
+            .limit(0, Some(1))?
+            .collect()
+            .await?
+            .is_empty()
+            .not();
+
+        if has_conflicts {
+            self.execute_upsert_with_conflicts(&state, &target_df, conflicts_df)
                 .await
         } else {
             self.execute_simple_append(&state).await
@@ -315,69 +331,18 @@ impl UpsertBuilder {
         Ok(target_df)
     }
 
-    /// Looks for conflicts between source and target data using an inner join on the join keys.
-    ///
-    /// Returns a `DataFrame` containing only the conflicting target rows, including the file path column.
-    ///
-    /// **Schema of returned DataFrame:**
-    /// - Each join key column (e\.g\. `"workspace_id"`, `"id"`)
-    /// - `__delta_rs_path` \(file path of the conflicting row\)
-    ///
-    /// **Example:**
-    /// If join keys are `["workspace_id", "id"]`, the resulting DataFrame schema:
-    /// ```
-    /// workspace_id: Int32
-    /// id: Utf8
-    /// __delta_rs_path: Utf8
-    /// ```
-    /// Each row represents a target record that conflicts with a source record \(i\.e\. same join key values\)\.
-    async fn find_conflicts(&self, target_df: &DataFrame) -> DeltaResult<DataFrame> {
-        let mut target_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
-        target_keys.push(col(FILE_PATH_COLUMN));
+    /// Prepare a DataFrame containing only the join key columns from the source.
+    /// This does not perform any matching or filtering against the target; it simply selects the relevant columns.
+    /// The resulting DataFrame is used later in an anti-join operation to filter out conflicting rows from the target DataFrame.
+    fn find_conflicts_keys_only(&self) -> DeltaResult<DataFrame> {
+        // Simply select join keys from source - we'll use this for the anti-join
+        let source_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
+        let source_subset =
+            self.source.clone().select(source_keys).map_err(|e| {
+                DeltaTableError::Generic(format!("Error selecting source keys: {}", e))
+            })?;
 
-        let source_keys: Vec<_> = self
-            .join_keys
-            .iter()
-            .map(|k| col(k).alias(&format!("source_{}", k)))
-            .collect();
-
-        let target_subset = target_df.clone().select(target_keys)?;
-        let source_subset = self.source.clone().select(source_keys)?;
-
-        let source_key_cols: Vec<_> = self
-            .join_keys
-            .iter()
-            .map(|s| format!("source_{}", s))
-            .collect();
-        let target_key_cols: Vec<_> = self.join_keys.iter().map(|s| format!("{}", s)).collect();
-
-        let conflicts = target_subset
-            .join(
-                source_subset,
-                JoinType::Inner,
-                &source_key_cols
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<&str>>(),
-                &target_key_cols
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<&str>>(),
-                None,
-            )?
-            //select only target columns (including file path)
-            .select(
-                target_key_cols
-                    .iter()
-                    .map(|s| col(s))
-                    .chain(std::iter::once(col(FILE_PATH_COLUMN)))
-                    .collect::<Vec<Expr>>(),
-            )
-            .map_err(|e| {
-                DeltaTableError::Generic(format!("Error during conflict detection join: {}", e))
-            });
-
-        conflicts
+        Ok(source_subset)
     }
 
     /// Execute upsert when there are no conflicts - simple append
@@ -421,13 +386,26 @@ impl UpsertBuilder {
         &self,
         state: &SessionState,
         target_df: &DataFrame,
-        conflicts_df: &DataFrame,
+        conflicts_df: DataFrame,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
-        let conflicting_file_names = Self::conflicting_filenames(conflicts_df).await?;
+        // Extract the file names from the conflicts DataFrame
+        let conflicting_file_names = Self::extract_file_paths_from_conflicts(&conflicts_df).await?;
         let remove_actions = self.files_to_remove(&conflicting_file_names);
-        let filtered_target_df = Self::filter_conflicting_files(target_df, conflicting_file_names)?;
+
+        // Count the number of conflicting records
+        let num_conflicting_records = conflicts_df.count().await?;
+
+        // Filter to only conflicting files and drop the file path column
+        // The filtered_target_df now only contains table columns (no __delta_rs_path)
+        let filtered_target_df =
+            Self::filter_conflicting_files(target_df, &conflicting_file_names)?;
+
+        // Create a conflicts query for the anti-join (only join keys, no file path)
+        // This ensures schema consistency
+        let conflicts_for_antijoin = self.find_conflicts_keys_only()?;
+
         let non_conflicting_target =
-            self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_df)?;
+            self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_for_antijoin)?;
         let result_df = self.union_source_with_target(&non_conflicting_target)?;
 
         // Write the combined data
@@ -457,6 +435,7 @@ impl UpsertBuilder {
 
         metrics.num_added_files = add_actions.len();
         metrics.num_removed_files = remove_actions.len();
+        metrics.num_conflicting_records = num_conflicting_records;
         metrics.scan_time_ms = write_metrics.scan_time_ms;
         metrics.write_time_ms = write_metrics.write_time_ms;
 
@@ -469,7 +448,7 @@ impl UpsertBuilder {
 
     fn filter_conflicting_files(
         target_df: &DataFrame,
-        conflicting_file_names: Vec<String>,
+        conflicting_file_names: &Vec<String>,
     ) -> Result<DataFrame, DeltaTableError> {
         let filtered_target_df = target_df
             .clone()
@@ -492,47 +471,103 @@ impl UpsertBuilder {
         remove_actions
     }
 
-    async fn conflicting_filenames(
+    /// Extract conflicting records as a DataFrame by performing a join.
+    ///
+    /// This method performs an inner join between target and source on join keys, which produces
+    /// a SMALL DataFrame containing only rows that conflict (same join key values in both source
+    /// and target). The result contains join keys + file path - NOT full row data.
+    ///
+    /// Memory footprint: Only conflicting rows with minimal columns (join keys + file path).
+    /// For a table with billions of rows but only thousands of conflicts, this is tiny.
+    ///
+    /// Returns a DataFrame with the join keys and the file path column for all conflicting records.
+    async fn extract_conflicts_dataframe(
+        target_df: &DataFrame,
+        source: &DataFrame,
+        join_keys: &[String],
+    ) -> Result<DataFrame, DeltaTableError> {
+        // Select only join keys and file path from target (not full rows)
+        let mut target_keys: Vec<_> = join_keys.iter().map(|k| col(k)).collect();
+        target_keys.push(col(FILE_PATH_COLUMN));
+        let target_subset = target_df.clone().select(target_keys)?;
+
+        // Select only join keys from source (not full rows)
+        let source_keys: Vec<_> = join_keys
+            .iter()
+            .map(|k| col(k).alias(&format!("source_{}", k)))
+            .collect();
+        let source_subset = source.clone().select(source_keys)?;
+
+        let source_key_cols: Vec<_> = join_keys.iter().map(|s| format!("source_{}", s)).collect();
+        let target_key_cols: Vec<_> = join_keys.iter().map(|s| s.to_string()).collect();
+
+        // Perform inner join to find conflicts
+        // The result is SMALL: only rows where join keys match (actual conflicts)
+        let conflicts = source_subset.join(
+            target_subset,
+            JoinType::Inner,
+            &source_key_cols
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>(),
+            &target_key_cols
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>(),
+            None,
+        )?;
+
+        Ok(conflicts)
+    }
+
+    /// Extract the list of unique file paths from the conflicts DataFrame.
+    async fn extract_file_paths_from_conflicts(
         conflicts_df: &DataFrame,
     ) -> Result<Vec<String>, DeltaTableError> {
-        // Find files to remove based on join key values (conflicting files only)
-        let conflicting_file_names = conflicts_df
+        use std::collections::HashSet;
+
+        let conflicting_paths = conflicts_df
             .clone()
-            .select([col(FILE_PATH_COLUMN)])?
+            .select([col(FILE_PATH_COLUMN).cast_to(
+                &arrow_schema::DataType::Dictionary(Box::new(UInt16), Box::new(Utf8)),
+                conflicts_df.schema(),
+            )?])?
             .distinct()?
             .collect()
-            .await?
-            .iter()
-            .flat_map(|batch| {
-                let array = batch.column(0);
-                if let Some(dict_array) = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
+            .await?;
+
+        let mut conflicting_files = HashSet::new();
+        for batch in &conflicting_paths {
+            let file_path_col = batch.column(0);
+
+            if let Some(dict_array) = file_path_col
+                .as_any()
+                .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
+            {
+                let keys = dict_array.keys();
+                let values = dict_array.values();
+                if let Some(str_values) =
+                    values.as_any().downcast_ref::<arrow::array::StringArray>()
                 {
-                    let keys = dict_array.keys();
-                    let values = dict_array.values();
-                    if let Some(str_values) =
-                        values.as_any().downcast_ref::<arrow::array::StringArray>()
-                    {
-                        return keys
-                            .iter()
-                            .flatten()
-                            .map(|key| str_values.value(key as usize).to_string())
-                            .collect::<Vec<String>>();
+                    for key in keys.iter().flatten() {
+                        conflicting_files.insert(str_values.value(key as usize).to_string());
                     }
-                } else if let Some(str_array) =
-                    array.as_any().downcast_ref::<arrow::array::StringArray>()
-                {
-                    return str_array
-                        .iter()
-                        .flatten()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>();
                 }
-                Vec::new()
-            })
-            .collect::<Vec<String>>();
-        Ok(conflicting_file_names)
+            } else if let Some(str_array) = file_path_col
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+            {
+                for value in str_array.iter().flatten() {
+                    conflicting_files.insert(value.to_string());
+                }
+            } else {
+                return Err(DeltaTableError::Generic(
+                    "Unsupported file path column type during conflict extraction".into(),
+                ));
+            }
+        }
+
+        Ok(conflicting_files.into_iter().collect())
     }
 
     /// Convert a LogicalFile to an Add action
@@ -575,10 +610,10 @@ impl UpsertBuilder {
         target_df: &DataFrame,
         conflicts_df: &DataFrame,
     ) -> DeltaResult<DataFrame> {
-        // Left anti join: target rows NOT in source (non-conflicting target rows)
-        let non_conflicting_target = target_df.clone().join(
-            conflicts_df.clone(),
-            JoinType::LeftAnti,
+        // Anti join: target rows NOT in source (non-conflicting target rows)
+        let non_conflicting_target = conflicts_df.clone().join(
+            target_df.clone(),
+            JoinType::RightAnti,
             &self
                 .join_keys
                 .iter()
@@ -822,6 +857,7 @@ mod tests {
         // Should have added files but no removed files since no conflicts
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 0);
+        assert_eq!(metrics.num_conflicting_records, 0); // No conflicts
 
         // Should have 6 total rows (4 original + 2 new)
         let data = get_table_data(updated_table).await;
@@ -856,6 +892,7 @@ mod tests {
         // Should have both added and removed files due to conflicts
         assert_eq!(metrics.num_added_files, 2);
         assert_eq!(metrics.num_removed_files, 1);
+        assert_eq!(metrics.num_conflicting_records, 1); // Only "A" conflicts
 
         // Should still have some rows
         let data = get_table_data(updated_table).await;
@@ -898,6 +935,7 @@ mod tests {
         // Should have both added and removed files due to conflicts
         assert_eq!(metrics.num_added_files, 2);
         assert_eq!(metrics.num_removed_files, 2);
+        assert_eq!(metrics.num_conflicting_records, 2); // "A" and "E" conflict
 
         // Should still have some rows
         let data = get_table_data(updated_table).await;
@@ -955,7 +993,8 @@ mod tests {
         // Should have both added and removed files due to conflicts
         assert_eq!(metrics.num_added_files, 2);
         assert_eq!(metrics.num_removed_files, 2);
-        // Should still have some rows
+        assert_eq!(metrics.num_conflicting_records, 2); // Duplicate "A" records conflict
+                                                        // Should still have some rows
         let data = get_table_data(updated_table).await;
         let total_rows: usize = table_rows(&data);
         assert_record(&data, ("A", 10)); // Updated record
@@ -987,6 +1026,7 @@ mod tests {
         // No changes should be made for empty source
         assert_eq!(metrics.num_added_files, 0);
         assert_eq!(metrics.num_removed_files, 0);
+        assert_eq!(metrics.num_conflicting_records, 0);
 
         // Original data should remain unchanged
         let data = get_table_data(updated_table).await;
@@ -1031,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_with_custom_properties() {
         let table = setup_test_table().await;
-        let input_rows = table_rows(&get_table_data(table.clone()).await);
+        let _input_rows = table_rows(&get_table_data(table.clone()).await);
 
         let source_batch = create_batch(vec![
             Arc::new(StringArray::from(vec!["2023-01-01"])),
