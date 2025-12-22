@@ -294,14 +294,16 @@ pub(crate) async fn write_execution_plan_v2(
                 writer_stats_config.num_indexed_cols,
                 writer_stats_config.stats_columns.clone(),
             );
-            let mut writer = DeltaWriter::new(object_store.clone(), config);
+            let object_store_clone = object_store.clone();
             let checker_stream = checker.clone();
-            let scan_start = std::time::Instant::now();
-            let mut stream = inner_plan.execute(i, task_ctx)?;
 
             let handle: tokio::task::JoinHandle<
                 DeltaResult<(Vec<Action>, WriteExecutionPlanMetrics)>,
             > = tokio::task::spawn(async move {
+                // Execute the partition stream inside the task to ensure concurrent draining
+                let mut stream = inner_plan.execute(i, task_ctx)?;
+                let mut writer = DeltaWriter::new(object_store_clone, config);
+                let scan_start = std::time::Instant::now();
                 let mut write_time_ms = 0;
                 while let Some(maybe_batch) = stream.next().await {
                     let batch = maybe_batch?;
@@ -371,19 +373,19 @@ pub(crate) async fn write_execution_plan_v2(
                 writer_stats_config.stats_columns.clone(),
             );
 
-            let mut writer = DeltaWriter::new(object_store.clone(), normal_config);
-
-            let mut cdf_writer = DeltaWriter::new(cdf_store.clone(), cdf_config);
-
+            let object_store_clone = object_store.clone();
+            let cdf_store_clone = cdf_store.clone();
             let checker_stream = checker.clone();
-            let scan_start = std::time::Instant::now();
-            let mut stream = inner_plan.execute(i, task_ctx)?;
-
-            let session_context = SessionContext::new();
 
             let handle: tokio::task::JoinHandle<
                 DeltaResult<(Vec<Action>, WriteExecutionPlanMetrics)>,
             > = tokio::task::spawn(async move {
+                // Execute the partition stream inside the task to ensure concurrent draining
+                let mut stream = inner_plan.execute(i, task_ctx)?;
+                let mut writer = DeltaWriter::new(object_store_clone, normal_config);
+                let mut cdf_writer = DeltaWriter::new(cdf_store_clone, cdf_config);
+                let session_context = SessionContext::new();
+                let scan_start = std::time::Instant::now();
                 let mut write_time_ms = 0;
                 while let Some(maybe_batch) = stream.next().await {
                     let batch = maybe_batch?;
