@@ -31,6 +31,8 @@ Benchmarks use Divan and time only the merge operation. A temporary Delta table 
 Environment variables:
 - `TPCDS_PARQUET_DIR` (optional): directory containing `web_returns.parquet`. Default: `crates/benchmarks/data/tpcds_parquet`.
 
+### Merge benchmarks
+
 From the repo root:
 ```
 cargo bench -p delta-benchmarks --bench merge
@@ -42,6 +44,36 @@ cargo bench -p delta-benchmarks --bench merge -- delete_only
 cargo bench -p delta-benchmarks --bench merge -- multiple_insert_only
 cargo bench -p delta-benchmarks --bench merge -- upsert_file_matched
 ```
+
+### Upsert vs Merge comparison benchmarks
+
+This benchmark suite compares the performance of the native `upsert` operation against the traditional `merge` operation with `when_matched_update` and `when_not_matched_insert`. Both operations are functionally equivalent, implementing an upsert pattern.
+
+From the repo root:
+```
+cargo bench -p delta-benchmarks --bench upsert_vs_merge
+```
+
+Filter specific scenarios:
+```
+# Compare native upsert vs merge for low match rate scenarios
+cargo bench -p delta-benchmarks --bench upsert_vs_merge -- low_match
+
+# Compare for high match rate scenarios
+cargo bench -p delta-benchmarks --bench upsert_vs_merge -- high_match
+
+# Compare balanced scenarios
+cargo bench -p delta-benchmarks --bench upsert_vs_merge -- balanced
+```
+
+The benchmark suite includes 9 different scenarios, each tested with both operations:
+- Low match rate (mostly inserts)
+- High match rate (mostly updates)
+- Balanced scenarios
+- Edge cases (only updates, only inserts)
+- Small and large workloads
+
+Each scenario uses substantial datasets from the TPC-DS benchmark with varying match and insert fractions to exercise different code paths.
 
 ## Profiling script
 

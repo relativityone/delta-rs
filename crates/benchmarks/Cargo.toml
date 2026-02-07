@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "tpcds"
 harness = false
+
+[[bench]]
+name = "upsert_vs_merge"
+harness = false
