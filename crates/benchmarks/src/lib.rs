@@ -5,8 +5,9 @@ pub mod upsert_comparison;
 
 pub use merge::{
     delete_only_cases, insert_only_cases, merge_case_by_name, merge_case_names, merge_delete,
-    merge_insert, merge_test_cases, merge_upsert, prepare_source_and_table, upsert_cases, MergeOp,
-    MergePerfParams, MergeScenario, MergeTestCase, apply_insert_projection, apply_update_projection,
+    merge_insert, merge_test_cases, merge_upsert, prepare_source_and_table, upsert_cases, 
+    MergeOp, MergePerfParams, MergeScenario, MergeTestCase, 
+    apply_insert_projection, apply_update_projection,
 };
 pub use smoke::{run_smoke_once, SmokeParams};
 pub use tpcds_queries::{

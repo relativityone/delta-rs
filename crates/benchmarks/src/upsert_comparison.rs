@@ -8,7 +8,7 @@ use deltalake_core::datafusion::{
 };
 use deltalake_core::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake_core::kernel::StructField;
-use deltalake_core::operations::merge::{MergeMetrics};
+use deltalake_core::operations::merge::MergeMetrics;
 use deltalake_core::operations::upsert::UpsertMetrics;
 use deltalake_core::{arrow, DeltaResult, DeltaTable};
 use tempfile::TempDir;
