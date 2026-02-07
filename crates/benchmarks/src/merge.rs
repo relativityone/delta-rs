@@ -307,7 +307,7 @@ pub fn merge_test_cases() -> Vec<&'static MergeTestCase> {
     all_cases_iter().collect()
 }
 
-fn apply_insert_projection(builder: InsertBuilder) -> InsertBuilder {
+pub fn apply_insert_projection(builder: InsertBuilder) -> InsertBuilder {
     builder
         .set("wr_returned_date_sk", "source.wr_returned_date_sk")
         .set("wr_returned_time_sk", "source.wr_returned_time_sk")
@@ -338,7 +338,7 @@ fn apply_insert_projection(builder: InsertBuilder) -> InsertBuilder {
         .set("wr_net_loss", "source.wr_net_loss")
 }
 
-fn apply_update_projection(builder: UpdateBuilder) -> UpdateBuilder {
+pub fn apply_update_projection(builder: UpdateBuilder) -> UpdateBuilder {
     builder
         .update("wr_returned_date_sk", "source.wr_returned_date_sk")
         .update("wr_returned_time_sk", "source.wr_returned_time_sk")
