@@ -333,7 +333,10 @@ pub async fn prepare_source_and_table(
         .with_columns(fields)
         .await?;
 
-    let table = table.write(batches).await?;
+    let mut table = table.write(batches).await?;
+    
+    // Load the table state to ensure it's available for upsert operation
+    table.load().await?;
 
     let source = ctx
         .read_parquet(&parquet_path, ParquetReadOptions::default())
