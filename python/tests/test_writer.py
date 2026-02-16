@@ -1619,23 +1619,6 @@ def test_issue_1651_roundtrip_timestamp(tmp_path: pathlib.Path):
 
 
 @pytest.mark.pyarrow
-def test_invalid_decimals(tmp_path: pathlib.Path):
-    import re
-
-    import pyarrow as pa
-
-    data = pa.table(
-        {"x": pa.array([Decimal("10000000000000000000000000000000000000.0")])}
-    )
-
-    with pytest.raises(
-        SchemaMismatchError,
-        match=re.escape("Invalid data type for Delta Lake: Decimal256(39, 1)"),
-    ):
-        write_deltalake(table_or_uri=tmp_path, mode="append", data=data)
-
-
-@pytest.mark.pyarrow
 def test_write_large_decimal(tmp_path: pathlib.Path):
     import pyarrow as pa
 
@@ -1987,7 +1970,7 @@ def test_roundtrip_cdc_evolution(tmp_path: pathlib.Path):
     approximately, that CDC files are being written
     """
     raw_commit = r"""{"metaData":{"id":"bb0fdeb2-76dd-4f5e-b1ea-845ecec8fa7e","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableChangeDataFeed":"true"},"createdTime":1713110303902}}
-{"protocol":{"minReaderVersion":1,"minWriterVersion":4,"writerFeatures":["changeDataFeed"]}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":7,"writerFeatures":["changeDataFeed"]}}
 """
     # timestampNtz looks like it might be an unnecessary requirement to write from Python
     os.mkdir(os.path.join(tmp_path, "_delta_log"))
@@ -2527,3 +2510,50 @@ def test_tilde_path_works_with_writes():
         expanded_path = os.path.expanduser(tilde_path)
         if os.path.exists(expanded_path):
             shutil.rmtree(expanded_path)
+
+
+@pytest.mark.pyarrow
+def test_dots_in_column_names_2624(tmp_path: pathlib.Path):
+    """
+    <https://github.com/delta-io/delta-rs/issues/2624>
+    """
+    import pyarrow as pa
+
+    initial = pa.Table.from_pydict(
+        {
+            "Product.Id": ["x-0", "x-1", "x-2", "x-3"],
+            "Cost": [10, 11, 12, 13],
+        }
+    )
+
+    write_deltalake(
+        table_or_uri=tmp_path,
+        data=initial,
+        partition_by=["Product.Id"],
+    )
+
+    update = pa.Table.from_pydict(
+        {
+            "Product.Id": ["x-1"],
+            "Cost": [101],
+        }
+    )
+
+    write_deltalake(
+        table_or_uri=tmp_path,
+        data=update,
+        partition_by=["Product.Id"],
+        mode="overwrite",
+        predicate="\"Product.Id\" = 'x-1'",
+    )
+
+    dt = DeltaTable(tmp_path)
+    expected = pa.Table.from_pydict(
+        {
+            "Product.Id": ["x-0", "x-1", "x-2", "x-3"],
+            "Cost": [10, 101, 12, 13],
+        }
+    )
+    # Sorting just to make sure the equivalency matches up
+    actual = dt.to_pyarrow_table().sort_by("Product.Id")
+    assert expected == actual

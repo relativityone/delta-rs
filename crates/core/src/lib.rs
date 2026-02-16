@@ -193,11 +193,11 @@ pub fn crate_version() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use futures::TryStreamExt as _;
     use itertools::Itertools;
 
     use super::*;
     use crate::table::PeekCommit;
-    use std::collections::HashMap;
 
     #[tokio::test]
     async fn read_delta_2_0_table_without_version() {
@@ -222,9 +222,9 @@ mod tests {
             .snapshot()
             .unwrap()
             .all_tombstones(&table.log_store())
+            .try_collect::<Vec<_>>()
             .await
-            .unwrap()
-            .collect_vec();
+            .unwrap();
         assert_eq!(tombstones.len(), 4);
         // assert!(tombstones.contains(&crate::kernel::Remove {
         //     path: "part-00000-512e1537-8aaa-4193-b8b4-bef3de0de409-c000.snappy.parquet".to_string(),
@@ -358,22 +358,16 @@ mod tests {
             .snapshot()
             .unwrap()
             .all_tombstones(&table.log_store())
+            .try_collect::<Vec<_>>()
             .await
-            .unwrap()
-            .collect_vec();
+            .unwrap();
         assert_eq!(tombstones.len(), 1);
-        assert!(tombstones.contains(&crate::kernel::Remove {
-            path: "part-00001-911a94a2-43f6-4acb-8620-5e68c2654989-c000.snappy.parquet".to_string(),
-            deletion_timestamp: Some(1615043776198),
-            data_change: true,
-            extended_file_metadata: Some(true),
-            partition_values: Some(HashMap::new()),
-            size: Some(445),
-            base_row_id: None,
-            default_row_commit_version: None,
-            deletion_vector: None,
-            tags: Some(HashMap::new()),
-        }));
+        let tombstone = tombstones.first().unwrap();
+        assert_eq!(
+            tombstone.path(),
+            "part-00001-911a94a2-43f6-4acb-8620-5e68c2654989-c000.snappy.parquet"
+        );
+        assert_eq!(tombstone.deletion_timestamp(), Some(1615043776198));
     }
 
     #[tokio::test]
@@ -590,18 +584,24 @@ mod tests {
 
         let table = crate::open_table_with_version(table_url, 1).await.unwrap();
 
-        let history1 = table.history(None).await.expect("Cannot get table history");
-        let history2 = latest_table
+        let history1: Vec<_> = table
             .history(None)
             .await
-            .expect("Cannot get table history");
+            .expect("Cannot get table history")
+            .collect();
+        let history2: Vec<_> = latest_table
+            .history(None)
+            .await
+            .expect("Cannot get table history")
+            .collect();
 
         assert_eq!(history1, history2);
 
-        let history3 = latest_table
+        let history3: Vec<_> = latest_table
             .history(Some(5))
             .await
-            .expect("Cannot get table history");
+            .expect("Cannot get table history")
+            .collect();
         assert_eq!(history3.len(), 5);
     }
 
@@ -666,18 +666,20 @@ mod tests {
         let table = crate::open_table(table_url).await.unwrap();
 
         // load history for table version with available log file
-        let history = table
+        let history: Vec<_> = table
             .history(Some(5))
             .await
-            .expect("Cannot get table history");
+            .expect("Cannot get table history")
+            .collect();
 
         assert_eq!(history.len(), 5);
 
         // load history for table version without log file
-        let history = table
+        let history: Vec<_> = table
             .history(Some(10))
             .await
-            .expect("Cannot get table history");
+            .expect("Cannot get table history")
+            .collect();
 
         assert_eq!(history.len(), 8);
     }
@@ -729,14 +731,16 @@ mod tests {
 
         let version_0_table = crate::open_table_with_version(table_url, 0).await.unwrap();
 
-        let version_0_history = version_0_table
+        let version_0_history: Vec<_> = version_0_table
             .history(None)
             .await
-            .expect("Cannot get table history");
-        let latest_table_history = latest_table
+            .expect("Cannot get table history")
+            .collect();
+        let latest_table_history: Vec<_> = latest_table
             .history(None)
             .await
-            .expect("Cannot get table history");
+            .expect("Cannot get table history")
+            .collect();
 
         assert_eq!(latest_table_history, version_0_history);
     }

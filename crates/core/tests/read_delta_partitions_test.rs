@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-use std::process::Command;
 use url::Url;
 
 #[allow(dead_code)]
@@ -8,8 +6,8 @@ mod fs_common;
 #[tokio::test]
 async fn read_null_partitions_from_checkpoint() {
     use deltalake_core::kernel::Add;
-    use maplit::hashmap;
     use serde_json::json;
+    use std::collections::HashMap;
 
     let mut table = fs_common::create_table_from_json(
         "../test/tests/data/read_null_partitions_from_checkpoint",
@@ -28,9 +26,7 @@ async fn read_null_partitions_from_checkpoint() {
     let delta_log = std::path::Path::new(&table.table_uri()).join("_delta_log");
 
     let add = |partition: Option<String>| Add {
-        partition_values: hashmap! {
-            "color".to_string() => partition
-        },
+        partition_values: HashMap::from([("color".to_string(), partition)]),
         ..fs_common::add(0)
     };
 
@@ -50,7 +46,7 @@ async fn read_null_partitions_from_checkpoint() {
 
     // verify that table loads from checkpoint and handles null partitions
     let table = deltalake_core::open_table(
-        url::Url::from_directory_path(std::path::Path::new(&table.table_uri())).unwrap(),
+        Url::from_directory_path(std::path::Path::new(&table.table_uri())).unwrap(),
     )
     .await
     .unwrap();
@@ -66,7 +62,7 @@ async fn load_from_delta_8_0_table_with_special_partition() {
 
     let path = "../test/tests/data/delta-0.8.0-special-partition";
     let table = deltalake_core::open_table(
-        url::Url::from_directory_path(std::fs::canonicalize(&path).unwrap()).unwrap(),
+        Url::from_directory_path(std::fs::canonicalize(&path).unwrap()).unwrap(),
     )
     .await
     .unwrap();

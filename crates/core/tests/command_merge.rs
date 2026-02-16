@@ -31,7 +31,7 @@ async fn create_table(table_uri: &str, partition: Option<Vec<&str>>) -> DeltaTab
 }
 
 fn get_delta_schema() -> StructType {
-    StructType::new(vec![
+    StructType::try_new(vec![
         StructField::new(
             "id".to_string(),
             DeltaDataType::Primitive(PrimitiveType::String),
@@ -48,6 +48,7 @@ fn get_delta_schema() -> StructType {
             true,
         ),
     ])
+    .unwrap()
 }
 
 fn get_arrow_schema() -> Arc<ArrowSchema> {
@@ -177,7 +178,6 @@ async fn test_merge_different_range() {
     let (_table_ref1, _metrics) = merge(table_ref1, df1, expr.clone()).await.unwrap();
     let result = merge(table_ref2, df2, expr).await;
 
-    println!("{result:#?}");
     assert!(result.is_ok());
 }
 

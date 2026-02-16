@@ -57,6 +57,12 @@ def test_read_simple_table_to_dict():
     ).read_all()["id"].to_pylist() == [5, 7, 9]
 
 
+def test_table_count():
+    table_path = "../crates/test/tests/data/COVID-19_NYT"
+    dt = DeltaTable(table_path)
+    assert dt.count() == 1111930
+
+
 class _SerializableException(BaseException):
     pass
 
@@ -522,6 +528,28 @@ def test_add_actions_table(flatten: bool):
     assert partition_year == pa.array(["2020"] * 3 + ["2021"] * 3)
     assert partition_month == pa.array(["1", "2", "2", "12", "12", "4"])
     assert partition_day == pa.array(["1", "3", "5", "20", "4", "5"])
+
+
+@pytest.mark.pyarrow
+def test_get_add_actions_on_empty_table(tmp_path: Path):
+    import pyarrow as pa
+
+    data = pa.table({"value": pa.array([1, 2, 3], type=pa.int64())})
+    write_deltalake(tmp_path, data)
+    dt = DeltaTable(tmp_path)
+
+    # Sanity check to ensure table starts with files.
+    initial_adds = dt.get_add_actions(flatten=True)
+    assert initial_adds.num_rows == 1
+    assert len(initial_adds["path"]) == 1
+
+    dt.delete()
+    dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
+
+    dt = DeltaTable(tmp_path)
+    add_actions = dt.get_add_actions()
+    assert add_actions.num_rows == 0
+    assert dt.get_add_actions(flatten=True).num_rows == 0
 
 
 def assert_correct_files(dt: DeltaTable, partition_filters, expected_paths):

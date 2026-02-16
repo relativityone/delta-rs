@@ -6,41 +6,37 @@
 //! the operations' behaviors and will return an updated table potentially in conjunction
 //! with a [data stream][datafusion::physical_plan::SendableRecordBatchStream],
 //! if the operation returns data as well.
-use async_trait::async_trait;
-use delta_kernel::table_properties::{DataSkippingNumIndexedCols, TableProperties};
 use std::collections::HashMap;
 use std::sync::Arc;
-use update_field_metadata::UpdateFieldMetadataBuilder;
-use uuid::Uuid;
 
-use add_feature::AddTableFeatureBuilder;
 #[cfg(feature = "datafusion")]
-use arrow_array::RecordBatch;
+use arrow::array::RecordBatch;
+use async_trait::async_trait;
 #[cfg(feature = "datafusion")]
 pub use datafusion::physical_plan::common::collect as collect_sendable_stream;
+use delta_kernel::table_properties::{DataSkippingNumIndexedCols, TableProperties};
+use url::Url;
+use uuid::Uuid;
 
-use self::add_column::AddColumnBuilder;
-use self::create::CreateBuilder;
-use self::filesystem_check::FileSystemCheckBuilder;
-#[cfg(feature = "datafusion")]
-use self::optimize::OptimizeBuilder;
-use self::restore::RestoreBuilder;
-use self::set_tbl_properties::SetTablePropertiesBuilder;
-use self::update_table_metadata::UpdateTableMetadataBuilder;
-use self::vacuum::VacuumBuilder;
+use self::{
+    add_column::AddColumnBuilder, add_feature::AddTableFeatureBuilder, create::CreateBuilder,
+    filesystem_check::FileSystemCheckBuilder, restore::RestoreBuilder,
+    set_tbl_properties::SetTablePropertiesBuilder,
+    update_field_metadata::UpdateFieldMetadataBuilder,
+    update_table_metadata::UpdateTableMetadataBuilder, vacuum::VacuumBuilder,
+};
 #[cfg(feature = "datafusion")]
 use self::{
     constraints::ConstraintBuilder, datafusion_utils::Expression, delete::DeleteBuilder,
     drop_constraints::DropConstraintBuilder, load::LoadBuilder, load_cdf::CdfLoadBuilder,
-    merge::MergeBuilder, update::UpdateBuilder, write::WriteBuilder,
+    merge::MergeBuilder, optimize::OptimizeBuilder, update::UpdateBuilder, write::WriteBuilder,
 };
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::logstore::LogStoreRef;
-use crate::table::builder::ensure_table_uri;
-use crate::table::builder::DeltaTableBuilder;
+use crate::operations::generate::GenerateBuilder;
+use crate::table::builder::{ensure_table_uri, DeltaTableBuilder};
 use crate::table::config::{TablePropertiesExt as _, DEFAULT_NUM_INDEX_COLS};
 use crate::DeltaTable;
-use url::Url;
 
 pub mod add_column;
 pub mod add_feature;
@@ -48,6 +44,7 @@ pub mod convert_to_delta;
 pub mod create;
 pub mod drop_constraints;
 pub mod filesystem_check;
+pub mod generate;
 pub mod restore;
 pub mod update_field_metadata;
 pub mod update_table_metadata;
@@ -70,6 +67,8 @@ pub mod optimize;
 pub mod set_tbl_properties;
 #[cfg(feature = "datafusion")]
 pub mod update;
+#[cfg(feature = "datafusion")]
+pub mod upsert;
 #[cfg(feature = "datafusion")]
 pub mod write;
 
@@ -101,7 +100,7 @@ pub trait CustomExecuteHandler: Send + Sync {
 #[allow(unused)]
 /// The [Operation] trait defines common behaviors that all operations builders
 /// should have consistent
-pub(crate) trait Operation<State>: std::future::IntoFuture {
+pub(crate) trait Operation: std::future::IntoFuture {
     fn log_store(&self) -> &LogStoreRef;
     fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>>;
     async fn pre_execute(&self, operation_id: Uuid) -> DeltaResult<()> {
@@ -227,64 +226,70 @@ impl DeltaOps {
         CreateBuilder::default().with_log_store(self.0.log_store)
     }
 
+    /// Generate a symlink_format_manifest for other engines
+    pub fn generate(self) -> GenerateBuilder {
+        GenerateBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
+    }
+
     /// Load data from a DeltaTable
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn load(self) -> LoadBuilder {
-        LoadBuilder::new(self.0.log_store, self.0.state.unwrap())
+        LoadBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Load a table with CDF Enabled
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn load_cdf(self) -> CdfLoadBuilder {
-        CdfLoadBuilder::new(self.0.log_store, self.0.state.unwrap())
+        CdfLoadBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Write data to Delta table
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn write(self, batches: impl IntoIterator<Item = RecordBatch>) -> WriteBuilder {
-        WriteBuilder::new(self.0.log_store, self.0.state).with_input_batches(batches)
+        WriteBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
+            .with_input_batches(batches)
     }
 
     /// Vacuum stale files from delta table
     #[must_use]
     pub fn vacuum(self) -> VacuumBuilder {
-        VacuumBuilder::new(self.0.log_store, self.0.state.unwrap())
+        VacuumBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Audit active files with files present on the filesystem
     #[must_use]
     pub fn filesystem_check(self) -> FileSystemCheckBuilder {
-        FileSystemCheckBuilder::new(self.0.log_store, self.0.state.unwrap())
+        FileSystemCheckBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Audit active files with files present on the filesystem
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn optimize<'a>(self) -> OptimizeBuilder<'a> {
-        OptimizeBuilder::new(self.0.log_store, self.0.state.unwrap())
+        OptimizeBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Delete data from Delta table
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn delete(self) -> DeleteBuilder {
-        DeleteBuilder::new(self.0.log_store, self.0.state.unwrap())
+        DeleteBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Update data from Delta table
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn update(self) -> UpdateBuilder {
-        UpdateBuilder::new(self.0.log_store, self.0.state.unwrap())
+        UpdateBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Restore delta table to a specified version or datetime
     #[must_use]
     pub fn restore(self) -> RestoreBuilder {
-        RestoreBuilder::new(self.0.log_store, self.0.state.unwrap())
+        RestoreBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Update data from Delta table
@@ -297,50 +302,60 @@ impl DeltaOps {
     ) -> MergeBuilder {
         MergeBuilder::new(
             self.0.log_store,
-            self.0.state.unwrap(),
+            self.0.state.map(|s| s.snapshot),
             predicate.into(),
             source,
         )
+    }
+
+    #[cfg(feature = "datafusion")]
+    #[must_use]
+    pub fn upsert(
+        self,
+        source: datafusion::prelude::DataFrame,
+        join_keys: Vec<String>,
+    ) -> upsert::UpsertBuilder {
+        upsert::UpsertBuilder::new(self.0.log_store, self.0.state.unwrap(), join_keys, source)
     }
 
     /// Add a check constraint to a table
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn add_constraint(self) -> ConstraintBuilder {
-        ConstraintBuilder::new(self.0.log_store, self.0.state.unwrap())
+        ConstraintBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Enable a table feature for a table
     #[must_use]
     pub fn add_feature(self) -> AddTableFeatureBuilder {
-        AddTableFeatureBuilder::new(self.0.log_store, self.0.state.unwrap())
+        AddTableFeatureBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Drops constraints from a table
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn drop_constraints(self) -> DropConstraintBuilder {
-        DropConstraintBuilder::new(self.0.log_store, self.0.state.unwrap())
+        DropConstraintBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Set table properties
     pub fn set_tbl_properties(self) -> SetTablePropertiesBuilder {
-        SetTablePropertiesBuilder::new(self.0.log_store, self.0.state.unwrap())
+        SetTablePropertiesBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Add new columns
     pub fn add_columns(self) -> AddColumnBuilder {
-        AddColumnBuilder::new(self.0.log_store, self.0.state.unwrap())
+        AddColumnBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Update field metadata
     pub fn update_field_metadata(self) -> UpdateFieldMetadataBuilder {
-        UpdateFieldMetadataBuilder::new(self.0.log_store, self.0.state.unwrap())
+        UpdateFieldMetadataBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 
     /// Update table metadata
     pub fn update_table_metadata(self) -> UpdateTableMetadataBuilder {
-        UpdateTableMetadataBuilder::new(self.0.log_store, self.0.state.unwrap())
+        UpdateTableMetadataBuilder::new(self.0.log_store, self.0.state.map(|s| s.snapshot))
     }
 }
 
@@ -406,6 +421,7 @@ pub fn get_num_idx_cols_and_stats_columns(
 /// Get the target_file_size from the table configuration in the sates
 /// If table_config does not exist (only can occur in the first write action) it takes
 /// the configuration that was passed to the writerBuilder.
+#[cfg(feature = "datafusion")]
 pub(crate) fn get_target_file_size(
     config: Option<&TableProperties>,
     configuration: &HashMap<String, Option<String>>,
@@ -421,9 +437,8 @@ pub(crate) fn get_target_file_size(
 
 #[cfg(feature = "datafusion")]
 mod datafusion_utils {
-    use datafusion::common::DFSchema;
-    use datafusion::execution::context::SessionState;
     use datafusion::logical_expr::Expr;
+    use datafusion::{catalog::Session, common::DFSchema};
 
     use crate::{delta_datafusion::expr::parse_predicate_expression, DeltaResult};
 
@@ -456,21 +471,21 @@ mod datafusion_utils {
     pub(crate) fn into_expr(
         expr: Expression,
         schema: &DFSchema,
-        df_state: &SessionState,
+        session: &dyn Session,
     ) -> DeltaResult<Expr> {
         match expr {
             Expression::DataFusion(expr) => Ok(expr),
-            Expression::String(s) => parse_predicate_expression(schema, s, df_state),
+            Expression::String(s) => parse_predicate_expression(schema, s, session),
         }
     }
 
     pub(crate) fn maybe_into_expr(
         expr: Option<Expression>,
         schema: &DFSchema,
-        df_state: &SessionState,
+        session: &dyn Session,
     ) -> DeltaResult<Option<Expr>> {
         Ok(match expr {
-            Some(predicate) => Some(into_expr(predicate, schema, df_state)?),
+            Some(predicate) => Some(into_expr(predicate, schema, session)?),
             None => None,
         })
     }

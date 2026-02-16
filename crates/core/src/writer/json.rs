@@ -15,7 +15,7 @@ use parquet::{
     file::properties::WriterProperties,
 };
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::*;
 use url::Url;
 use uuid::Uuid;
 
@@ -264,6 +264,7 @@ impl JsonWriter {
             .schema();
         Arc::new(
             schema
+                .as_ref()
                 .try_into_arrow()
                 .expect("Failed to coerce delta schema to arrow"),
         )
@@ -371,9 +372,12 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
     ///
     /// This function returns the [Add] actions which should be committed to the [DeltaTable] for
     /// the written data files
+    #[instrument(skip(self), fields(writer_count = 0))]
     async fn flush(&mut self) -> Result<Vec<Add>, DeltaTableError> {
         let writers = std::mem::take(&mut self.arrow_writers);
-        let mut actions = Vec::new();
+        let mut actions = Vec::with_capacity(writers.len());
+
+        Span::current().record("writer_count", writers.len());
 
         for (_, writer) in writers {
             let metadata = writer.arrow_writer.close()?;
@@ -384,6 +388,9 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
             let path = next_data_path(&prefix, 0, &uuid, &writer.writer_properties);
             let obj_bytes = Bytes::from(writer.buffer.to_vec());
             let file_size = obj_bytes.len() as i64;
+
+            debug!(path = %path, size = file_size, rows = metadata.file_metadata().num_rows(), "writing data file");
+
             self.table
                 .object_store()
                 .put_with_retries(&path, obj_bytes.into(), 15)
@@ -403,6 +410,7 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
                     .map(|cols| cols.iter().map(|c| c.to_string()).collect_vec()),
             )?);
         }
+        debug!(actions_count = actions.len(), "flush completed");
         Ok(actions)
     }
 }
@@ -424,8 +432,8 @@ fn quarantine_failed_parquet_rows(
     arrow_schema: Arc<ArrowSchema>,
     values: Vec<Value>,
 ) -> Result<(Vec<Value>, Vec<BadValue>), DeltaWriterError> {
-    let mut good: Vec<Value> = Vec::new();
-    let mut bad: Vec<BadValue> = Vec::new();
+    let mut good: Vec<Value> = Vec::with_capacity(values.len());
+    let mut bad: Vec<BadValue> = Vec::with_capacity(values.len());
 
     for value in values {
         let record_batch =
@@ -466,6 +474,8 @@ mod tests {
     use super::*;
 
     use arrow_schema::ArrowError;
+    #[cfg(feature = "datafusion")]
+    use futures::TryStreamExt;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
     use std::fs::File;
@@ -497,11 +507,10 @@ mod tests {
     async fn test_partition_not_written_to_parquet() {
         let table_dir = tempfile::tempdir().unwrap();
         let table = get_test_table(&table_dir).await;
-        let schema = table.snapshot().unwrap().schema();
-        let arrow_schema: ArrowSchema = schema.try_into_arrow().unwrap();
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
             ensure_table_uri(&table.table_uri()).unwrap(),
-            Arc::new(arrow_schema),
+            arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
         )
@@ -574,11 +583,10 @@ mod tests {
         let table_dir = tempfile::tempdir().unwrap();
         let table = get_test_table(&table_dir).await;
 
-        let arrow_schema: ArrowSchema =
-            table.snapshot().unwrap().schema().try_into_arrow().unwrap();
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
             ensure_table_uri(&table.table_uri()).unwrap(),
-            Arc::new(arrow_schema),
+            arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
         )
@@ -612,11 +620,10 @@ mod tests {
             let table_dir = tempfile::tempdir().unwrap();
             let table = get_test_table(&table_dir).await;
 
-            let arrow_schema: ArrowSchema =
-                table.snapshot().unwrap().schema().try_into_arrow().unwrap();
+            let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
             let mut writer = JsonWriter::try_new(
                 Url::from_directory_path(table_dir.path()).unwrap(),
-                Arc::new(arrow_schema),
+                arrow_schema,
                 Some(vec!["modified".to_string()]),
                 None,
             )
@@ -653,11 +660,9 @@ mod tests {
             let table_dir = tempfile::tempdir().unwrap();
             let mut table = get_test_table(&table_dir).await;
 
-            let schema = table.snapshot().unwrap().schema();
-            let arrow_schema: ArrowSchema = schema.try_into_arrow().unwrap();
             let mut writer = JsonWriter::try_new(
                 ensure_table_uri(&table.table_uri()).unwrap(),
-                Arc::new(arrow_schema),
+                table.snapshot().unwrap().snapshot().arrow_schema(),
                 Some(vec!["modified".to_string()]),
                 None,
             )
@@ -761,11 +766,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(0));
-        let arrow_schema: ArrowSchema =
-            table.snapshot().unwrap().schema().try_into_arrow().unwrap();
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
             crate::ensure_table_uri(&table.table_uri()).unwrap(),
-            Arc::new(arrow_schema),
+            arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
         )
@@ -782,10 +786,12 @@ mod tests {
         writer.write(vec![data]).await.unwrap();
         writer.flush_and_commit(&mut table).await.unwrap();
         assert_eq!(table.version(), Some(1));
-        let add_actions = table
-            .state
+        let add_actions: Vec<_> = table
+            .snapshot()
             .unwrap()
-            .file_actions(&table.log_store)
+            .snapshot()
+            .file_views(&table.log_store, None)
+            .try_collect()
             .await
             .unwrap();
         assert_eq!(add_actions.len(), 1);
@@ -796,7 +802,7 @@ mod tests {
                 .into_iter()
                 .next()
                 .unwrap()
-                .stats
+                .stats()
                 .unwrap()
                 .parse::<serde_json::Value>()
                 .unwrap()
@@ -825,11 +831,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(0));
-        let arrow_schema: ArrowSchema =
-            table.snapshot().unwrap().schema().try_into_arrow().unwrap();
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
             crate::ensure_table_uri(&table.table_uri()).unwrap(),
-            Arc::new(arrow_schema),
+            arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
         )
@@ -846,10 +851,12 @@ mod tests {
         writer.write(vec![data]).await.unwrap();
         writer.flush_and_commit(&mut table).await.unwrap();
         assert_eq!(table.version(), Some(1));
-        let add_actions = table
-            .state
+        let add_actions: Vec<_> = table
+            .snapshot()
             .unwrap()
-            .file_actions(&table.log_store)
+            .snapshot()
+            .file_views(&table.log_store, None)
+            .try_collect()
             .await
             .unwrap();
         assert_eq!(add_actions.len(), 1);
@@ -860,7 +867,7 @@ mod tests {
                 .into_iter()
                 .next()
                 .unwrap()
-                .stats
+                .stats()
                 .unwrap()
                 .parse::<serde_json::Value>()
                 .unwrap()

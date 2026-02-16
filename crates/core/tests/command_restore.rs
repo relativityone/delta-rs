@@ -6,6 +6,7 @@ use deltalake_core::kernel::{DataType, PrimitiveType, StructField};
 use deltalake_core::logstore::commit_uri_from_version;
 use deltalake_core::protocol::SaveMode;
 use deltalake_core::{ensure_table_uri, DeltaOps, DeltaTable};
+use futures::TryStreamExt;
 use itertools::Itertools;
 use rand::Rng;
 use std::error::Error;
@@ -149,7 +150,7 @@ async fn test_restore_with_error_params() -> Result<(), Box<dyn Error>> {
     let table_uri = tmp_dir.path().to_str().to_owned().unwrap();
     let context = setup_test(table_uri).await?;
     let table = context.table;
-    let history = table.history(Some(10)).await?;
+    let history: Vec<_> = table.history(Some(10)).await?.collect();
     let timestamp = history.get(1).unwrap().timestamp.unwrap();
     let datetime = DateTime::from_timestamp_millis(timestamp).unwrap();
 
@@ -185,9 +186,10 @@ async fn test_restore_file_missing() -> Result<(), Box<dyn Error>> {
         .table
         .snapshot()?
         .all_tombstones(&context.table.log_store())
+        .try_collect::<Vec<_>>()
         .await?
     {
-        let p = tmp_dir.path().join(file.clone().path);
+        let p = tmp_dir.path().join(file.path().to_string());
         fs::remove_file(p).unwrap();
     }
 
@@ -214,9 +216,10 @@ async fn test_restore_allow_file_missing() -> Result<(), Box<dyn Error>> {
         .table
         .snapshot()?
         .all_tombstones(&context.table.log_store())
+        .try_collect::<Vec<_>>()
         .await?
     {
-        let p = tmp_dir.path().join(file.clone().path);
+        let p = tmp_dir.path().join(file.path().to_string());
         fs::remove_file(p).unwrap();
     }
 

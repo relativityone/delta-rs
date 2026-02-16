@@ -3,10 +3,10 @@ use deltalake::datafusion::catalog::TableProvider;
 use deltalake::datafusion::datasource::MemTable;
 use deltalake::datafusion::physical_plan::memory::LazyBatchGenerator;
 use deltalake::datafusion::prelude::SessionContext;
+use deltalake::kernel::EagerSnapshot;
 use deltalake::logstore::LogStoreRef;
 use deltalake::operations::merge::MergeBuilder;
 use deltalake::operations::CustomExecuteHandler;
-use deltalake::table::state::DeltaTableState;
 use deltalake::{DeltaResult, DeltaTable, DeltaTableError};
 use parking_lot::RwLock;
 use pyo3::prelude::*;
@@ -40,7 +40,7 @@ impl PyMergeBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         log_store: LogStoreRef,
-        snapshot: DeltaTableState,
+        snapshot: EagerSnapshot,
         source: PyRecordBatchReader,
         batch_schema: PyArrowSchema,
         predicate: String,
@@ -79,7 +79,7 @@ impl PyMergeBuilder {
             ctx.read_table(table_provider).unwrap()
         };
 
-        let mut cmd = MergeBuilder::new(log_store, snapshot, predicate, source_df)
+        let mut cmd = MergeBuilder::new(log_store, Some(snapshot), predicate, source_df)
             .with_safe_cast(safe_cast)
             .with_streaming(streamed_exec);
 

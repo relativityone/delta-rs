@@ -16,13 +16,13 @@ use std::time::SystemTime;
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Field, Schema};
 use chrono::{DateTime, Utc};
+use datafusion::catalog::Session;
 use datafusion::common::config::TableParquetOptions;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::memory::DataSourceExec;
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfigBuilder, FileSource, ParquetSource,
 };
-use datafusion::execution::SessionState;
 use datafusion::physical_expr::{expressions, PhysicalExpr};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -32,17 +32,17 @@ use tracing::log;
 
 use crate::delta_datafusion::{register_store, DataFusionMixins};
 use crate::errors::DeltaResult;
-use crate::kernel::{Action, Add, AddCDCFile, CommitInfo};
+use crate::kernel::transaction::PROTOCOL;
+use crate::kernel::{resolve_snapshot, Action, Add, AddCDCFile, CommitInfo, EagerSnapshot};
 use crate::logstore::{get_actions, LogStoreRef};
-use crate::table::state::DeltaTableState;
 use crate::DeltaTableError;
 use crate::{delta_datafusion::cdf::*, kernel::Remove};
 
 /// Builder for create a read of change data feeds for delta tables
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CdfLoadBuilder {
     /// A snapshot of the to-be-loaded table's state
-    pub snapshot: DeltaTableState,
+    pub(crate) snapshot: Option<EagerSnapshot>,
     /// Delta object store for handling data files
     log_store: LogStoreRef,
     /// Version to read from
@@ -55,11 +55,27 @@ pub struct CdfLoadBuilder {
     ending_timestamp: Option<DateTime<Utc>>,
     /// Enable ending version or timestamp exceeding the last commit
     allow_out_of_range: bool,
+    /// Datafusion session state relevant for executing the input plan
+    session: Option<Arc<dyn Session>>,
+}
+
+impl std::fmt::Debug for CdfLoadBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CdfLoadBuilder")
+            .field("snapshot", &self.snapshot)
+            .field("log_store", &self.log_store)
+            .field("starting_version", &self.starting_version)
+            .field("ending_version", &self.ending_version)
+            .field("starting_timestamp", &self.starting_timestamp)
+            .field("ending_timestamp", &self.ending_timestamp)
+            .field("allow_out_of_range", &self.allow_out_of_range)
+            .finish()
+    }
 }
 
 impl CdfLoadBuilder {
-    /// Create a new [`LoadBuilder`]
-    pub fn new(log_store: LogStoreRef, snapshot: DeltaTableState) -> Self {
+    /// Create a new [`CdfLoadBuilder`]
+    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
         Self {
             snapshot,
             log_store,
@@ -68,6 +84,7 @@ impl CdfLoadBuilder {
             starting_timestamp: None,
             ending_timestamp: None,
             allow_out_of_range: false,
+            session: None,
         }
     }
 
@@ -101,11 +118,17 @@ impl CdfLoadBuilder {
         self
     }
 
-    async fn calculate_earliest_version(&self) -> DeltaResult<i64> {
+    /// The Datafusion session state to use
+    pub fn with_session_state(mut self, session: Arc<dyn Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    async fn calculate_earliest_version(&self, snapshot: &EagerSnapshot) -> DeltaResult<i64> {
         let ts = self.starting_timestamp.unwrap_or(DateTime::UNIX_EPOCH);
-        for v in 0..self.snapshot.version() {
+        for v in 0..snapshot.version() {
             if let Ok(Some(bytes)) = self.log_store.read_commit_entry(v).await {
-                if let Ok(actions) = get_actions(v, bytes).await {
+                if let Ok(actions) = get_actions(v, &bytes) {
                     if actions.iter().any(|action| {
                         matches!(action, Action::CommitInfo(CommitInfo {
                             timestamp: Some(t), ..
@@ -125,6 +148,7 @@ impl CdfLoadBuilder {
     /// than I have right now. I plan to extend the checks once we have a stable state of the initial implementation.
     async fn determine_files_to_read(
         &self,
+        snapshot: &EagerSnapshot,
     ) -> DeltaResult<(
         Vec<CdcDataSpec<AddCDCFile>>,
         Vec<CdcDataSpec<Add>>,
@@ -136,7 +160,7 @@ impl CdfLoadBuilder {
         let start = if let Some(s) = self.starting_version {
             s
         } else {
-            self.calculate_earliest_version().await?
+            self.calculate_earliest_version(snapshot).await?
         };
 
         let mut change_files: Vec<CdcDataSpec<AddCDCFile>> = vec![];
@@ -186,7 +210,7 @@ impl CdfLoadBuilder {
             .ok_or(DeltaTableError::InvalidVersion(latest_version))?;
 
         let latest_version_actions: Vec<Action> =
-            get_actions(latest_version, latest_snapshot_bytes).await?;
+            get_actions(latest_version, &latest_snapshot_bytes)?;
         let latest_version_commit = latest_version_actions
             .iter()
             .find(|a| matches!(a, Action::CommitInfo(_)));
@@ -217,7 +241,7 @@ impl CdfLoadBuilder {
                 .await?
                 .ok_or(DeltaTableError::InvalidVersion(version));
 
-            let version_actions: Vec<Action> = get_actions(version, snapshot_bytes?).await?;
+            let version_actions: Vec<Action> = get_actions(version, &snapshot_bytes?)?;
 
             let mut ts = 0;
             let mut cdc_actions = vec![];
@@ -325,17 +349,18 @@ impl CdfLoadBuilder {
     /// Executes the scan
     pub(crate) async fn build(
         &self,
-        session_sate: &SessionState,
+        session: &dyn Session,
         filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> DeltaResult<Arc<dyn ExecutionPlan>> {
-        let (cdc, add, remove) = self.determine_files_to_read().await?;
-        register_store(self.log_store.clone(), session_sate.runtime_env().clone());
+        let snapshot = resolve_snapshot(&self.log_store, self.snapshot.clone(), true).await?;
+        PROTOCOL.can_read_from(&snapshot)?;
 
-        let partition_values = self.snapshot.metadata().partition_columns().clone();
-        let schema = self.snapshot.input_schema()?;
-        let schema_fields: Vec<Arc<Field>> = self
-            .snapshot
-            .input_schema()?
+        let (cdc, add, remove) = self.determine_files_to_read(&snapshot).await?;
+        register_store(self.log_store.clone(), session.runtime_env().as_ref());
+
+        let partition_values = snapshot.metadata().partition_columns().clone();
+        let schema = snapshot.input_schema();
+        let schema_fields: Vec<Arc<Field>> = schema
             .fields()
             .into_iter()
             .filter(|f| !partition_values.contains(f.name()))
@@ -423,8 +448,7 @@ impl CdfLoadBuilder {
 
         // The output batches are then unioned to create a single output. Coalesce partitions is only here for the time
         // being for development. I plan to parallelize the reads once the base idea is correct.
-        let union_scan: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![cdc_scan, add_scan, remove_scan]));
+        let union_scan = UnionExec::try_new(vec![cdc_scan, add_scan, remove_scan])?;
 
         // We project the union in the order of the input_schema + cdc cols at the end
         // This is to ensure the DeltaCdfTableProvider uses the correct schema construction.
@@ -930,7 +954,7 @@ pub(crate) mod tests {
             .read_commit_entry(2)
             .await?
             .expect("failed to get snapshot bytes");
-        let version_actions = get_actions(2, snapshot_bytes).await?;
+        let version_actions = get_actions(2, &snapshot_bytes)?;
 
         let cdc_actions = version_actions
             .iter()

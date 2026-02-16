@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, StringArray, StructArray};
+use arrow_array::RecordBatch;
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::expressions::{Scalar, StructData};
 use delta_kernel::table_configuration::TableConfiguration;
@@ -10,56 +10,38 @@ use indexmap::IndexMap;
 use super::super::scalars::ScalarExt;
 use super::iterators::LogicalFileView;
 
-use crate::kernel::arrow::extract::extract_and_cast;
-use crate::{DeltaResult, DeltaTableError};
-
-const COL_NUM_RECORDS: &str = "numRecords";
-const COL_MIN_VALUES: &str = "minValues";
-const COL_MAX_VALUES: &str = "maxValues";
-const COL_NULL_COUNT: &str = "nullCount";
-
 pub(crate) trait PartitionsExt {
     fn hive_partition_path(&self) -> String;
 }
 
-impl PartitionsExt for IndexMap<&str, Scalar> {
-    fn hive_partition_path(&self) -> String {
-        let fields = self
-            .iter()
-            .map(|(k, v)| {
-                let encoded = v.serialize_encoded();
-                format!("{k}={encoded}")
-            })
-            .collect::<Vec<_>>();
-        fields.join("/")
-    }
-}
-
 impl PartitionsExt for IndexMap<String, Scalar> {
     fn hive_partition_path(&self) -> String {
-        let fields = self
-            .iter()
-            .map(|(k, v)| {
+        let sep = String::from('/');
+        itertools::Itertools::intersperse(
+            self.iter().map(|(k, v)| {
                 let encoded = v.serialize_encoded();
                 format!("{k}={encoded}")
-            })
-            .collect::<Vec<_>>();
-        fields.join("/")
+            }),
+            sep,
+        )
+        .collect()
     }
 }
 
 impl PartitionsExt for StructData {
     fn hive_partition_path(&self) -> String {
-        let fields = self
-            .fields()
-            .iter()
-            .zip(self.values().iter())
-            .map(|(k, v)| {
-                let encoded = v.serialize_encoded();
-                format!("{}={encoded}", k.name())
-            })
-            .collect::<Vec<_>>();
-        fields.join("/")
+        let sep = String::from('/');
+        itertools::Itertools::intersperse(
+            self.fields()
+                .iter()
+                .zip(self.values().iter())
+                .map(|(k, v)| {
+                    let encoded = v.serialize_encoded();
+                    format!("{}={encoded}", k.name())
+                }),
+            sep,
+        )
+        .collect()
     }
 }
 
@@ -75,12 +57,12 @@ impl<T: PartitionsExt> PartitionsExt for Arc<T> {
 /// to avid the necessiity of knowing the exact layout of the underlying log data.
 #[derive(Clone)]
 pub struct LogDataHandler<'a> {
-    data: &'a RecordBatch,
+    data: &'a [RecordBatch],
     config: &'a TableConfiguration,
 }
 
 impl<'a> LogDataHandler<'a> {
-    pub(crate) fn new(data: &'a RecordBatch, config: &'a TableConfiguration) -> Self {
+    pub(crate) fn new(data: &'a [RecordBatch], config: &'a TableConfiguration) -> Self {
         Self { data, config }
     }
 
@@ -102,12 +84,13 @@ impl<'a> LogDataHandler<'a> {
 
     /// The number of files in the log data.
     pub fn num_files(&self) -> usize {
-        self.data.num_rows()
+        self.data.iter().map(|batch| batch.num_rows()).sum()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = LogicalFileView> {
-        let batch = self.data.clone();
-        (0..batch.num_rows()).map(move |idx| LogicalFileView::new(batch.clone(), idx))
+    pub fn iter(&self) -> impl Iterator<Item = LogicalFileView> + '_ {
+        self.data.iter().flat_map(|batch| {
+            (0..batch.num_rows()).map(move |idx| LogicalFileView::new(batch.clone(), idx))
+        })
     }
 }
 
@@ -116,8 +99,9 @@ impl IntoIterator for LogDataHandler<'_> {
     type IntoIter = Box<dyn Iterator<Item = Self::Item>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let batch = self.data.clone();
-        Box::new((0..self.data.num_rows()).map(move |idx| LogicalFileView::new(batch.clone(), idx)))
+        Box::new(self.data.to_vec().into_iter().flat_map(|batch| {
+            (0..batch.num_rows()).map(move |idx| LogicalFileView::new(batch.clone(), idx))
+        }))
     }
 }
 
@@ -133,17 +117,28 @@ mod datafusion {
     use ::datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
     use ::datafusion::physical_optimizer::pruning::PruningStatistics;
     use ::datafusion::physical_plan::Accumulator;
+    use arrow::compute::concat;
     use arrow_arith::aggregate::sum;
+    use arrow_array::{Array, RecordBatch, StringArray, StructArray};
     use arrow_array::{ArrayRef, BooleanArray, Int64Array, UInt64Array};
     use arrow_schema::DataType as ArrowDataType;
     use delta_kernel::expressions::Expression;
     use delta_kernel::schema::{DataType, PrimitiveType};
     use delta_kernel::{EvaluationHandler, ExpressionEvaluator};
+    use itertools::Itertools;
 
     use super::*;
     use crate::kernel::arrow::engine_ext::ExpressionEvaluatorExt as _;
     use crate::kernel::arrow::extract::{extract_and_cast_opt, extract_column};
+    use crate::{DeltaResult, DeltaTableError};
+
+    use crate::kernel::arrow::extract::extract_and_cast;
     use crate::kernel::ARROW_HANDLER;
+
+    const COL_NUM_RECORDS: &str = "numRecords";
+    const COL_MIN_VALUES: &str = "minValues";
+    const COL_MAX_VALUES: &str = "maxValues";
+    const COL_NULL_COUNT: &str = "nullCount";
 
     #[derive(Debug, Default, Clone)]
     enum AccumulatorType {
@@ -319,33 +314,50 @@ mod datafusion {
     }
 
     impl LogDataHandler<'_> {
+        fn accessors(&self) -> Option<Vec<FileStatsAccessor<'_>>> {
+            self.data
+                .iter()
+                .map(FileStatsAccessor::try_new)
+                .try_collect()
+                .ok()
+        }
+
         fn num_records(&self) -> Precision<usize> {
-            FileStatsAccessor::try_new(self.data)
-                .map(|a| a.num_records())
-                .into_iter()
-                .reduce(|acc, num_records| acc.add(&num_records))
-                .unwrap_or(Precision::Absent)
+            if let Some(accessors) = self.accessors() {
+                return accessors
+                    .iter()
+                    .map(|a| a.num_records())
+                    .reduce(|acc, num_records| acc.add(&num_records))
+                    .unwrap_or(Precision::Absent);
+            }
+            Precision::Absent
         }
 
         fn total_size_files(&self) -> Precision<usize> {
-            FileStatsAccessor::try_new(self.data)
-                .map(|a| a.total_size_files())
-                .into_iter()
-                .reduce(|acc, size| acc.add(&size))
-                .unwrap_or(Precision::Absent)
+            if let Some(accessors) = self.accessors() {
+                return accessors
+                    .iter()
+                    .map(|a| a.total_size_files())
+                    .reduce(|acc, size| acc.add(&size))
+                    .unwrap_or(Precision::Absent);
+            }
+            Precision::Absent
         }
 
         pub(crate) fn column_stats(&self, name: impl AsRef<str>) -> Option<ColumnStatistics> {
-            FileStatsAccessor::try_new(self.data)
-                .map(|a| a.column_stats(name.as_ref()))
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?
-                .iter()
-                .fold(None::<ColumnStatistics>, |acc, stats| match (acc, stats) {
-                    (None, stats) => Some(stats.clone()),
-                    (Some(acc), stats) => Some(acc.add(stats)),
-                })
+            if let Some(accessors) = self.accessors() {
+                return accessors
+                    .iter()
+                    .map(|a| a.column_stats(name.as_ref()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?
+                    .iter()
+                    .fold(None::<ColumnStatistics>, |acc, stats| match (acc, stats) {
+                        (None, stats) => Some(stats.clone()),
+                        (Some(acc), stats) => Some(acc.add(stats)),
+                    });
+            }
+            None
         }
 
         pub(crate) fn statistics(&self) -> Option<Statistics> {
@@ -381,14 +393,29 @@ mod datafusion {
             } else {
                 Expression::column(["stats_parsed", stats_field, &column.name])
             };
-            let evaluator = ARROW_HANDLER.new_expression_evaluator(
-                crate::kernel::models::fields::log_schema_ref().clone(),
-                expression.into(),
-                field.data_type().clone(),
-            );
+            let evaluator = ARROW_HANDLER
+                .new_expression_evaluator(
+                    crate::kernel::models::fields::log_schema_ref().clone(),
+                    expression.into(),
+                    field.data_type().clone(),
+                )
+                .ok()?;
 
-            let batch = evaluator.evaluate_arrow(self.data.clone()).ok()?;
-            batch.column_by_name("output").cloned()
+            let results: Vec<_> = self
+                .data
+                .iter()
+                .map(|data| -> DeltaResult<_> {
+                    Ok(evaluator.evaluate_arrow(data.clone())?.column(0).clone())
+                })
+                .try_collect()
+                .ok()?;
+            concat(
+                &results
+                    .iter()
+                    .map(|result| result.as_ref())
+                    .collect::<Vec<_>>(),
+            )
+            .ok()
         }
     }
 
@@ -408,7 +435,7 @@ mod datafusion {
         /// return the number of containers (e.g. row groups) being
         /// pruned with these statistics
         fn num_containers(&self) -> usize {
-            self.data.num_rows()
+            self.data.iter().map(|b| b.num_rows()).sum()
         }
 
         /// return the number of null values for the named column as an
@@ -446,15 +473,32 @@ mod datafusion {
         /// Note: the returned array must contain `num_containers()` rows
         fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
             static ROW_COUNTS_EVAL: LazyLock<Arc<dyn ExpressionEvaluator>> = LazyLock::new(|| {
-                ARROW_HANDLER.new_expression_evaluator(
-                    crate::kernel::models::fields::log_schema_ref().clone(),
-                    Expression::column(["add", "stats_parsed", "numRecords"]).into(),
-                    DataType::Primitive(PrimitiveType::Long),
-                )
+                ARROW_HANDLER
+                    .new_expression_evaluator(
+                        crate::kernel::models::fields::log_schema_ref().clone(),
+                        Expression::column(["add", "stats_parsed", "numRecords"]).into(),
+                        DataType::Primitive(PrimitiveType::Long),
+                    )
+                    .expect("Failed to create row counts evaluator")
             });
 
-            let batch = ROW_COUNTS_EVAL.evaluate_arrow(self.data.clone()).ok()?;
-            arrow_cast::cast(batch.column_by_name("output")?, &ArrowDataType::UInt64).ok()
+            let results: Vec<_> = self
+                .data
+                .iter()
+                .map(|data| -> DeltaResult<_> {
+                    let batch = ROW_COUNTS_EVAL.evaluate_arrow(data.clone())?;
+                    Ok(arrow_cast::cast(batch.column(0), &ArrowDataType::UInt64)?)
+                })
+                .try_collect()
+                .ok()?;
+
+            concat(
+                &results
+                    .iter()
+                    .map(|result| result.as_ref())
+                    .collect::<Vec<_>>(),
+            )
+            .ok()
         }
 
         // This function is optional but will optimize partition column pruning
@@ -514,8 +558,60 @@ mod datafusion {
     }
 }
 
-#[cfg(all(test, feature = "datafusion"))]
+#[cfg(test)]
 mod tests {
+    use super::*;
+    use delta_kernel::schema::DataType;
+    use delta_kernel::schema::PrimitiveType;
+    use delta_kernel::schema::StructField;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_partitionsext_structdata() {
+        let partitions = StructData::try_new(
+            vec![
+                StructField::new("year", DataType::LONG, false),
+                StructField::new("month", DataType::LONG, false),
+                StructField::new("day", DataType::LONG, false),
+            ],
+            vec![Scalar::Long(2025), Scalar::Long(1), Scalar::Long(1)],
+        )
+        .expect("Failed to make StructData");
+        assert_eq!("year=2025/month=1/day=1", partitions.hive_partition_path());
+
+        let partitions = StructData::try_new(
+            vec![StructField::new("year", DataType::LONG, true)],
+            vec![Scalar::Null(DataType::Primitive(PrimitiveType::Long))],
+        )
+        .expect("Failed to make StructData");
+        assert_eq!(
+            "year=__HIVE_DEFAULT_PARTITION__",
+            partitions.hive_partition_path()
+        );
+    }
+
+    #[test]
+    fn test_partitionsext_indexmap() {
+        let partitions: IndexMap<String, Scalar> = IndexMap::from([
+            ("year".to_string(), Scalar::Long(2025)),
+            ("month".to_string(), Scalar::Long(1)),
+            ("day".to_string(), Scalar::Long(1)),
+        ]);
+        assert_eq!("year=2025/month=1/day=1", partitions.hive_partition_path());
+
+        let partitions: IndexMap<String, Scalar> = IndexMap::from([(
+            "year".to_string(),
+            Scalar::Null(DataType::Primitive(PrimitiveType::String)),
+        )]);
+        assert_eq!(
+            "year=__HIVE_DEFAULT_PARTITION__",
+            partitions.hive_partition_path()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "datafusion"))]
+mod df_tests {
     use futures::TryStreamExt;
 
     #[tokio::test]
@@ -530,8 +626,8 @@ mod tests {
         let json_adds: Vec<_> = table_from_json_stats
             .snapshot()
             .unwrap()
-            .snapshot
-            .files(&log_store, None)
+            .snapshot()
+            .file_views(&log_store, None)
             .try_collect()
             .await
             .unwrap();
@@ -547,8 +643,8 @@ mod tests {
         let struct_adds: Vec<_> = table_from_struct_stats
             .snapshot()
             .unwrap()
-            .snapshot
-            .files(&log_store, None)
+            .snapshot()
+            .file_views(&log_store, None)
             .try_collect()
             .await
             .unwrap();
@@ -587,7 +683,7 @@ mod tests {
         let file_stats = table_from_struct_stats
             .snapshot()
             .unwrap()
-            .snapshot
+            .snapshot()
             .log_data();
 
         let col_stats = file_stats.statistics();

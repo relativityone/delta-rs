@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use arrow_array::{Array, StructArray};
 use arrow_schema::{
     DataType as ArrowDataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -12,22 +11,17 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{ColumnName, Scalar, StructData};
-use delta_kernel::scan::{Scan, ScanMetadata};
+use delta_kernel::scan::ScanMetadata;
 use delta_kernel::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     StructType,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_properties::{DataSkippingNumIndexedCols, TableProperties};
-use delta_kernel::{
-    DeltaResult, Engine, EngineData, ExpressionEvaluator, ExpressionRef, PredicateRef, Version,
-};
-use itertools::Itertools;
+use delta_kernel::{DeltaResult, ExpressionEvaluator, ExpressionRef};
 
 use crate::errors::{DeltaResult as DeltaResultLocal, DeltaTableError};
-use crate::kernel::replay::parse_partitions;
 use crate::kernel::SCAN_ROW_ARROW_SCHEMA;
 
 /// [`ScanMetadata`] contains (1) a [`RecordBatch`] specifying data files to be scanned
@@ -47,58 +41,7 @@ pub(crate) struct ScanMetadataArrow {
     /// - `None`: No transformation is needed; the data is already in the correct logical form.
     ///
     /// Note: This vector can be indexed by row number.
-    pub scan_file_transforms: Vec<Option<ExpressionRef>>,
-}
-
-/// Internal extension trait to streamline working with Kernel scan objects.
-///
-/// THe trait mainly handles conversion between arrow `RecordBatch` and `ArrowEngineData`.
-/// The exposed methods are arrow-variants of methods already exposed on the kernel scan.
-pub(crate) trait ScanExt {
-    /// Get the metadata for a table scan.
-    ///
-    /// This method handles translation between `EngineData` and `RecordBatch`
-    /// and will already apply any selection vectors to the data.
-    /// See [`Scan::scan_metadata`] for details.
-    fn scan_metadata_arrow(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadataArrow>>>;
-
-    fn scan_metadata_from_arrow(
-        &self,
-        engine: &dyn Engine,
-        existing_version: Version,
-        existing_data: Box<dyn Iterator<Item = RecordBatch>>,
-        existing_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadataArrow>>>;
-}
-
-impl ScanExt for Scan {
-    fn scan_metadata_arrow(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadataArrow>>> {
-        Ok(self
-            .scan_metadata(engine)?
-            .map_ok(kernel_to_arrow)
-            .flatten())
-    }
-
-    fn scan_metadata_from_arrow(
-        &self,
-        engine: &dyn Engine,
-        existing_version: Version,
-        existing_data: Box<dyn Iterator<Item = RecordBatch>>,
-        existing_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadataArrow>>> {
-        let engine_iter =
-            existing_data.map(|batch| Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>);
-        Ok(self
-            .scan_metadata_from(engine, existing_version, engine_iter, existing_predicate)?
-            .map_ok(kernel_to_arrow)
-            .flatten())
-    }
+    scan_file_transforms: Vec<Option<ExpressionRef>>,
 }
 
 /// Internal extension traits to the Kernel Snapshot.
@@ -118,21 +61,18 @@ pub(crate) trait SnapshotExt {
     /// computations by delta-rs. Specifically the `stats_parsed` and
     /// `partitionValues_parsed` fields are added.
     fn scan_row_parsed_schema_arrow(&self) -> DeltaResultLocal<ArrowSchemaRef>;
-
-    /// Parse stats column into a struct array.
-    fn parse_stats_column(&self, batch: &RecordBatch) -> DeltaResultLocal<RecordBatch>;
 }
 
 impl SnapshotExt for Snapshot {
     fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let partition_columns = self.metadata().partition_columns();
+        let partition_columns = self.table_configuration().metadata().partition_columns();
         let column_mapping_mode = self.table_configuration().column_mapping_mode();
-        let physical_schema = StructType::new(
+        let physical_schema = StructType::try_new(
             self.schema()
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
                 .map(|field| field.make_physical(column_mapping_mode)),
-        );
+        )?;
         Ok(Arc::new(stats_schema(
             &physical_schema,
             self.table_properties(),
@@ -140,24 +80,26 @@ impl SnapshotExt for Snapshot {
     }
 
     fn partitions_schema(&self) -> DeltaResultLocal<Option<SchemaRef>> {
-        Ok(
-            partitions_schema(self.schema().as_ref(), self.metadata().partition_columns())?
-                .map(Arc::new),
-        )
+        Ok(partitions_schema(
+            self.schema().as_ref(),
+            self.table_configuration().metadata().partition_columns(),
+        )?
+        .map(Arc::new))
     }
 
     /// Arrow schema for a parsed (including stats_parsed and partitionValues_parsed)
     /// scan row (file data).
     fn scan_row_parsed_schema_arrow(&self) -> DeltaResultLocal<ArrowSchemaRef> {
         let mut fields = SCAN_ROW_ARROW_SCHEMA.fields().to_vec();
+        let stats_idx = SCAN_ROW_ARROW_SCHEMA.index_of("stats").unwrap();
 
         let stats_schema = self.stats_schema()?;
         let stats_schema: ArrowSchema = stats_schema.as_ref().try_into_arrow()?;
-        fields.push(Arc::new(Field::new(
+        fields[stats_idx] = Arc::new(Field::new(
             "stats_parsed",
             ArrowDataType::Struct(stats_schema.fields().to_owned()),
             true,
-        )));
+        ));
 
         if let Some(partition_schema) = self.partitions_schema()? {
             let partition_schema: ArrowSchema = partition_schema.as_ref().try_into_arrow()?;
@@ -171,51 +113,6 @@ impl SnapshotExt for Snapshot {
         let schema = Arc::new(ArrowSchema::new(fields));
         Ok(schema)
     }
-
-    fn parse_stats_column(&self, batch: &RecordBatch) -> DeltaResultLocal<RecordBatch> {
-        let Some((stats_idx, _)) = batch.schema_ref().column_with_name("stats") else {
-            return Err(DeltaTableError::SchemaMismatch {
-                msg: "stats column not found".to_string(),
-            });
-        };
-
-        let mut columns = batch.columns().to_vec();
-        let mut fields = batch.schema().fields().to_vec();
-
-        let stats_schema = self.stats_schema()?;
-        let stats_batch = batch.project(&[stats_idx])?;
-        let stats_data = Box::new(ArrowEngineData::new(stats_batch));
-
-        let parsed = parse_json(stats_data, stats_schema)?;
-        let parsed: RecordBatch = ArrowEngineData::try_from_engine_data(parsed)?.into();
-
-        let stats_array: Arc<StructArray> = Arc::new(parsed.into());
-        fields.push(Arc::new(Field::new(
-            "stats_parsed",
-            stats_array.data_type().to_owned(),
-            true,
-        )));
-        columns.push(stats_array.clone());
-
-        if let Some(partition_schema) = self.partitions_schema()? {
-            let partition_array = parse_partitions(
-                batch,
-                partition_schema.as_ref(),
-                "fileConstantValues.partitionValues",
-            )?;
-            fields.push(Arc::new(Field::new(
-                "partitionValues_parsed",
-                partition_array.data_type().to_owned(),
-                false,
-            )));
-            columns.push(Arc::new(partition_array));
-        }
-
-        Ok(RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(fields)),
-            columns,
-        )?)
-    }
 }
 
 fn partitions_schema(
@@ -225,7 +122,7 @@ fn partitions_schema(
     if partition_columns.is_empty() {
         return Ok(None);
     }
-    Ok(Some(StructType::new(
+    Ok(Some(StructType::try_new(
         partition_columns
             .iter()
             .map(|col| {
@@ -234,7 +131,7 @@ fn partitions_schema(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,
-    )))
+    )?))
 }
 
 /// Generates the expected schema for file statistics.
@@ -293,7 +190,7 @@ pub(crate) fn stats_schema(
         }
     }
 
-    StructType::new(fields)
+    StructType::try_new(fields).expect("Failed to construct StructType for stats_schema")
 }
 
 // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
@@ -424,7 +321,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
         self.path.pop();
 
         // exclude struct fields with no children
-        if matches!(field.data_type(), DataType::Struct(dt) if dt.fields.is_empty()) {
+        if matches!(field.data_type(), DataType::Struct(dt) if dt.num_fields() == 0) {
             None
         } else {
             Some(field)
@@ -489,18 +386,16 @@ fn is_skipping_eligeble_datatype(data_type: &PrimitiveType) -> bool {
     )
 }
 
-fn kernel_to_arrow(metadata: ScanMetadata) -> DeltaResult<ScanMetadataArrow> {
+pub(crate) fn kernel_to_arrow(metadata: ScanMetadata) -> DeltaResult<ScanMetadataArrow> {
+    let (underlying_data, selection_vector) = metadata.scan_files.into_parts();
     let scan_file_transforms = metadata
         .scan_file_transforms
         .into_iter()
         .enumerate()
-        .filter_map(|(i, v)| metadata.scan_files.selection_vector[i].then_some(v))
+        .filter_map(|(i, v)| selection_vector[i].then_some(v))
         .collect();
-    let batch = ArrowEngineData::try_from_engine_data(metadata.scan_files.data)?.into();
-    let scan_files = filter_record_batch(
-        &batch,
-        &BooleanArray::from(metadata.scan_files.selection_vector),
-    )?;
+    let batch = ArrowEngineData::try_from_engine_data(underlying_data)?.into();
+    let scan_files = filter_record_batch(&batch, &BooleanArray::from(selection_vector))?;
     Ok(ScanMetadataArrow {
         scan_files,
         scan_file_transforms,
@@ -579,11 +474,13 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
 
         let expression = column_expr!("a");
-        let expr = handler.new_expression_evaluator(
-            Arc::new((&schema).try_into_kernel().unwrap()),
-            expression.into(),
-            DataType::INTEGER,
-        );
+        let expr = handler
+            .new_expression_evaluator(
+                Arc::new((&schema).try_into_kernel().unwrap()),
+                expression.into(),
+                DataType::INTEGER,
+            )
+            .unwrap();
 
         let result = expr.evaluate_arrow(batch);
         assert!(result.is_ok());
@@ -610,15 +507,17 @@ mod tests {
     #[test]
     fn test_stats_schema_simple() {
         let properties: TableProperties = [("key", "value")].into();
-        let file_schema = StructType::new([StructField::nullable("id", DataType::LONG)]);
+        let file_schema =
+            StructType::try_new([StructField::nullable("id", DataType::LONG)]).unwrap();
 
         let stats_schema = stats_schema(&file_schema, &properties);
-        let expected = StructType::new([
+        let expected = StructType::try_new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", file_schema.clone()),
             StructField::nullable("minValues", file_schema.clone()),
             StructField::nullable("maxValues", file_schema),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -636,46 +535,53 @@ mod tests {
 
         // Create array type for a field that's not eligible for data skipping
         let array_type = DataType::Array(Box::new(ArrayType::new(DataType::STRING, false)));
-        let metadata_struct = StructType::new([
+        let metadata_struct = StructType::try_new([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("tags", array_type),
             StructField::nullable("score", DataType::DOUBLE),
-        ]);
-        let file_schema = StructType::new([
+        ])
+        .unwrap();
+        let file_schema = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable(
                 "metadata",
                 DataType::Struct(Box::new(metadata_struct.clone())),
             ),
-        ]);
+        ])
+        .unwrap();
 
         let stats_schema = stats_schema(&file_schema, &properties);
 
-        let expected_null_nested = StructType::new([
+        let expected_null_nested = StructType::try_new([
             StructField::nullable("name", DataType::LONG),
             StructField::nullable("tags", DataType::LONG),
             StructField::nullable("score", DataType::LONG),
-        ]);
-        let expected_null = StructType::new([
+        ])
+        .unwrap();
+        let expected_null = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("metadata", DataType::Struct(Box::new(expected_null_nested))),
-        ]);
+        ])
+        .unwrap();
 
-        let expected_nested = StructType::new([
+        let expected_nested = StructType::try_new([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("score", DataType::DOUBLE),
-        ]);
-        let expected_fields = StructType::new([
+        ])
+        .unwrap();
+        let expected_fields = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("metadata", DataType::Struct(Box::new(expected_nested))),
-        ]);
+        ])
+        .unwrap();
 
-        let expected = StructType::new([
+        let expected = StructType::try_new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -688,33 +594,38 @@ mod tests {
         )]
         .into();
 
-        let user_struct = StructType::new([
+        let user_struct = StructType::try_new([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("age", DataType::INTEGER),
-        ]);
-        let file_schema = StructType::new([
+        ])
+        .unwrap();
+        let file_schema = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("user.info", DataType::Struct(Box::new(user_struct.clone()))),
-        ]);
+        ])
+        .unwrap();
 
         let stats_schema = stats_schema(&file_schema, &properties);
 
-        let expected_nested = StructType::new([StructField::nullable("name", DataType::STRING)]);
-        let expected_fields = StructType::new([StructField::nullable(
+        let expected_nested =
+            StructType::try_new([StructField::nullable("name", DataType::STRING)]).unwrap();
+        let expected_fields = StructType::try_new([StructField::nullable(
             "user.info",
             DataType::Struct(Box::new(expected_nested)),
-        )]);
+        )])
+        .unwrap();
         let null_count = NullCountStatsTransform
             .transform_struct(&expected_fields)
             .unwrap()
             .into_owned();
 
-        let expected = StructType::new([
+        let expected = StructType::try_new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -727,25 +638,28 @@ mod tests {
         )]
         .into();
 
-        let logical_schema = StructType::new([
+        let logical_schema = StructType::try_new([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("age", DataType::INTEGER),
-        ]);
+        ])
+        .unwrap();
 
         let stats_schema = stats_schema(&logical_schema, &properties);
 
-        let expected_fields = StructType::new([StructField::nullable("name", DataType::STRING)]);
+        let expected_fields =
+            StructType::try_new([StructField::nullable("name", DataType::STRING)]).unwrap();
         let null_count = NullCountStatsTransform
             .transform_struct(&expected_fields)
             .unwrap()
             .into_owned();
 
-        let expected = StructType::new([
+        let expected = StructType::try_new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -758,30 +672,34 @@ mod tests {
         // - "id" (LONG) - eligible for both null count and min/max
         // - "is_active" (BOOLEAN) - eligible for null count but NOT for min/max
         // - "metadata" (BINARY) - eligible for null count but NOT for min/max
-        let file_schema = StructType::new([
+        let file_schema = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("is_active", DataType::BOOLEAN),
             StructField::nullable("metadata", DataType::BINARY),
-        ]);
+        ])
+        .unwrap();
 
         let stats_schema = stats_schema(&file_schema, &properties);
 
         // Expected nullCount schema: all fields converted to LONG
-        let expected_null_count = StructType::new([
+        let expected_null_count = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("is_active", DataType::LONG),
             StructField::nullable("metadata", DataType::LONG),
-        ]);
+        ])
+        .unwrap();
 
         // Expected minValues/maxValues schema: only eligible fields (no boolean, no binary)
-        let expected_min_max = StructType::new([StructField::nullable("id", DataType::LONG)]);
+        let expected_min_max =
+            StructType::try_new([StructField::nullable("id", DataType::LONG)]).unwrap();
 
-        let expected = StructType::new([
+        let expected = StructType::try_new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -791,50 +709,57 @@ mod tests {
         let properties: TableProperties = [("key", "value")].into();
 
         // Create a nested schema where some nested fields are eligible for min/max and others aren't
-        let user_struct = StructType::new([
+        let user_struct = StructType::try_new([
             StructField::nullable("name", DataType::STRING), // eligible for min/max
             StructField::nullable("is_admin", DataType::BOOLEAN), // NOT eligible for min/max
             StructField::nullable("age", DataType::INTEGER), // eligible for min/max
             StructField::nullable("profile_pic", DataType::BINARY), // NOT eligible for min/max
-        ]);
+        ])
+        .unwrap();
 
-        let file_schema = StructType::new([
+        let file_schema = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("user", DataType::Struct(Box::new(user_struct.clone()))),
             StructField::nullable("is_deleted", DataType::BOOLEAN), // NOT eligible for min/max
-        ]);
+        ])
+        .unwrap();
 
         let stats_schema = stats_schema(&file_schema, &properties);
 
         // Expected nullCount schema: all fields converted to LONG, maintaining structure
-        let expected_null_user = StructType::new([
+        let expected_null_user = StructType::try_new([
             StructField::nullable("name", DataType::LONG),
             StructField::nullable("is_admin", DataType::LONG),
             StructField::nullable("age", DataType::LONG),
             StructField::nullable("profile_pic", DataType::LONG),
-        ]);
-        let expected_null_count = StructType::new([
+        ])
+        .unwrap();
+        let expected_null_count = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("user", DataType::Struct(Box::new(expected_null_user))),
             StructField::nullable("is_deleted", DataType::LONG),
-        ]);
+        ])
+        .unwrap();
 
         // Expected minValues/maxValues schema: only eligible fields
-        let expected_minmax_user = StructType::new([
+        let expected_minmax_user = StructType::try_new([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("age", DataType::INTEGER),
-        ]);
-        let expected_min_max = StructType::new([
+        ])
+        .unwrap();
+        let expected_min_max = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("user", DataType::Struct(Box::new(expected_minmax_user))),
-        ]);
+        ])
+        .unwrap();
 
-        let expected = StructType::new([
+        let expected = StructType::try_new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -844,44 +769,68 @@ mod tests {
         let properties: TableProperties = [("key", "value")].into();
 
         // Create a schema with only fields that are NOT eligible for min/max skipping
-        let file_schema = StructType::new([
+        let file_schema = StructType::try_new([
             StructField::nullable("is_active", DataType::BOOLEAN),
             StructField::nullable("metadata", DataType::BINARY),
             StructField::nullable(
                 "tags",
                 DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
             ),
-        ]);
+        ])
+        .unwrap();
 
         let stats_schema = stats_schema(&file_schema, &properties);
 
         // Expected nullCount schema: all fields converted to LONG
-        let expected_null_count = StructType::new([
+        let expected_null_count = StructType::try_new([
             StructField::nullable("is_active", DataType::LONG),
             StructField::nullable("metadata", DataType::LONG),
             StructField::nullable("tags", DataType::LONG),
-        ]);
+        ])
+        .unwrap();
 
         // Expected minValues/maxValues schema: empty since no fields are eligible
         // Since there are no eligible fields, minValues and maxValues should not be present
-        let expected = StructType::new([
+        let expected = StructType::try_new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null_count),
             // No minValues or maxValues fields since no primitive fields are eligible
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(&expected, &stats_schema);
     }
 
     #[test]
     fn test_partitions_schema() -> DeltaResultLocal<()> {
-        let logical_schema = StructType::new([
+        let logical_schema = StructType::try_new([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("age", DataType::INTEGER),
-        ]);
+        ])
+        .unwrap();
 
         let result = partitions_schema(&logical_schema, &[])?;
         assert_eq!(None, result);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_partition_schema2() {
+        let schema = StructType::try_new(vec![
+            StructField::new("id", DataType::LONG, true),
+            StructField::new("name", DataType::STRING, true),
+            StructField::new("date", DataType::DATE, true),
+        ])
+        .unwrap();
+
+        let partition_columns = vec!["date".to_string()];
+        let expected =
+            StructType::try_new(vec![StructField::new("date", DataType::DATE, true)]).unwrap();
+        assert_eq!(
+            partitions_schema(&schema, &partition_columns).unwrap(),
+            Some(expected)
+        );
+
+        assert_eq!(partitions_schema(&schema, &[]).unwrap(), None);
     }
 }

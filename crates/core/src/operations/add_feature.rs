@@ -2,23 +2,22 @@
 
 use std::sync::Arc;
 
-use delta_kernel::table_features::{ReaderFeature, WriterFeature};
+use delta_kernel::table_features::TableFeature;
 use futures::future::BoxFuture;
 use itertools::Itertools;
 
 use super::{CustomExecuteHandler, Operation};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::{ProtocolExt as _, TableFeatures};
+use crate::kernel::{resolve_snapshot, EagerSnapshot, ProtocolExt as _, TableFeatures};
 use crate::logstore::LogStoreRef;
 use crate::protocol::DeltaOperation;
-use crate::table::state::DeltaTableState;
 use crate::DeltaTable;
 use crate::{DeltaResult, DeltaTableError};
 
 /// Enable table features for a table
 pub struct AddTableFeatureBuilder {
     /// A snapshot of the table's state
-    snapshot: DeltaTableState,
+    snapshot: Option<EagerSnapshot>,
     /// Name of the feature
     name: Vec<TableFeatures>,
     /// Allow protocol versions to be increased by setting features
@@ -30,7 +29,7 @@ pub struct AddTableFeatureBuilder {
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
-impl super::Operation<()> for AddTableFeatureBuilder {
+impl super::Operation for AddTableFeatureBuilder {
     fn log_store(&self) -> &LogStoreRef {
         &self.log_store
     }
@@ -41,7 +40,7 @@ impl super::Operation<()> for AddTableFeatureBuilder {
 
 impl AddTableFeatureBuilder {
     /// Create a new builder
-    pub fn new(log_store: LogStoreRef, snapshot: DeltaTableState) -> Self {
+    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
         Self {
             name: vec![],
             allow_protocol_versions_increase: false,
@@ -93,6 +92,8 @@ impl std::future::IntoFuture for AddTableFeatureBuilder {
         let this = self;
 
         Box::pin(async move {
+            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), false).await?;
+
             let name = if this.name.is_empty() {
                 return Err(DeltaTableError::Generic("No features provided".to_string()));
             } else {
@@ -102,13 +103,13 @@ impl std::future::IntoFuture for AddTableFeatureBuilder {
             this.pre_execute(operation_id).await?;
 
             let (reader_features, writer_features): (
-                Vec<Option<ReaderFeature>>,
-                Vec<Option<WriterFeature>>,
+                Vec<Option<TableFeature>>,
+                Vec<Option<TableFeature>>,
             ) = name.iter().map(|v| v.to_reader_writer_features()).unzip();
             let reader_features = reader_features.into_iter().flatten().collect_vec();
             let writer_features = writer_features.into_iter().flatten().collect_vec();
 
-            let mut protocol = this.snapshot.protocol().clone();
+            let mut protocol = snapshot.protocol().clone();
 
             if !this.allow_protocol_versions_increase {
                 if !reader_features.is_empty()
@@ -136,7 +137,7 @@ impl std::future::IntoFuture for AddTableFeatureBuilder {
                 .with_actions(actions)
                 .with_operation_id(operation_id)
                 .with_post_commit_hook_handler(this.get_custom_execute_handler())
-                .build(Some(&this.snapshot), this.log_store.clone(), operation)
+                .build(Some(&snapshot), this.log_store.clone(), operation)
                 .await?;
 
             this.post_execute(operation_id).await?;
@@ -157,7 +158,7 @@ mod tests {
         writer::test_utils::{create_bare_table, get_record_batch},
         DeltaOps,
     };
-    use delta_kernel::table_features::{ReaderFeature, WriterFeature};
+    use delta_kernel::table_features::TableFeature;
     use delta_kernel::DeltaResult;
 
     #[tokio::test]
@@ -181,7 +182,7 @@ mod tests {
             .protocol()
             .writer_features()
             .unwrap_or_default()
-            .contains(&WriterFeature::ChangeDataFeed));
+            .contains(&TableFeature::ChangeDataFeed));
 
         let result = DeltaOps(result)
             .add_feature()
@@ -194,11 +195,11 @@ mod tests {
         assert!(&current_protocol
             .writer_features()
             .unwrap_or_default()
-            .contains(&WriterFeature::DeletionVectors));
+            .contains(&TableFeature::DeletionVectors));
         assert!(&current_protocol
             .reader_features()
             .unwrap_or_default()
-            .contains(&ReaderFeature::DeletionVectors));
+            .contains(&TableFeature::DeletionVectors));
         assert_eq!(result.version(), Some(2));
         Ok(())
     }

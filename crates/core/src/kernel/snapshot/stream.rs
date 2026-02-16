@@ -1,15 +1,15 @@
 //! the code in this file is hoisted from datafusion with only slight modifications
 //!
-use std::pin::Pin;
-
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use futures::stream::BoxStream;
 use futures::{Future, Stream, StreamExt};
+use std::pin::Pin;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
+use tracing::dispatcher;
+use tracing::Span;
 
 use crate::errors::DeltaResult;
-use crate::kernel::Add;
 use crate::DeltaTableError;
 
 /// Trait for types that stream [RecordBatch]
@@ -52,8 +52,6 @@ pub trait RecordBatchStream: Stream<Item = DeltaResult<RecordBatch>> {
 pub type SendableRecordBatchStream = Pin<Box<dyn RecordBatchStream + Send>>;
 
 pub type SendableRBStream = Pin<Box<dyn Stream<Item = DeltaResult<RecordBatch>> + Send>>;
-
-pub type SendableAddStream = Pin<Box<dyn Stream<Item = DeltaResult<Add>> + Send>>;
 
 /// Creates a stream from a collection of producing tasks, routing panics to the stream.
 ///
@@ -109,7 +107,16 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: FnOnce() -> DeltaResult<()>,
         F: Send + 'static,
     {
-        self.join_set.spawn_blocking(f);
+        // Capture the current dispatcher and span
+        let dispatch = dispatcher::get_default(|d| d.clone());
+        let span = Span::current();
+
+        self.join_set.spawn_blocking(move || {
+            dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                f()
+            })
+        });
     }
 
     /// Create a stream of all data written to `tx`

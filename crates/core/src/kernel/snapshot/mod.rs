@@ -15,45 +15,46 @@
 //!
 //!
 
-use std::io::{BufRead, BufReader, Cursor};
 use std::sync::{Arc, LazyLock};
 
-use arrow::compute::concat_batches;
-use arrow_array::RecordBatch;
-use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use arrow::array::RecordBatch;
+use arrow::compute::{filter_record_batch, is_not_null};
+use arrow::datatypes::SchemaRef;
+use delta_kernel::actions::{Remove, Sidecar};
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::scan::scan_row_schema;
-use delta_kernel::schema::SchemaRef;
+use delta_kernel::schema::derive_macro_utils::ToDataType;
+use delta_kernel::schema::{SchemaRef as KernelSchemaRef, StructField, ToSchema};
 use delta_kernel::snapshot::Snapshot as KernelSnapshot;
 use delta_kernel::table_configuration::TableConfiguration;
 use delta_kernel::table_properties::TableProperties;
-use delta_kernel::{PredicateRef, Version};
-use futures::stream::BoxStream;
+use delta_kernel::{
+    Engine, EvaluationHandler, Expression, ExpressionEvaluator, PredicateRef, Version,
+};
+use futures::future::ready;
+use futures::stream::{once, BoxStream};
 use futures::{StreamExt, TryStreamExt};
-use itertools::Itertools;
 use object_store::path::Path;
 use object_store::ObjectStore;
-use tokio::task::spawn_blocking;
+use serde_json::Deserializer;
 use url::Url;
 
-use super::{Action, CommitInfo, Metadata, Protocol, Remove};
-use crate::kernel::arrow::engine_ext::{ScanExt, SnapshotExt};
-use crate::kernel::parse::read_removes;
-#[cfg(test)]
-use crate::kernel::transaction::CommitData;
-use crate::kernel::{ActionType, StructType};
+use super::{Action, CommitInfo, Metadata, Protocol};
+use crate::kernel::arrow::engine_ext::{kernel_to_arrow, ExpressionEvaluatorExt};
+use crate::kernel::{spawn_blocking_with_span, StructType, ARROW_HANDLER};
 use crate::logstore::{LogStore, LogStoreExt};
-use crate::{DeltaResult, DeltaTableConfig, DeltaTableError};
+use crate::{to_kernel_predicate, DeltaResult, DeltaTableConfig, DeltaTableError, PartitionFilter};
 
 pub use self::log_data::*;
 pub use iterators::*;
+pub use scan::*;
 pub use stream::*;
 
 mod iterators;
 mod log_data;
-pub(crate) mod parse;
-pub(crate) mod replay;
+mod scan;
 mod serde;
 mod stream;
 
@@ -69,30 +70,21 @@ pub struct Snapshot {
     config: DeltaTableConfig,
     /// Logical table schema
     schema: SchemaRef,
-    /// Fully qualified URL of the table
-    table_url: Url,
 }
 
 impl Snapshot {
-    /// Create a new [`Snapshot`] instance
-    pub async fn try_new(
-        log_store: &dyn LogStore,
+    pub async fn try_new_with_engine(
+        engine: Arc<dyn Engine>,
+        table_root: Url,
         config: DeltaTableConfig,
-        version: Option<i64>,
+        version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // TODO: bundle operation_id with logstore ...
-        let engine = log_store.engine(None);
-        let mut table_root = log_store.table_root_url();
-        let version = version.map(|v| v as u64);
-
-        // NB: kernel engine uses Url::join to construct paths,
-        // if the path does not end with a slash, the would override the entire path.
-        // So we need to be extra sure its ends with a slash.
-        if !table_root.path().ends_with('/') {
-            table_root.set_path(&format!("{}/", table_root.path()));
-        }
-        let snapshot = match spawn_blocking(move || {
-            KernelSnapshot::try_new(table_root, engine.as_ref(), version)
+        let snapshot = match spawn_blocking_with_span(move || {
+            let mut builder = KernelSnapshot::builder_for(table_root);
+            if let Some(version) = version {
+                builder = builder.at_version(version);
+            }
+            builder.build(engine.as_ref())
         })
         .await
         .map_err(|e| DeltaTableError::Generic(e.to_string()))?
@@ -108,52 +100,47 @@ impl Snapshot {
             }
         };
 
-        let schema = snapshot.table_configuration().schema();
+        let schema = Arc::new(
+            snapshot
+                .table_configuration()
+                .schema()
+                .as_ref()
+                .try_into_arrow()?,
+        );
 
         Ok(Self {
-            inner: Arc::new(snapshot),
+            inner: snapshot,
             config,
             schema,
-            table_url: log_store.config().location.clone(),
         })
     }
 
-    #[cfg(test)]
-    pub async fn new_test<'a>(
-        commits: impl IntoIterator<Item = &'a CommitData>,
-    ) -> DeltaResult<(Self, Arc<dyn LogStore>)> {
-        use crate::logstore::{commit_uri_from_version, default_logstore};
-        use object_store::memory::InMemory;
-        let store = Arc::new(InMemory::new());
+    /// Create a new [`Snapshot`] instance
+    pub async fn try_new(
+        log_store: &dyn LogStore,
+        config: DeltaTableConfig,
+        version: Option<i64>,
+    ) -> DeltaResult<Self> {
+        // TODO: bundle operation_id with logstore ...
+        let engine = log_store.engine(None);
 
-        for (idx, commit) in commits.into_iter().enumerate() {
-            let uri = commit_uri_from_version(idx as i64);
-            let data = commit.get_bytes()?;
-            store.put(&uri, data.into()).await?;
+        // NB: kernel engine uses Url::join to construct paths,
+        // if the path does not end with a slash, the would override the entire path.
+        // So we need to be extra sure its ends with a slash.
+        let mut table_root = log_store.table_root_url();
+        if !table_root.path().ends_with('/') {
+            table_root.set_path(&format!("{}/", table_root.path()));
         }
 
-        let table_url = Url::parse("memory:///").unwrap();
+        Self::try_new_with_engine(engine, table_root, config, version.map(|v| v as u64)).await
+    }
 
-        let log_store = default_logstore(
-            store.clone(),
-            store.clone(),
-            &table_url,
-            &Default::default(),
-        );
+    pub fn scan_builder(&self) -> ScanBuilder {
+        ScanBuilder::new(self.inner.clone())
+    }
 
-        let engine = log_store.engine(None);
-        let snapshot = KernelSnapshot::try_new(table_url.clone(), engine.as_ref(), None)?;
-        let schema = snapshot.table_configuration().schema();
-
-        Ok((
-            Self {
-                inner: Arc::new(snapshot),
-                config: Default::default(),
-                schema,
-                table_url,
-            },
-            log_store,
-        ))
+    pub fn into_scan_builder(self) -> ScanBuilder {
+        ScanBuilder::new(self.inner)
     }
 
     /// Update the snapshot to the given version
@@ -174,14 +161,24 @@ impl Snapshot {
         // TODO: bundle operation id with log store ...
         let engine = log_store.engine(None);
         let current = self.inner.clone();
-        let snapshot = spawn_blocking(move || {
-            KernelSnapshot::try_new_from(current, engine.as_ref(), target_version)
+        let snapshot = spawn_blocking_with_span(move || {
+            let mut builder = KernelSnapshot::builder_from(current);
+            if let Some(version) = target_version {
+                builder = builder.at_version(version);
+            }
+            builder.build(engine.as_ref())
         })
         .await
         .map_err(|e| DeltaTableError::Generic(e.to_string()))??;
 
         self.inner = snapshot;
-        self.schema = self.inner.table_configuration().schema();
+        self.schema = Arc::new(
+            self.inner
+                .table_configuration()
+                .schema()
+                .as_ref()
+                .try_into_arrow()?,
+        );
 
         Ok(())
     }
@@ -192,18 +189,22 @@ impl Snapshot {
     }
 
     /// Get the table schema of the snapshot
-    pub fn schema(&self) -> &StructType {
-        self.schema.as_ref()
+    pub fn schema(&self) -> KernelSchemaRef {
+        self.inner.table_configuration().schema()
+    }
+
+    pub fn arrow_schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 
     /// Get the table metadata of the snapshot
     pub fn metadata(&self) -> &Metadata {
-        self.inner.metadata()
+        self.inner.table_configuration().metadata()
     }
 
     /// Get the table protocol of the snapshot
     pub fn protocol(&self) -> &Protocol {
-        self.inner.protocol()
+        self.inner.table_configuration().protocol()
     }
 
     /// Get the table config which is loaded with of the snapshot
@@ -213,7 +214,7 @@ impl Snapshot {
 
     /// Get the table root of the snapshot
     pub(crate) fn table_root_path(&self) -> DeltaResult<Path> {
-        Ok(Path::from_url_path(self.table_url.path())?)
+        Ok(Path::from_url_path(self.inner.table_root().path())?)
     }
 
     /// Well known properties of the table
@@ -247,41 +248,39 @@ impl Snapshot {
         log_store: &dyn LogStore,
         predicate: Option<PredicateRef>,
     ) -> SendableRBStream {
-        let scan = match self
-            .inner
-            .clone()
-            .scan_builder()
-            .with_predicate(predicate)
-            .build()
-        {
+        let scan = match self.scan_builder().with_predicate(predicate).build() {
             Ok(scan) => scan,
-            Err(err) => {
-                return Box::pin(futures::stream::once(async {
-                    Err(DeltaTableError::KernelError(err))
-                }))
-            }
+            Err(err) => return Box::pin(once(ready(Err(err)))),
         };
 
-        // TODO: which capacity to choose?
-        let mut builder = RecordBatchReceiverStreamBuilder::new(100);
-        let tx = builder.tx();
         // TODO: bundle operation id with log store ...
         let engine = log_store.engine(None);
-        let inner = self.inner.clone();
+        let stream = scan
+            .scan_metadata(engine)
+            .map(|d| Ok(kernel_to_arrow(d?)?.scan_files));
 
-        builder.spawn_blocking(move || {
-            let scan_iter = scan.scan_metadata_arrow(engine.as_ref())?;
-            for res in scan_iter {
-                let batch = res?.scan_files;
-                let batch = inner.parse_stats_column(&batch)?;
-                if tx.blocking_send(Ok(batch)).is_err() {
-                    break;
-                }
-            }
-            Ok(())
-        });
+        ScanRowOutStream::new(self.inner.clone(), stream).boxed()
+    }
 
-        builder.build()
+    pub(crate) fn files_from<T: Iterator<Item = RecordBatch> + Send + 'static>(
+        &self,
+        log_store: &dyn LogStore,
+        predicate: Option<PredicateRef>,
+        existing_version: Version,
+        existing_data: Box<T>,
+        existing_predicate: Option<PredicateRef>,
+    ) -> SendableRBStream {
+        let scan = match self.scan_builder().with_predicate(predicate).build() {
+            Ok(scan) => scan,
+            Err(err) => return Box::pin(once(ready(Err(err)))),
+        };
+
+        let engine = log_store.engine(None);
+        let stream = scan
+            .scan_metadata_from(engine, existing_version, existing_data, existing_predicate)
+            .map(|d| Ok(kernel_to_arrow(d?)?.scan_files));
+
+        ScanRowOutStream::new(self.inner.clone(), stream).boxed()
     }
 
     /// Get the commit infos in the snapshot
@@ -335,9 +334,10 @@ impl Snapshot {
                 let store = store.clone();
                 async move {
                     let commit_log_bytes = store.get(&meta.location).await?.bytes().await?;
-                    let reader = BufReader::new(Cursor::new(commit_log_bytes));
-                    for line in reader.lines() {
-                        let action: Action = serde_json::from_str(line?.as_str())?;
+
+                    for result in Deserializer::from_slice(&commit_log_bytes).into_iter::<Action>()
+                    {
+                        let action = result?;
                         if let Action::CommitInfo(commit_info) = action {
                             return Ok::<_, DeltaTableError>(Some(commit_info));
                         }
@@ -352,15 +352,33 @@ impl Snapshot {
     pub(crate) fn tombstones(
         &self,
         log_store: &dyn LogStore,
-    ) -> BoxStream<'_, DeltaResult<Remove>> {
+    ) -> BoxStream<'_, DeltaResult<TombstoneView>> {
         static TOMBSTONE_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
-            Arc::new(StructType::new(vec![
-                ActionType::Remove.schema_field().clone(),
-                ActionType::Sidecar.schema_field().clone(),
-            ]))
+            Arc::new(
+                StructType::try_new(vec![
+                    StructField::nullable("remove", Remove::to_data_type()),
+                    StructField::nullable("sidecar", Sidecar::to_data_type()),
+                ])
+                .expect("Failed to create a StructType somehow"),
+            )
+        });
+        static TOMBSTONE_EVALUATOR: LazyLock<Arc<dyn ExpressionEvaluator>> = LazyLock::new(|| {
+            let expression = Expression::struct_from(
+                Remove::to_schema()
+                    .fields()
+                    .map(|field| Expression::column(["remove", field.name()])),
+            )
+            .into();
+            ARROW_HANDLER
+                .new_expression_evaluator(
+                    TOMBSTONE_SCHEMA.clone(),
+                    expression,
+                    Remove::to_data_type(),
+                )
+                .expect("Failed to create tombstone evaluator")
         });
 
-        // TODO: which capacity to choose?
+        // TODO: which capacity to choose
         let mut builder = RecordBatchReceiverStreamBuilder::new(100);
         let tx = builder.tx();
 
@@ -370,21 +388,17 @@ impl Snapshot {
         let remove_data = match self.inner.log_segment().read_actions(
             engine.as_ref(),
             TOMBSTONE_SCHEMA.clone(),
-            TOMBSTONE_SCHEMA.clone(),
             None,
         ) {
             Ok(data) => data,
             Err(err) => {
-                return Box::pin(futures::stream::once(async {
-                    Err(DeltaTableError::KernelError(err))
-                }))
+                return Box::pin(once(ready(Err(DeltaTableError::KernelError(err)))));
             }
         };
 
         builder.spawn_blocking(move || {
             for res in remove_data {
-                let batch: RecordBatch =
-                    ArrowEngineData::try_from_engine_data(res?.actions)?.into();
+                let batch = ArrowEngineData::try_from_engine_data(res?.actions)?.into();
                 if tx.blocking_send(Ok(batch)).is_err() {
                     break;
                 }
@@ -394,10 +408,15 @@ impl Snapshot {
 
         builder
             .build()
-            .map(|maybe_batch| maybe_batch.and_then(|batch| read_removes(&batch)))
-            .map_ok(|removes| {
-                futures::stream::iter(removes.into_iter().map(Ok::<_, DeltaTableError>))
+            .map(|maybe_batch| {
+                maybe_batch.and_then(|batch| {
+                    let filtered = filter_record_batch(&batch, &is_not_null(batch.column(0))?)?;
+                    let tombstones = TOMBSTONE_EVALUATOR.evaluate_arrow(filtered)?;
+                    Ok((0..tombstones.num_rows())
+                        .map(move |idx| TombstoneView::new(tombstones.clone(), idx)))
+                })
             })
+            .map_ok(|removes| futures::stream::iter(removes.map(Ok::<_, DeltaTableError>)))
             .try_flatten()
             .boxed()
     }
@@ -413,9 +432,10 @@ impl Snapshot {
         // TODO: bundle operation id with log store ...
         let engine = log_store.engine(None);
         let inner = self.inner.clone();
-        let version = spawn_blocking(move || inner.get_app_id_version(&app_id, engine.as_ref()))
-            .await
-            .map_err(|e| DeltaTableError::GenericError { source: e.into() })??;
+        let version =
+            spawn_blocking_with_span(move || inner.get_app_id_version(&app_id, engine.as_ref()))
+                .await
+                .map_err(|e| DeltaTableError::GenericError { source: e.into() })??;
         Ok(version)
     }
 
@@ -432,9 +452,10 @@ impl Snapshot {
         let engine = log_store.engine(None);
         let inner = self.inner.clone();
         let domain = domain.to_string();
-        let metadata = spawn_blocking(move || inner.get_domain_metadata(&domain, engine.as_ref()))
-            .await
-            .map_err(|e| DeltaTableError::GenericError { source: e.into() })??;
+        let metadata =
+            spawn_blocking_with_span(move || inner.get_domain_metadata(&domain, engine.as_ref()))
+                .await
+                .map_err(|e| DeltaTableError::GenericError { source: e.into() })??;
         Ok(metadata)
     }
 }
@@ -444,7 +465,25 @@ impl Snapshot {
 pub struct EagerSnapshot {
     snapshot: Snapshot,
     // logical files in the snapshot
-    pub(crate) files: RecordBatch,
+    files: Vec<RecordBatch>,
+}
+
+pub(crate) async fn resolve_snapshot(
+    log_store: &dyn LogStore,
+    maybe_snapshot: Option<EagerSnapshot>,
+    require_files: bool,
+) -> DeltaResult<EagerSnapshot> {
+    if let Some(snapshot) = maybe_snapshot {
+        if require_files {
+            snapshot.with_files(log_store).await
+        } else {
+            Ok(snapshot)
+        }
+    } else {
+        let mut config = DeltaTableConfig::default();
+        config.require_files = require_files;
+        EagerSnapshot::try_new(log_store, config, None).await
+    }
 }
 
 impl EagerSnapshot {
@@ -455,31 +494,34 @@ impl EagerSnapshot {
         version: Option<i64>,
     ) -> DeltaResult<Self> {
         let snapshot = Snapshot::try_new(log_store, config.clone(), version).await?;
+        Self::try_new_with_snapshot(log_store, snapshot).await
+    }
 
-        let files = match config.require_files {
+    pub(crate) async fn try_new_with_snapshot(
+        log_store: &dyn LogStore,
+        snapshot: Snapshot,
+    ) -> DeltaResult<Self> {
+        let files = match snapshot.load_config().require_files {
             true => snapshot.files(log_store, None).try_collect().await?,
             false => vec![],
         };
-
-        let scan_row_schema = snapshot.inner.scan_row_parsed_schema_arrow()?;
-        let files = concat_batches(&scan_row_schema, &files)?;
-
         Ok(Self { snapshot, files })
     }
 
-    #[cfg(test)]
-    pub async fn new_test<'a>(
-        commits: impl IntoIterator<Item = &'a CommitData>,
-    ) -> DeltaResult<Self> {
-        let (snapshot, log_store) = Snapshot::new_test(commits).await?;
-        let files: Vec<_> = snapshot
-            .files(log_store.as_ref(), None)
-            .try_collect()
-            .await?;
-        let scan_row_schema = snapshot.inner.scan_row_parsed_schema_arrow()?;
-        let files = concat_batches(&scan_row_schema, &files)?;
+    pub(crate) async fn with_files(mut self, log_store: &dyn LogStore) -> DeltaResult<Self> {
+        if self.snapshot.config.require_files {
+            return Ok(self);
+        }
+        self.snapshot.config.require_files = true;
+        Self::try_new_with_snapshot(log_store, self.snapshot).await
+    }
 
-        Ok(Self { snapshot, files })
+    pub(crate) fn files(&self) -> DeltaResult<&[RecordBatch]> {
+        if self.snapshot.config.require_files {
+            Ok(&self.files)
+        } else {
+            Err(DeltaTableError::NotInitializedWithFiles("files".into()))
+        }
     }
 
     /// Update the snapshot to the given version
@@ -495,26 +537,17 @@ impl EagerSnapshot {
 
         self.snapshot.update(log_store, target_version).await?;
 
-        let scan = self.snapshot.inner.clone().scan_builder().build()?;
-        let engine = log_store.engine(None);
-        let current_files = self.files.clone();
-        let files: Vec<_> = spawn_blocking(move || {
-            scan.scan_metadata_from_arrow(
-                engine.as_ref(),
-                current_version,
-                Box::new(std::iter::once(current_files)),
+        self.files = self
+            .snapshot
+            .files_from(
+                log_store,
                 None,
-            )?
-            .map_ok(|s| s.scan_files)
+                current_version,
+                Box::new(std::mem::take(&mut self.files).into_iter()),
+                None,
+            )
             .try_collect()
-        })
-        .await
-        .map_err(|e| DeltaTableError::Generic(e.to_string()))??;
-
-        let files = concat_batches(&SCAN_ROW_ARROW_SCHEMA, &files)?;
-        let files = self.snapshot.inner.parse_stats_column(&files)?;
-
-        self.files = files;
+            .await?;
 
         Ok(())
     }
@@ -540,8 +573,13 @@ impl EagerSnapshot {
     }
 
     /// Get the table schema of the snapshot
-    pub fn schema(&self) -> &StructType {
+    pub fn schema(&self) -> KernelSchemaRef {
         self.snapshot.schema()
+    }
+
+    /// Get the table arrow schema of the snapshot
+    pub fn arrow_schema(&self) -> SchemaRef {
+        self.snapshot.arrow_schema()
     }
 
     /// Get the table metadata of the snapshot
@@ -578,83 +616,56 @@ impl EagerSnapshot {
     /// This function returns a stream of [`LogicalFileView`] objects,
     /// which represent the active files in the snapshot.
     ///
-    /// # Arguments
+    /// ## Parameters
     ///
     /// * `log_store` - A reference to a [`LogStore`] implementation.
     /// * `predicate` - An optional predicate to filter the files.
     ///
-    /// # Returns
+    /// ## Returns
     ///
     /// A stream of [`LogicalFileView`] objects.
-    pub fn files(
+    pub fn file_views(
         &self,
         log_store: &dyn LogStore,
         predicate: Option<PredicateRef>,
     ) -> BoxStream<'_, DeltaResult<LogicalFileView>> {
-        // TODO: the logic in this function would be more suitable as an async fn rather than
-        // a stream. However as we are moving from an eager to a cached snapshot, this should be
-        // a stream just like on the Snapshot. So we swallow the awkward error handling for now
-        // knowing that we will be able to clean this up soon (TM).
-        let data = if let Some(predicate) = predicate {
-            let scan = match self
-                .snapshot
-                .inner
-                .clone()
-                .scan_builder()
-                .with_predicate(predicate)
-                .build()
-            {
-                Ok(scan) => scan,
-                Err(err) => {
-                    return Box::pin(futures::stream::once(async {
-                        Err(DeltaTableError::KernelError(err))
-                    }))
-                }
-            };
-            let engine = log_store.engine(None);
-            let current_files = self.files.clone();
-            let current_version = self.version() as u64;
+        if !self.snapshot.load_config().require_files {
+            return Box::pin(once(ready(Err(DeltaTableError::NotInitializedWithFiles(
+                "file_views".into(),
+            )))));
+        }
 
-            // TODO: while we are always re-processing the cached files, we are confident that no IO
-            // is performed when processing, so for now we are not spawning this on a blocking thread.
-            // As we continue refactoring, we need to move this onto an actual stream.
-            let files_iter = match scan.scan_metadata_from_arrow(
-                engine.as_ref(),
-                current_version,
-                Box::new(std::iter::once(current_files)),
+        self.snapshot
+            .files_from(
+                log_store,
+                predicate,
+                self.version() as u64,
+                Box::new(self.files.clone().into_iter()),
                 None,
-            ) {
-                Ok(files_iter) => files_iter,
-                Err(err) => {
-                    return Box::pin(futures::stream::once(async {
-                        Err(DeltaTableError::KernelError(err))
-                    }))
-                }
-            };
+            )
+            .map_ok(|batch| {
+                futures::stream::iter(0..batch.num_rows()).map(move |idx| {
+                    Ok::<_, DeltaTableError>(LogicalFileView::new(batch.clone(), idx))
+                })
+            })
+            .try_flatten()
+            .boxed()
+    }
 
-            let files: Vec<_> = match files_iter.map_ok(|s| s.scan_files).try_collect() {
-                Ok(files) => files,
-                Err(err) => {
-                    return Box::pin(futures::stream::once(async {
-                        Err(DeltaTableError::KernelError(err))
-                    }))
-                }
-            };
-
-            let files = match concat_batches(&SCAN_ROW_ARROW_SCHEMA, &files)
-                .map_err(DeltaTableError::from)
-                .and_then(|batch| self.snapshot.inner.parse_stats_column(&batch))
-            {
-                Ok(files) => files,
-                Err(err) => return Box::pin(futures::stream::once(async { Err(err) })),
-            };
-
-            files
-        } else {
-            self.files.clone()
+    #[deprecated(since = "0.29.0", note = "Use `files` with kernel predicate instead.")]
+    pub fn file_views_by_partitions(
+        &self,
+        log_store: &dyn LogStore,
+        filters: &[PartitionFilter],
+    ) -> BoxStream<'_, DeltaResult<LogicalFileView>> {
+        if filters.is_empty() {
+            return self.file_views(log_store, None);
+        }
+        let predicate = match to_kernel_predicate(filters, self.snapshot.schema().as_ref()) {
+            Ok(predicate) => Arc::new(predicate),
+            Err(err) => return Box::pin(once(ready(Err(err)))),
         };
-        let iter = (0..data.num_rows()).map(move |i| Ok(LogicalFileView::new(data.clone(), i)));
-        futures::stream::iter(iter).boxed()
+        self.file_views(log_store, Some(predicate))
     }
 
     /// Iterate over all latest app transactions
@@ -677,6 +688,7 @@ impl EagerSnapshot {
     }
 }
 
+#[cfg(any(test, feature = "integration_test"))]
 pub(crate) fn partitions_schema(
     schema: &StructType,
     partition_columns: &[String],
@@ -684,7 +696,7 @@ pub(crate) fn partitions_schema(
     if partition_columns.is_empty() {
         return Ok(None);
     }
-    Ok(Some(StructType::new(
+    Ok(Some(StructType::try_new(
         partition_columns
             .iter()
             .map(|col| {
@@ -693,27 +705,80 @@ pub(crate) fn partitions_schema(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,
-    )))
+    )?))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use delta_kernel::schema::{DataType, StructField};
     use futures::TryStreamExt;
     use itertools::Itertools;
     use pretty_assertions::assert_eq;
 
-    // use super::log_segment::tests::{concurrent_checkpoint, test_log_segment};
+    // use super::log_segment::tests::{concurrent_checkpoint};
     // use super::replay::tests::test_log_replay;
     use super::*;
-    use crate::protocol::{DeltaOperation, SaveMode};
-    use crate::test_utils::{assert_batches_sorted_eq, ActionFactory, TestResult, TestTables};
+    use crate::{
+        kernel::transaction::CommitData,
+        test_utils::{assert_batches_sorted_eq, TestResult, TestTables},
+    };
+
+    impl Snapshot {
+        pub async fn new_test<'a>(
+            commits: impl IntoIterator<Item = &'a CommitData>,
+        ) -> DeltaResult<(Self, Arc<dyn LogStore>)> {
+            use crate::logstore::{commit_uri_from_version, default_logstore};
+            use object_store::memory::InMemory;
+            let store = Arc::new(InMemory::new());
+
+            for (idx, commit) in commits.into_iter().enumerate() {
+                let uri = commit_uri_from_version(idx as i64);
+                let data = commit.get_bytes()?;
+                store.put(&uri, data.into()).await?;
+            }
+
+            let table_url = url::Url::parse("memory:///").unwrap();
+
+            let log_store = default_logstore(
+                store.clone(),
+                store.clone(),
+                &table_url,
+                &Default::default(),
+            );
+
+            let engine = log_store.engine(None);
+            let snapshot = KernelSnapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+            let schema = snapshot
+                .table_configuration()
+                .schema()
+                .as_ref()
+                .try_into_arrow()?;
+
+            Ok((
+                Self {
+                    inner: snapshot,
+                    config: Default::default(),
+                    schema: Arc::new(schema),
+                },
+                log_store,
+            ))
+        }
+    }
+
+    impl EagerSnapshot {
+        pub async fn new_test<'a>(
+            commits: impl IntoIterator<Item = &'a CommitData>,
+        ) -> DeltaResult<Self> {
+            let (snapshot, log_store) = Snapshot::new_test(commits).await?;
+            let files: Vec<_> = snapshot
+                .files(log_store.as_ref(), None)
+                .try_collect()
+                .await?;
+            Ok(Self { snapshot, files })
+        }
+    }
 
     #[tokio::test]
     async fn test_snapshots() -> TestResult {
-        // test_log_segment().await?;
         test_snapshot().await?;
         test_eager_snapshot().await?;
 
@@ -738,7 +803,7 @@ mod tests {
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string)?;
-        assert_eq!(snapshot.schema(), &expected);
+        assert_eq!(snapshot.schema().as_ref(), &expected);
 
         let infos = snapshot
             .commit_infos(&log_store, None)
@@ -759,15 +824,15 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
         let expected = [
-            "+---------------------------------------------------------------------+------+------------------+-------+----------------+-----------------------+-------------------------------------------------------+",
-            "| path                                                                | size | modificationTime | stats | deletionVector | fileConstantValues    | stats_parsed                                          |",
-            "+---------------------------------------------------------------------+------+------------------+-------+----------------+-----------------------+-------------------------------------------------------+",
-            "| part-00000-2befed33-c358-4768-a43c-3eda0d2a499d-c000.snappy.parquet | 262  | 1587968626000    |       |                | {partitionValues: {}} | {numRecords: , nullCount: , minValues: , maxValues: } |",
-            "| part-00000-c1777d7d-89d9-4790-b38a-6ee7e24456b1-c000.snappy.parquet | 262  | 1587968602000    |       |                | {partitionValues: {}} | {numRecords: , nullCount: , minValues: , maxValues: } |",
-            "| part-00001-7891c33d-cedc-47c3-88a6-abcfb049d3b4-c000.snappy.parquet | 429  | 1587968602000    |       |                | {partitionValues: {}} | {numRecords: , nullCount: , minValues: , maxValues: } |",
-            "| part-00004-315835fe-fb44-4562-98f6-5e6cfa3ae45d-c000.snappy.parquet | 429  | 1587968602000    |       |                | {partitionValues: {}} | {numRecords: , nullCount: , minValues: , maxValues: } |",
-            "| part-00007-3a0e4727-de0d-41b6-81ef-5223cf40f025-c000.snappy.parquet | 429  | 1587968602000    |       |                | {partitionValues: {}} | {numRecords: , nullCount: , minValues: , maxValues: } |",
-            "+---------------------------------------------------------------------+------+------------------+-------+----------------+-----------------------+-------------------------------------------------------+",
+            "+---------------------------------------------------------------------+------+------------------+-------------------------------------------------------+----------------+-----------------------------------------------------------------------+",
+            "| path                                                                | size | modificationTime | stats_parsed                                          | deletionVector | fileConstantValues                                                    |",
+            "+---------------------------------------------------------------------+------+------------------+-------------------------------------------------------+----------------+-----------------------------------------------------------------------+",
+            "| part-00000-2befed33-c358-4768-a43c-3eda0d2a499d-c000.snappy.parquet | 262  | 1587968626000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "| part-00000-c1777d7d-89d9-4790-b38a-6ee7e24456b1-c000.snappy.parquet | 262  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "| part-00001-7891c33d-cedc-47c3-88a6-abcfb049d3b4-c000.snappy.parquet | 429  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "| part-00004-315835fe-fb44-4562-98f6-5e6cfa3ae45d-c000.snappy.parquet | 429  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "| part-00007-3a0e4727-de0d-41b6-81ef-5223cf40f025-c000.snappy.parquet | 429  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "+---------------------------------------------------------------------+------+------------------+-------------------------------------------------------+----------------+-----------------------------------------------------------------------+",
         ];
         assert_batches_sorted_eq!(expected, &batches);
 
@@ -797,71 +862,17 @@ mod tests {
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string)?;
-        assert_eq!(snapshot.schema(), &expected);
+        assert_eq!(snapshot.schema().as_ref(), &expected);
 
         let log_store = TestTables::Checkpoints.table_builder()?.build_storage()?;
 
         for version in 0..=12 {
             let snapshot =
                 EagerSnapshot::try_new(&log_store, Default::default(), Some(version)).await?;
-            let batches: Vec<_> = snapshot.files(&log_store, None).try_collect().await?;
+            let batches: Vec<_> = snapshot.file_views(&log_store, None).try_collect().await?;
             assert_eq!(batches.len(), version as usize);
         }
 
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_partition_schema() {
-        let schema = StructType::new(vec![
-            StructField::new("id", DataType::LONG, true),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("date", DataType::DATE, true),
-        ]);
-
-        let partition_columns = vec!["date".to_string()];
-        let metadata = ActionFactory::metadata(&schema, Some(&partition_columns), None);
-        let protocol = ActionFactory::protocol(None, None, None::<Vec<_>>, None::<Vec<_>>);
-
-        let commit_data = CommitData::new(
-            vec![
-                Action::Protocol(protocol.clone()),
-                Action::Metadata(metadata.clone()),
-            ],
-            DeltaOperation::Write {
-                mode: SaveMode::Append,
-                partition_by: Some(partition_columns),
-                predicate: None,
-            },
-            HashMap::new(),
-            vec![],
-        );
-
-        let (snapshot, _) = Snapshot::new_test(vec![&commit_data]).await.unwrap();
-
-        let expected = Arc::new(StructType::new(vec![StructField::new(
-            "date",
-            DataType::DATE,
-            true,
-        )]));
-        assert_eq!(snapshot.inner.partitions_schema().unwrap(), Some(expected));
-
-        let metadata = ActionFactory::metadata(&schema, None::<Vec<&str>>, None);
-        let commit_data = CommitData::new(
-            vec![
-                Action::Protocol(protocol.clone()),
-                Action::Metadata(metadata.clone()),
-            ],
-            DeltaOperation::Write {
-                mode: SaveMode::Append,
-                partition_by: None,
-                predicate: None,
-            },
-            HashMap::new(),
-            vec![],
-        );
-        let (snapshot, _) = Snapshot::new_test(vec![&commit_data]).await.unwrap();
-
-        assert_eq!(snapshot.inner.partitions_schema().unwrap(), None);
     }
 }

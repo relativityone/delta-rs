@@ -2,8 +2,8 @@
 //! The CDC module contains private tools for managing CDC files
 //!
 
+use crate::kernel::EagerSnapshot;
 use crate::table::config::TablePropertiesExt as _;
-use crate::table::state::DeltaTableState;
 use crate::DeltaResult;
 
 use datafusion::common::ScalarValue;
@@ -65,20 +65,20 @@ impl CDCTracker {
 /// > For Writer Version 7, all writers must respect the delta.enableChangeDataFeed configuration flag in
 /// > the metadata of the table only if the feature changeDataFeed exists in the table protocol's
 /// > writerFeatures.
-pub(crate) fn should_write_cdc(snapshot: &DeltaTableState) -> DeltaResult<bool> {
+pub(crate) fn should_write_cdc(snapshot: &EagerSnapshot) -> DeltaResult<bool> {
     if let Some(features) = &snapshot.protocol().writer_features() {
         // Features should only exist at writer version 7 but to avoid cases where
         // the Option<HashSet<T>> can get filled with an empty set, checking for the value
         // explicitly
         if snapshot.protocol().min_writer_version() == 7
-            && !features.contains(&delta_kernel::table_features::WriterFeature::ChangeDataFeed)
+            && !features.contains(&delta_kernel::table_features::TableFeature::ChangeDataFeed)
         {
             // If the writer feature has not been set, then the table should not have CDC written
             // to it. Otherwise fallback to the configured table configuration
             return Ok(false);
         }
     }
-    Ok(snapshot.table_config().enable_change_data_feed())
+    Ok(snapshot.table_properties().enable_change_data_feed())
 }
 
 #[cfg(test)]
@@ -96,7 +96,7 @@ mod tests {
     use arrow_schema::Schema;
     use datafusion::assert_batches_sorted_eq;
     use datafusion::datasource::{MemTable, TableProvider};
-    use delta_kernel::table_features::WriterFeature;
+    use delta_kernel::table_features::TableFeature;
 
     /// A simple test which validates primitive writer version 1 tables should
     /// not write Change Data Files
@@ -113,7 +113,8 @@ mod tests {
             .await
             .expect("Failed to make a table");
         table.load().await.expect("Failed to reload table");
-        let result = should_write_cdc(table.snapshot().unwrap()).expect("Failed to use table");
+        let result =
+            should_write_cdc(table.snapshot().unwrap().snapshot()).expect("Failed to use table");
         assert!(!result, "A default table should not create CDC files");
     }
 
@@ -137,7 +138,8 @@ mod tests {
             .expect("failed to make a version 4 table with EnableChangeDataFeed");
         table.load().await.expect("Failed to reload table");
 
-        let result = should_write_cdc(table.snapshot().unwrap()).expect("Failed to use table");
+        let result =
+            should_write_cdc(table.snapshot().unwrap().snapshot()).expect("Failed to use table");
         assert!(
             result,
             "A table with the EnableChangeDataFeed should create CDC files"
@@ -163,7 +165,8 @@ mod tests {
             .expect("failed to make a version 4 table with EnableChangeDataFeed");
         table.load().await.expect("Failed to reload table");
 
-        let result = should_write_cdc(table.snapshot().unwrap()).expect("Failed to use table");
+        let result =
+            should_write_cdc(table.snapshot().unwrap().snapshot()).expect("Failed to use table");
         assert!(
             !result,
             "A v7 table must not write CDC files unless the writer feature is set"
@@ -176,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn test_should_write_cdc_v7_table_with_writer_feature() {
         let protocol = ProtocolInner::new(1, 7)
-            .append_writer_features(vec![WriterFeature::ChangeDataFeed])
+            .append_writer_features(vec![TableFeature::ChangeDataFeed])
             .as_kernel();
         let actions = vec![Action::Protocol(protocol)];
         let mut table: DeltaTable = DeltaOps::new_in_memory()
@@ -193,7 +196,8 @@ mod tests {
             .expect("failed to make a version 4 table with EnableChangeDataFeed");
         table.load().await.expect("Failed to reload table");
 
-        let result = should_write_cdc(table.snapshot().unwrap()).expect("Failed to use table");
+        let result =
+            should_write_cdc(table.snapshot().unwrap().snapshot()).expect("Failed to use table");
         assert!(
             result,
             "A v7 table must not write CDC files unless the writer feature is set"

@@ -18,12 +18,12 @@
 //! ````
 
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::common::ScalarValue;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::provider_as_source;
 use datafusion::error::Result as DataFusionResult;
-use datafusion::execution::context::{SessionContext, SessionState};
-use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{
     lit, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode,
 };
@@ -46,14 +46,13 @@ use super::Operation;
 use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::delta_datafusion::logical::MetricObserver;
 use crate::delta_datafusion::physical::{find_metric_node, get_metric, MetricObserverExec};
-use crate::delta_datafusion::planner::DeltaPlanner;
 use crate::delta_datafusion::{
-    find_files, register_store, DataFusionMixins, DeltaScanConfigBuilder, DeltaSessionContext,
-    DeltaTableProvider,
+    create_session, find_files, register_store, session_state_from_session, DataFusionMixins,
+    DeltaScanConfigBuilder, DeltaTableProvider,
 };
 use crate::errors::DeltaResult;
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
-use crate::kernel::{Action, Add, Remove};
+use crate::kernel::{resolve_snapshot, Action, Add, EagerSnapshot, Remove};
 use crate::logstore::LogStoreRef;
 use crate::operations::write::execution::{write_execution_plan, write_execution_plan_cdc};
 use crate::operations::write::WriterStatsConfig;
@@ -68,20 +67,32 @@ const SOURCE_COUNT_METRIC: &str = "num_source_rows";
 
 /// Delete Records from the Delta Table.
 /// See this module's documentation for more information
+#[derive(Clone)]
 pub struct DeleteBuilder {
     /// Which records to delete
     predicate: Option<Expression>,
     /// A snapshot of the table's state
-    snapshot: DeltaTableState,
+    snapshot: Option<EagerSnapshot>,
     /// Delta object store for handling data files
     log_store: LogStoreRef,
     /// Datafusion session state relevant for executing the input plan
-    state: Option<SessionState>,
+    session: Option<Arc<dyn Session>>,
     /// Properties passed to underlying parquet writer for when files are rewritten
     writer_properties: Option<WriterProperties>,
     /// Commit properties and configuration
     commit_properties: CommitProperties,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
+}
+
+impl std::fmt::Debug for DeleteBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeleteBuilder")
+            .field("predicate", &self.predicate)
+            .field("snapshot", &self.snapshot)
+            .field("log_store", &self.log_store)
+            .field("commit_properties", &self.commit_properties)
+            .finish()
+    }
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -103,7 +114,7 @@ pub struct DeleteMetrics {
     pub rewrite_time_ms: u64,
 }
 
-impl super::Operation<()> for DeleteBuilder {
+impl super::Operation for DeleteBuilder {
     fn log_store(&self) -> &LogStoreRef {
         &self.log_store
     }
@@ -114,12 +125,12 @@ impl super::Operation<()> for DeleteBuilder {
 
 impl DeleteBuilder {
     /// Create a new [`DeleteBuilder`]
-    pub fn new(log_store: LogStoreRef, snapshot: DeltaTableState) -> Self {
+    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
         Self {
             predicate: None,
             snapshot,
             log_store,
-            state: None,
+            session: None,
             commit_properties: CommitProperties::default(),
             writer_properties: None,
             custom_execute_handler: None,
@@ -133,8 +144,8 @@ impl DeleteBuilder {
     }
 
     /// The Datafusion session state to use
-    pub fn with_session_state(mut self, state: SessionState) -> Self {
-        self.state = Some(state);
+    pub fn with_session_state(mut self, session: Arc<dyn Session>) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -157,8 +168,70 @@ impl DeleteBuilder {
     }
 }
 
+impl std::future::IntoFuture for DeleteBuilder {
+    type Output = DeltaResult<(DeltaTable, DeleteMetrics)>;
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let this = self;
+
+        Box::pin(async move {
+            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), true).await?;
+            PROTOCOL.check_append_only(&snapshot)?;
+            PROTOCOL.can_write_to(&snapshot)?;
+
+            let operation_id = this.get_operation_id();
+            this.pre_execute(operation_id).await?;
+
+            let session = this
+                .session
+                .unwrap_or_else(|| Arc::new(create_session().into_inner().state()));
+
+            register_store(this.log_store.clone(), session.runtime_env().as_ref());
+
+            let predicate = match this.predicate {
+                Some(predicate) => match predicate {
+                    Expression::DataFusion(expr) => Some(expr),
+                    Expression::String(s) => {
+                        Some(snapshot.parse_predicate_expression(s, session.as_ref())?)
+                    }
+                },
+                None => None,
+            };
+
+            let (new_snapshot, metrics) = execute(
+                predicate,
+                this.log_store.clone(),
+                snapshot,
+                session.as_ref(),
+                this.writer_properties,
+                this.commit_properties,
+                operation_id,
+                this.custom_execute_handler.as_ref(),
+            )
+            .await?;
+
+            Ok((
+                DeltaTable::new_with_state(
+                    this.log_store,
+                    DeltaTableState {
+                        snapshot: new_snapshot,
+                    },
+                ),
+                metrics,
+            ))
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
-struct DeleteMetricExtensionPlanner {}
+pub(crate) struct DeleteMetricExtensionPlanner {}
+
+impl DeleteMetricExtensionPlanner {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {})
+    }
+}
 
 #[async_trait]
 impl ExtensionPlanner for DeleteMetricExtensionPlanner {
@@ -189,9 +262,9 @@ impl ExtensionPlanner for DeleteMetricExtensionPlanner {
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_non_empty_expr(
-    snapshot: &DeltaTableState,
+    snapshot: &EagerSnapshot,
     log_store: LogStoreRef,
-    state: &SessionState,
+    session: &dyn Session,
     expression: &Expr,
     rewrite: &[Add],
     metrics: &mut DeleteMetrics,
@@ -204,17 +277,9 @@ async fn execute_non_empty_expr(
     let mut actions: Vec<Action> = Vec::new();
     let table_partition_cols = snapshot.metadata().partition_columns().clone();
 
-    let delete_planner = DeltaPlanner::<DeleteMetricExtensionPlanner> {
-        extension_planner: DeleteMetricExtensionPlanner {},
-    };
-
-    let state = SessionStateBuilder::new_from_existing(state.clone())
-        .with_query_planner(Arc::new(delete_planner))
-        .build();
-
     let scan_config = DeltaScanConfigBuilder::default()
         .with_file_column(false)
-        .with_schema(snapshot.input_schema()?)
+        .with_schema(snapshot.input_schema())
         .build(snapshot)?;
 
     let target_provider = Arc::new(
@@ -232,12 +297,10 @@ async fn execute_non_empty_expr(
         }),
     });
 
-    let df = DataFrame::new(state.clone(), source);
-
     let writer_stats_config = WriterStatsConfig::new(
-        snapshot.table_config().num_indexed_cols(),
+        snapshot.table_properties().num_indexed_cols(),
         snapshot
-            .table_config()
+            .table_properties()
             .data_skipping_stats_columns
             .as_ref()
             .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
@@ -246,20 +309,18 @@ async fn execute_non_empty_expr(
     if !partition_scan {
         // Apply the negation of the filter and rewrite files
         let negated_expression = Expr::Not(Box::new(Expr::IsTrue(Box::new(expression.clone()))));
-
-        let filter = df
-            .clone()
+        let filter = LogicalPlanBuilder::from(source.clone())
             .filter(negated_expression)?
-            .create_physical_plan()
-            .await?;
+            .build()?;
+        let filter = session.create_physical_plan(&filter).await?;
 
         let add_actions: Vec<Action> = write_execution_plan(
             Some(snapshot),
-            state.clone(),
+            session,
             filter.clone(),
             table_partition_cols.clone(),
             log_store.object_store(Some(operation_id)),
-            Some(snapshot.table_config().target_file_size().get() as usize),
+            Some(snapshot.table_properties().target_file_size().get() as usize),
             None,
             writer_properties.clone(),
             writer_stats_config.clone(),
@@ -283,7 +344,8 @@ async fn execute_non_empty_expr(
     if let Ok(true) = should_write_cdc(snapshot) {
         // Create CDC scan
         let change_type_lit = lit(ScalarValue::Utf8(Some("delete".to_string())));
-        let cdc_filter = df
+        let state = session_state_from_session(session)?;
+        let cdc_filter = DataFrame::new(state.clone(), source)
             .filter(expression.clone())?
             .with_column("_change_type", change_type_lit)?
             .create_physical_plan()
@@ -291,11 +353,11 @@ async fn execute_non_empty_expr(
 
         let cdc_actions = write_execution_plan_cdc(
             Some(snapshot),
-            state.clone(),
+            session,
             cdc_filter,
             table_partition_cols.clone(),
             log_store.object_store(Some(operation_id)),
-            Some(snapshot.table_config().target_file_size().get() as usize),
+            Some(snapshot.table_properties().target_file_size().get() as usize),
             None,
             writer_properties,
             writer_stats_config,
@@ -308,16 +370,17 @@ async fn execute_non_empty_expr(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(operation = "delete", version = snapshot.version(), table_uri = %log_store.root_uri()))]
 async fn execute(
     predicate: Option<Expr>,
     log_store: LogStoreRef,
-    snapshot: DeltaTableState,
-    state: SessionState,
+    snapshot: EagerSnapshot,
+    session: &dyn Session,
     writer_properties: Option<WriterProperties>,
     mut commit_properties: CommitProperties,
     operation_id: Uuid,
     handle: Option<&Arc<dyn CustomExecuteHandler>>,
-) -> DeltaResult<(DeltaTableState, DeleteMetrics)> {
+) -> DeltaResult<(EagerSnapshot, DeleteMetrics)> {
     if !&snapshot.load_config().require_files {
         return Err(DeltaTableError::NotInitializedWithFiles("DELETE".into()));
     }
@@ -326,7 +389,7 @@ async fn execute(
     let mut metrics = DeleteMetrics::default();
 
     let scan_start = Instant::now();
-    let candidates = find_files(&snapshot, log_store.clone(), &state, predicate.clone()).await?;
+    let candidates = find_files(&snapshot, log_store.clone(), session, predicate.clone()).await?;
     metrics.scan_time_ms = Instant::now().duration_since(scan_start).as_millis() as u64;
 
     let predicate = predicate.unwrap_or(lit(true));
@@ -336,7 +399,7 @@ async fn execute(
         let add = execute_non_empty_expr(
             &snapshot,
             log_store.clone(),
-            &state,
+            session,
             &predicate,
             &candidates.candidates,
             &mut metrics,
@@ -401,60 +464,7 @@ async fn execute(
     if let Some(handler) = handle {
         handler.post_execute(&log_store, operation_id).await?;
     }
-    Ok((commit.snapshot(), metrics))
-}
-
-impl std::future::IntoFuture for DeleteBuilder {
-    type Output = DeltaResult<(DeltaTable, DeleteMetrics)>;
-    type IntoFuture = BoxFuture<'static, Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        let this = self;
-
-        Box::pin(async move {
-            PROTOCOL.check_append_only(&this.snapshot.snapshot)?;
-            PROTOCOL.can_write_to(&this.snapshot.snapshot)?;
-
-            let operation_id = this.get_operation_id();
-            this.pre_execute(operation_id).await?;
-
-            let state = this.state.unwrap_or_else(|| {
-                let session: SessionContext = DeltaSessionContext::default().into();
-
-                // If a user provides their own their DF state then they must register the store themselves
-                register_store(this.log_store.clone(), session.runtime_env());
-
-                session.state()
-            });
-
-            let predicate = match this.predicate {
-                Some(predicate) => match predicate {
-                    Expression::DataFusion(expr) => Some(expr),
-                    Expression::String(s) => {
-                        Some(this.snapshot.parse_predicate_expression(s, &state)?)
-                    }
-                },
-                None => None,
-            };
-
-            let (new_snapshot, metrics) = execute(
-                predicate,
-                this.log_store.clone(),
-                this.snapshot,
-                state,
-                this.writer_properties,
-                this.commit_properties,
-                operation_id,
-                this.custom_execute_handler.as_ref(),
-            )
-            .await?;
-
-            Ok((
-                DeltaTable::new_with_state(this.log_store, new_snapshot),
-                metrics,
-            ))
-        })
-    }
+    Ok((commit.snapshot().snapshot, metrics))
 }
 
 #[cfg(test)]
@@ -552,14 +562,6 @@ mod tests {
         assert_eq!(metrics.num_deleted_rows, 0);
         assert_eq!(metrics.num_copied_rows, 0);
 
-        let commit_info = table.history(None).await.unwrap();
-        let last_commit = &commit_info[0];
-        let _extra_info = last_commit.info.clone();
-        // assert_eq!(
-        //     extra_info["operationMetrics"],
-        //     serde_json::to_value(&metrics).unwrap()
-        // );
-
         // Deletes with no changes to state must not commit
         let (table, metrics) = DeltaOps(table).delete().await.unwrap();
         assert_eq!(table.version(), Some(2));
@@ -643,8 +645,7 @@ mod tests {
         assert_eq!(metrics.num_deleted_rows, 1);
         assert_eq!(metrics.num_copied_rows, 3);
 
-        let commit_info = table.history(None).await.unwrap();
-        let last_commit = &commit_info[0];
+        let last_commit = table.last_commit().await.unwrap();
         let parameters = last_commit.operation_parameters.clone().unwrap();
         assert_eq!(parameters["predicate"], json!("value = 1"));
 

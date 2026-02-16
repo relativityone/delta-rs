@@ -331,6 +331,11 @@ class DeltaTable:
             ("z", "not in", ["a","b"])
             ```
         """
+        warnings.warn(
+            "Method `files` is deprecated, Use DeltaTable.file_uris(predicate) instead.",
+            category=DeprecationWarning,
+            stacklevel=2,
+        )
         return self._table.files(self._stringify_partition_values(partition_filters))
 
     def file_uris(
@@ -467,13 +472,17 @@ class DeltaTable:
         """
         return self._table.schema
 
+    @deprecated(
+        version="1.2.1",
+        reason="Not compatible with modern Delta features (e.g. shallow clones). Use `file_uris` instead.",
+    )
     def files_by_partitions(self, partition_filters: PartitionFilterType) -> list[str]:
         """
         Get the files for each partition
 
         """
         warnings.warn(
-            "files_by_partitions is deprecated, please use DeltaTable.files() instead.",
+            "Method `files_by_partitions` is deprecated, please use DeltaTable.file_uris() instead.",
             category=DeprecationWarning,
             stacklevel=2,
         )
@@ -497,6 +506,37 @@ class DeltaTable:
             the current ProtocolVersions registered in the transaction log
         """
         return ProtocolVersions(*self._table.protocol_versions())
+
+    def generate(self) -> None:
+        """
+        Generate symlink manifest for engines that cannot read native Delta Lake tables.
+
+        The generate supports the fairly simple "GENERATE" operation which produces a
+        [symlink_format_manifest](https://docs.delta.io/delta-utility/#generate-a-manifest-file) file
+        when needed for an external engine such as Presto or BigQuery.
+
+        The "symlink_format_manifest" is not something that has been well documented, but for
+        enon-partitioned tables this will generate a `_symlink_format_manifest/manifest` file next to
+        the `_delta_log`, for example:
+
+        ```
+        COVID-19_NYT
+        ├── _delta_log
+        │   ├── 00000000000000000000.crc
+        │   └── 00000000000000000000.json
+        ├── part-00000-a496f40c-e091-413a-85f9-b1b69d4b3b4e-c000.snappy.parquet
+        ├── part-00001-9d9d980b-c500-4f0b-bb96-771a515fbccc-c000.snappy.parquet
+        ├── part-00002-8826af84-73bd-49a6-a4b9-e39ffed9c15a-c000.snappy.parquet
+        ├── part-00003-539aff30-2349-4b0d-9726-c18630c6ad90-c000.snappy.parquet
+        ├── part-00004-1bb9c3e3-c5b0-4d60-8420-23261f58a5eb-c000.snappy.parquet
+        ├── part-00005-4d47f8ff-94db-4d32-806c-781a1cf123d2-c000.snappy.parquet
+        ├── part-00006-d0ec7722-b30c-4e1c-92cd-b4fe8d3bb954-c000.snappy.parquet
+        ├── part-00007-4582392f-9fc2-41b0-ba97-a74b3afc8239-c000.snappy.parquet
+        └── _symlink_format_manifest
+            └── manifest
+        ```
+        """
+        return self._table.generate()
 
     def history(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
@@ -527,6 +567,29 @@ class DeltaTable:
             commit["version"] = version
             history.append(commit)
         return history
+
+    def count(self) -> int:
+        """
+        Get the approximate row count based on file statistics added to the Delta table.
+
+        This requires that add actions have been added to the Delta table with
+        per-file statistics enabled. Because this is an optional field this
+        "count" will be less than or equal to the true row count of the table.
+        In order to get an exact number of rows a full table scan must happen
+
+        Returns:
+            The approximate number of rows for this specific table
+        """
+        total_rows = 0
+
+        for value in self.get_add_actions().column("num_records").to_pylist():
+            # Add action file statistics are optional and so while most modern
+            # tables are _likely_ to have this information it is not
+            # guaranteed.
+            if value is not None:
+                total_rows += value
+
+        return total_rows
 
     def vacuum(
         self,
@@ -858,6 +921,24 @@ class DeltaTable:
                     f"The table has set these reader features: {missing_features} "
                     "but these are not yet supported by the deltalake reader."
                 )
+
+        if (
+            table_protocol.reader_features
+            and "columnMapping" in table_protocol.reader_features
+        ):
+            raise DeltaProtocolError(
+                "The table requires reader feature 'columnMapping' "
+                "but this is not supported using pyarrow Datasets."
+            )
+
+        if (
+            table_protocol.reader_features
+            and "deletionVectors" in table_protocol.reader_features
+        ):
+            raise DeltaProtocolError(
+                "The table requires reader feature 'deletionVectors' "
+                "but this is not supported using pyarrow Datasets."
+            )
 
         import pyarrow
         import pyarrow.fs as pa_fs
@@ -1744,12 +1825,6 @@ class TableAlterer:
             {'delta.constraints.value_gt_5': 'value > 5'}
             ```
         """
-        if len(constraints.keys()) > 1:
-            raise ValueError(
-                """add_constraints is limited to a single constraint addition at once for now.
-                Please execute add_constraints multiple times with each time a different constraint."""
-            )
-
         self.table._table.add_constraints(
             constraints,
             commit_properties,
