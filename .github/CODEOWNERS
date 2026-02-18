@@ -1,3 +1,5 @@
+* @relativityone/distributed-data-ops @HawaiianSpork @alexwilcoxson-rel
+
 crates/core @roeap @rtyler @hntd187
 crates/aws @rtyler
 crates/lakefs @ion-elgreco
