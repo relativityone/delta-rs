@@ -24,18 +24,18 @@ delta_kernel = { version = "0.19.0", features = [
 
 
 # arrow
-arrow = { version = "57" }
-arrow-arith = { version = "57" }
-arrow-array = { version = "57", features = ["chrono-tz"] }
-arrow-buffer = { version = "57" }
-arrow-cast = { version = "57" }
-arrow-ipc = { version = "57" }
-arrow-json = { version = "57" }
-arrow-ord = { version = "57" }
-arrow-row = { version = "57" }
-arrow-schema = { version = "57" }
-arrow-select = { version = "57" }
-object_store = { version = "0.12.1" }
+arrow = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37"}
+arrow-arith = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow-array = { version = "57.2.0", features = ["chrono-tz"], git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow-buffer = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow-cast = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow-ipc = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow-json = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow-ord = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow-row = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow-schema = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow-select = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+object_store = { version = "0.13.1", git = "https://github.com/apache/arrow-rs-object-store", rev = "50e1229a97225fa1d330cd925187e2b302d25676" }
 parquet = { version = "57" }
 
 # datafusion 52.1
@@ -156,3 +156,6 @@ inherits = "release"
 opt-level = 3
 codegen-units = 1
 lto = "thin"
+
+[patch.crates-io]
+object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "50e1229a97225fa1d330cd925187e2b302d25676" }

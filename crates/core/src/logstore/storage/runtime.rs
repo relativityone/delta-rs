@@ -8,10 +8,7 @@ use futures::TryFutureExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use object_store::path::Path;
-use object_store::{
-    Error as ObjectStoreError, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore,
-    PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
-};
+use object_store::{CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult};
 use object_store::{MultipartUpload, PutMultipartOptions};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder as RuntimeBuilder, Handle, Runtime};
@@ -185,14 +182,6 @@ impl<T: ObjectStore + Clone> std::fmt::Display for DeltaIOStorageBackend<T> {
 
 #[async_trait::async_trait]
 impl<T: ObjectStore + Clone> ObjectStore for DeltaIOStorageBackend<T> {
-    async fn put(&self, location: &Path, bytes: PutPayload) -> ObjectStoreResult<PutResult> {
-        self.spawn_io_rt(
-            |store, path| store.put(path, bytes),
-            &self.inner,
-            location.clone(),
-        )
-        .await
-    }
 
     async fn put_opts(
         &self,
@@ -208,9 +197,17 @@ impl<T: ObjectStore + Clone> ObjectStore for DeltaIOStorageBackend<T> {
         .await
     }
 
-    async fn get(&self, location: &Path) -> ObjectStoreResult<GetResult> {
-        self.spawn_io_rt(|store, path| store.get(path), &self.inner, location.clone())
-            .await
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.spawn_io_rt(
+            |store, path| store.put_multipart_opts(path, options),
+            &self.inner,
+            location.clone(),
+        )
+        .await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
@@ -222,31 +219,8 @@ impl<T: ObjectStore + Clone> ObjectStore for DeltaIOStorageBackend<T> {
         .await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
-        self.spawn_io_rt(
-            |store, path| store.get_range(path, range),
-            &self.inner,
-            location.clone(),
-        )
-        .await
-    }
-
-    async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
-        self.spawn_io_rt(
-            |store, path| store.head(path),
-            &self.inner,
-            location.clone(),
-        )
-        .await
-    }
-
-    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        self.spawn_io_rt(
-            |store, path| store.delete(path),
-            &self.inner,
-            location.clone(),
-        )
-        .await
+    fn delete_stream(&self, locations: BoxStream<'static, ObjectStoreResult<Path>>) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -265,56 +239,8 @@ impl<T: ObjectStore + Clone> ObjectStore for DeltaIOStorageBackend<T> {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.spawn_io_rt_from_to(
-            |store, from_path, to_path| store.copy(from_path, to_path),
-            &self.inner,
-            from.clone(),
-            to.clone(),
-        )
-        .await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.spawn_io_rt_from_to(
-            |store, from_path, to_path| store.copy_if_not_exists(from_path, to_path),
-            &self.inner,
-            from.clone(),
-            to.clone(),
-        )
-        .await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.spawn_io_rt_from_to(
-            |store, from_path, to_path| store.rename_if_not_exists(from_path, to_path),
-            &self.inner,
-            from.clone(),
-            to.clone(),
-        )
-        .await
-    }
-
-    async fn put_multipart(&self, location: &Path) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.spawn_io_rt(
-            |store, path| store.put_multipart(path),
-            &self.inner,
-            location.clone(),
-        )
-        .await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        options: PutMultipartOptions,
-    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.spawn_io_rt(
-            |store, path| store.put_multipart_opts(path, options),
-            &self.inner,
-            location.clone(),
-        )
-        .await
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
+        self.copy_opts(from, to, options).await
     }
 }
 
