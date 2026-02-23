@@ -24,19 +24,19 @@ delta_kernel = { version = "0.19.0", features = [
 
 
 # arrow
-arrow = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37"}
-arrow-arith = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
-arrow-array = { version = "57.2.0", features = ["chrono-tz"], git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
-arrow-buffer = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
-arrow-cast = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
-arrow-ipc = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
-arrow-json = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
-arrow-ord = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
-arrow-row = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
-arrow-schema = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
-arrow-select = { version = "57.2.0", git = "https://github.com/relativityone/arrow-rs", rev = "cd7b05512f592ab33f9d662579ee2ad97541ea37" }
+arrow = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa"}
+arrow-arith = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-array = { version = "57.3.0", features = ["chrono-tz"], git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-buffer = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-cast = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-ipc = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-json = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-ord = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-row = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-schema = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-select = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+parquet = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa"}
 object_store = { version = "0.13.1", git = "https://github.com/apache/arrow-rs-object-store", rev = "50e1229a97225fa1d330cd925187e2b302d25676" }
-parquet = { version = "57" }
 
 # datafusion 52.1
 datafusion = { version = "52.1.0" }
