@@ -2,8 +2,7 @@
 //! For each conflicting record (e.g., matching on primary key), only the source record is kept.
 //! All non-conflicting records are appended.
 
-use crate::delta_datafusion::DeltaSessionConfig;
-use crate::delta_datafusion::{register_store};
+use crate::delta_datafusion::{DeltaSessionConfig, DeltaSessionExt};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{Action, EagerSnapshot, Remove};
 use crate::logstore::LogStoreRef;
@@ -121,7 +120,7 @@ impl std::future::IntoFuture for UpsertBuilder {
             Self::validate_table_state(&self.snapshot)?;
 
             // Get or create session state
-            let state = self.get_or_create_session_state();
+            let state = self.get_or_create_session_state()?;
 
             // Execute the upsert operation
             let (actions, mut metrics) = self.execute_upsert(state).await?;
@@ -151,15 +150,16 @@ impl UpsertBuilder {
     }
 
     /// Get the existing session state or create a new one
-    fn get_or_create_session_state(&self) -> Arc<SessionState> {
+    fn get_or_create_session_state(&self) -> DeltaResult<Arc<SessionState>> {
         match &self.state {
-            Some(state) => Arc::clone(state),
+            Some(state) => Ok(Arc::clone(state)),
             None => {
                 let config: datafusion::execution::context::SessionConfig =
                     DeltaSessionConfig::default().into();
                 let session = SessionContext::new_with_config(config);
-                register_store(self.log_store.clone(), &session.runtime_env());
-                Arc::new(session.state())
+                let state = session.state();
+                state.ensure_log_store_registered(self.log_store.as_ref())?;
+                Ok(Arc::new(state))
             }
         }
     }
