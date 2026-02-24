@@ -4,7 +4,7 @@ use deltalake_core::operations::upsert::UpsertMetrics;
 use deltalake_core::{DeltaResult, DeltaTable};
 use deltalake_core::datafusion::prelude::DataFrame;
 
-use crate::merge::MergePerfParams;
+use crate::merge::{apply_insert_projection, apply_update_projection, MergePerfParams};
 
 /// Join keys used to match records in the web_returns dataset
 pub const UPSERT_JOIN_KEYS: &[&str] = &["wr_item_sk", "wr_order_number"];
@@ -30,13 +30,36 @@ impl fmt::Display for UpsertTestCase {
 }
 
 impl UpsertTestCase {
-    pub async fn execute(
+    pub async fn execute_with_upsert(
         &self,
         source: DataFrame,
         table: DeltaTable,
     ) -> DeltaResult<(DeltaTable, UpsertMetrics)> {
         let join_keys = UPSERT_JOIN_KEYS.iter().map(|s| s.to_string()).collect();
         table.upsert(source, join_keys).await
+    }
+
+    pub async fn execute_with_merge(&self, source: DataFrame, table: DeltaTable) -> DeltaResult<(DeltaTable, UpsertMetrics)> {
+        let join_keys = UPSERT_JOIN_KEYS.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let predicate = join_keys
+            .iter()
+            .map(|k| format!("source.{k} = target.{k}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        table
+            .merge(source, predicate)
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_matched_update(crate::merge::apply_update_projection)?
+            .when_not_matched_insert(crate::merge::apply_insert_projection)?
+            .await.map(|(table, metrics)| (table, UpsertMetrics {
+            num_added_files: metrics.num_target_files_added,
+            num_removed_files: metrics.num_target_files_removed,
+            num_conflicting_records: metrics.num_target_rows_updated,
+            write_time_ms: metrics.rewrite_time_ms,
+            scan_time_ms: metrics.scan_time_ms,
+            execution_time_ms: metrics.execution_time_ms,
+        }))
     }
 }
 

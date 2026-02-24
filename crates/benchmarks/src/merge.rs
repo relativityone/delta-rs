@@ -307,7 +307,7 @@ pub fn merge_test_cases() -> Vec<&'static MergeTestCase> {
     all_cases_iter().collect()
 }
 
-fn apply_insert_projection(builder: InsertBuilder) -> InsertBuilder {
+pub(crate) fn apply_insert_projection(builder: InsertBuilder) -> InsertBuilder {
     builder
         .set("wr_returned_date_sk", "source.wr_returned_date_sk")
         .set("wr_returned_time_sk", "source.wr_returned_time_sk")
@@ -338,7 +338,7 @@ fn apply_insert_projection(builder: InsertBuilder) -> InsertBuilder {
         .set("wr_net_loss", "source.wr_net_loss")
 }
 
-fn apply_update_projection(builder: UpdateBuilder) -> UpdateBuilder {
+pub(crate) fn apply_update_projection(builder: UpdateBuilder) -> UpdateBuilder {
     builder
         .update("wr_returned_date_sk", "source.wr_returned_date_sk")
         .update("wr_returned_time_sk", "source.wr_returned_time_sk")
@@ -460,8 +460,8 @@ pub async fn prepare_source_and_table(
         .filter(expr_fn::random().lt_eq(lit(params.sample_matched_rows)))?;
 
     let rand = cast(
-        expr_fn::random() * lit(u32::MAX),
-        arrow::datatypes::DataType::Int64,
+        expr_fn::random() * lit(i32::MAX),
+        arrow::datatypes::DataType::Int32,
     );
     let not_matched = source
         .filter(expr_fn::random().lt_eq(lit(params.sample_not_matched_rows)))?
