@@ -231,6 +231,8 @@ class RawDeltaTable:
         post_commithook_properties: PostCommitHookProperties | None,
         safe_cast: bool,
         streamed_exec: bool,
+        max_spill_size: int | None,
+        max_temp_directory_size: int | None,
     ) -> PyMergeBuilder: ...
     def merge_execute(self, merge_builder: PyMergeBuilder) -> str: ...
     def get_active_partitions(
@@ -266,7 +268,7 @@ class RawDeltaTable:
         commit_properties: CommitProperties | None,
         post_commithook_properties: PostCommitHookProperties | None,
     ) -> None: ...
-    def __datafusion_table_provider__(self) -> Any: ...
+    def __datafusion_table_provider__(self, session: Any | None = None) -> Any: ...
     def write(
         self,
         data: RecordBatchReader,

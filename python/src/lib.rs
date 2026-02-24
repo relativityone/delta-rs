@@ -31,6 +31,7 @@ use deltalake::delta_datafusion::{
 use deltalake::arrow::array::{
     ArrayRef, BooleanBuilder, LargeStringBuilder, ListBuilder, RecordBatchIterator,
 };
+use deltalake::delta_datafusion::create_session_state_with_spill_config;
 use deltalake::errors::DeltaTableError;
 use deltalake::kernel::scalars::ScalarExt;
 use deltalake::kernel::transaction::{CommitBuilder, CommitProperties, TableReference};
@@ -42,7 +43,7 @@ use deltalake::logstore::LogStoreRef;
 use deltalake::logstore::{IORuntime, ObjectStoreRef};
 use deltalake::operations::CustomExecuteHandler;
 use deltalake::operations::convert_to_delta::{ConvertToDeltaBuilder, PartitionStrategy};
-use deltalake::operations::optimize::{OptimizeType, create_session_state_for_optimize};
+use deltalake::operations::optimize::OptimizeType;
 use deltalake::operations::update_table_metadata::TableMetadataUpdate;
 use deltalake::operations::vacuum::VacuumMode;
 use deltalake::operations::write::WriteBuilder;
@@ -68,7 +69,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::future::IntoFuture;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time;
 use uuid::Uuid;
 
@@ -121,6 +122,7 @@ struct RawDeltaTableMetaData {
 type StringVec = Vec<String>;
 
 const REQUIRED_DATAFUSION_PY_MAJOR: u32 = 52;
+static FALLBACK_TASK_CTX_PROVIDER: OnceLock<Arc<SessionContext>> = OnceLock::new();
 
 /// Maximum number of file-level deletion vector entries per Arrow RecordBatch when returning
 /// results from `DeltaTable.deletion_vectors()`.  Each entry is one (filepath, selection_vector)
@@ -187,6 +189,55 @@ fn datafusion_python_version(py: Python<'_>) -> Option<String> {
         .ok()?
         .extract()
         .ok()
+}
+
+fn datafusion_task_context_provider_from_session(
+    session: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<datafusion_ffi::execution::FFI_TaskContextProvider>> {
+    let Some(session) = session else {
+        return Ok(None);
+    };
+
+    if !session.hasattr("__datafusion_task_context_provider__")? {
+        return Ok(None);
+    }
+
+    let task_ctx_provider_obj = session
+        .getattr("__datafusion_task_context_provider__")?
+        .call0()?;
+    let task_ctx_provider = task_ctx_provider_obj.downcast::<PyCapsule>()?;
+
+    let capsule_name = task_ctx_provider.name()?;
+    if capsule_name.is_none() {
+        return Err(PyValueError::new_err(
+            "Expected datafusion_task_context_provider PyCapsule to have name set.",
+        ));
+    }
+    let capsule_name = capsule_name.unwrap().to_str().map_err(|err| {
+        PyValueError::new_err(format!(
+            "Invalid datafusion_task_context_provider capsule name: {err}"
+        ))
+    })?;
+    if capsule_name != "datafusion_task_context_provider" {
+        return Err(PyValueError::new_err(format!(
+            "Expected PyCapsule name datafusion_task_context_provider, got {capsule_name}",
+        )));
+    }
+
+    // SAFETY: `task_ctx_provider` is a `PyCapsule` (downcast above) and we verify its
+    // capsule name is exactly `datafusion_task_context_provider` before taking a typed
+    // reference, matching the producer side DataFusion capsule contract.
+    let task_ctx_provider = unsafe {
+        task_ctx_provider.reference::<datafusion_ffi::execution::FFI_TaskContextProvider>()
+    };
+    Ok(Some(task_ctx_provider.clone()))
+}
+
+fn fallback_datafusion_task_context_provider() -> datafusion_ffi::execution::FFI_TaskContextProvider
+{
+    let ctx = FALLBACK_TASK_CTX_PROVIDER.get_or_init(|| Arc::new(SessionContext::new()));
+    let task_ctx_provider = Arc::clone(ctx) as Arc<dyn datafusion_execution::TaskContextProvider>;
+    datafusion_ffi::execution::FFI_TaskContextProvider::from(&task_ctx_provider)
 }
 
 /// Segmented impl for RawDeltaTable to avoid these methods being exposed via the pymethods macro.
@@ -711,7 +762,7 @@ impl RawDeltaTable {
 
             if max_spill_size.is_some() || max_temp_directory_size.is_some() {
                 let session =
-                    create_session_state_for_optimize(max_spill_size, max_temp_directory_size);
+                    create_session_state_with_spill_config(max_spill_size, max_temp_directory_size);
                 cmd = cmd.with_session_state(Arc::new(session));
             }
 
@@ -788,7 +839,7 @@ impl RawDeltaTable {
 
             if max_spill_size.is_some() || max_temp_directory_size.is_some() {
                 let session =
-                    create_session_state_for_optimize(max_spill_size, max_temp_directory_size);
+                    create_session_state_with_spill_config(max_spill_size, max_temp_directory_size);
                 cmd = cmd.with_session_state(Arc::new(session));
             }
 
@@ -1098,6 +1149,8 @@ impl RawDeltaTable {
         merge_schema = false,
         safe_cast = false,
         streamed_exec = false,
+        max_spill_size = None,
+        max_temp_directory_size = None,
         writer_properties = None,
         post_commithook_properties = None,
         commit_properties = None,
@@ -1113,6 +1166,8 @@ impl RawDeltaTable {
         merge_schema: bool,
         safe_cast: bool,
         streamed_exec: bool,
+        max_spill_size: Option<usize>,
+        max_temp_directory_size: Option<u64>,
         writer_properties: Option<PyWriterProperties>,
         post_commithook_properties: Option<PyPostCommitHookProperties>,
         commit_properties: Option<PyCommitProperties>,
@@ -1136,6 +1191,8 @@ impl RawDeltaTable {
                 merge_schema,
                 safe_cast,
                 streamed_exec,
+                max_spill_size,
+                max_temp_directory_size,
                 writer_properties,
                 post_commithook_properties,
                 commit_properties,
@@ -1979,9 +2036,11 @@ impl RawDeltaTable {
         Ok(())
     }
 
+    #[pyo3(signature = (session=None))]
     fn __datafusion_table_provider__<'py>(
         &self,
         py: Python<'py>,
+        session: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
         let found_version = datafusion_python_version(py);
         let found_major = found_version
@@ -2020,9 +2079,8 @@ Install datafusion=={required}.* (matching major) to use DataFusion SessionConte
             TokioDeltaScan::new(scan, handle.clone())
                 .with_object_store(object_store_url, object_store),
         ) as Arc<dyn TableProvider>;
-        let ctx =
-            Arc::new(SessionContext::new()) as Arc<dyn datafusion_execution::TaskContextProvider>;
-        let task_ctx_provider = datafusion_ffi::execution::FFI_TaskContextProvider::from(&ctx);
+        let task_ctx_provider = datafusion_task_context_provider_from_session(session.as_ref())?
+            .unwrap_or_else(fallback_datafusion_task_context_provider);
         let provider = FFI_TableProvider::new(
             tokio_scan,
             false,
