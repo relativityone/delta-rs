@@ -24,19 +24,19 @@ delta_kernel = { version = "0.19.0", features = [
 
 
 # arrow
-arrow = { version = "57" }
-arrow-arith = { version = "57" }
-arrow-array = { version = "57", features = ["chrono-tz"] }
-arrow-buffer = { version = "57" }
-arrow-cast = { version = "57" }
-arrow-ipc = { version = "57" }
-arrow-json = { version = "57" }
-arrow-ord = { version = "57" }
-arrow-row = { version = "57" }
-arrow-schema = { version = "57" }
-arrow-select = { version = "57" }
-object_store = { version = "0.12.1" }
-parquet = { version = "57" }
+arrow = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa"}
+arrow-arith = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-array = { version = "57.3.0", features = ["chrono-tz"], git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-buffer = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-cast = { version = "57.3.0", features = ["prettyprint"], git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-ipc = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-json = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-ord = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-row = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-schema = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-select = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+parquet = { version = "57.3.0", git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa"}
+object_store = { version = "0.13.1", git = "https://github.com/apache/arrow-rs-object-store", rev = "50e1229a97225fa1d330cd925187e2b302d25676" }
 
 # datafusion 52.1
 datafusion = { version = "52.1.0" }
@@ -156,3 +156,18 @@ inherits = "release"
 opt-level = 3
 codegen-units = 1
 lto = "thin"
+
+[patch.crates-io]
+arrow = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-arith = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-array = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-buffer = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-cast = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-ipc = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-json = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-ord = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-row = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-schema = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+arrow-select = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+parquet = { git = "https://github.com/relativityone/arrow-rs", rev = "188169039365dd2fcc2be0738e07a68cb86e26fa" }
+object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "50e1229a97225fa1d330cd925187e2b302d25676" }
