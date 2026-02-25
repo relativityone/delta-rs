@@ -95,9 +95,277 @@ use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
+use crate::operations::merge::upsert::UpsertBuilder;
 
 mod barrier;
 mod filter;
+mod upsert;
+
+
+// ---------------------------------------------------------------------------
+// Upsert-path detection
+// ---------------------------------------------------------------------------
+
+/// Attempt to detect whether the merge configuration matches "upsert" semantics:
+///   - Exactly one `when_matched_update` clause with **no** predicate.
+///   - Exactly one `when_not_matched_insert` clause with **no** predicate.
+///   - **No** `when_not_matched_by_source_*` clauses.
+///   - No schema-evolution (`merge_schema == false`).
+///   - The join predicate is a pure AND-conjunction of `source.col = target.col`
+///     equalities — which lets us extract the join keys needed by `UpsertBuilder`.
+///   - The update operation maps **every** column in `schema_fields` to itself
+///     from the source side (full-row replacement), ensuring that routing through
+///     `UpsertBuilder` is semantically equivalent.
+///
+/// Returns the bare join-key column names (without any alias prefix) if the
+/// conditions are met, or `None` if the merge cannot be routed through the
+/// faster upsert path.
+fn try_detect_upsert_join_keys(
+    predicate: &Expression,
+    match_operations: &[MergeOperationConfig],
+    not_match_operations: &[MergeOperationConfig],
+    not_match_source_operations: &[MergeOperationConfig],
+    merge_schema: bool,
+    source_alias: &Option<String>,
+    target_alias: &Option<String>,
+    schema_fields: &[String],
+) -> Option<Vec<String>> {
+    // 1. No schema evolution.
+    if merge_schema {
+        return None;
+    }
+
+    // 2. No "not-matched-by-source" operations (those require reading every target row).
+    if !not_match_source_operations.is_empty() {
+        return None;
+    }
+
+    // 3. Exactly one unconditional match-update.
+    if match_operations.len() != 1 {
+        return None;
+    }
+    let match_op = &match_operations[0];
+    if match_op.predicate.is_some() {
+        return None;
+    }
+    if !matches!(match_op.r#type, OperationType::Update) {
+        return None;
+    }
+
+    // 4. Exactly one unconditional not-match-insert.
+    if not_match_operations.len() != 1 {
+        return None;
+    }
+    let not_match_op = &not_match_operations[0];
+    if not_match_op.predicate.is_some() {
+        return None;
+    }
+    if !matches!(not_match_op.r#type, OperationType::Insert) {
+        return None;
+    }
+
+    // 5. The update must be a full-row replacement: every schema field must have
+    //    an entry in the operations HashMap.  Partial updates cannot be safely
+    //    routed through UpsertBuilder (which always replaces whole rows).
+    if !operations_cover_all_columns(&match_op.operations, schema_fields) {
+        return None;
+    }
+
+    // 6. The predicate must be a conjunction of `source.col = target.col` equalities.
+    let src_alias: Option<&str> = source_alias.as_deref();
+    let tgt_alias: Option<&str> = target_alias.as_deref();
+
+    match predicate {
+        Expression::DataFusion(expr) => {
+            extract_join_keys_from_expr(expr, src_alias, tgt_alias)
+        }
+        Expression::String(s) => {
+            extract_join_keys_from_str(s, src_alias, tgt_alias)
+        }
+    }
+}
+
+/// Check that the `operations` HashMap contains an entry for every field name
+/// in `schema_fields`.  The HashMap keys are `Column` values whose `name`
+/// fields (ignoring any table qualifier) must cover all column names.
+fn operations_cover_all_columns(
+    operations: &HashMap<Column, Expression>,
+    schema_fields: &[String],
+) -> bool {
+    if operations.len() < schema_fields.len() {
+        return false;
+    }
+    let op_names: std::collections::HashSet<&str> =
+        operations.keys().map(|c| c.name.as_str()).collect();
+    schema_fields.iter().all(|f| op_names.contains(f.as_str()))
+}
+
+/// Walk a DataFusion `Expr` tree and collect column names from a conjunction of
+/// `source.col = target.col` (or `target.col = source.col`) equalities.
+///
+/// Returns `None` if the expression contains anything other than such equalities
+/// and AND-nodes.
+fn extract_join_keys_from_expr(
+    expr: &Expr,
+    source_alias: Option<&str>,
+    target_alias: Option<&str>,
+) -> Option<Vec<String>> {
+    use datafusion::logical_expr::Operator;
+    match expr {
+        Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr { left, op, right }) => {
+            match op {
+                Operator::And => {
+                    let mut keys = extract_join_keys_from_expr(left, source_alias, target_alias)?;
+                    keys.extend(extract_join_keys_from_expr(right, source_alias, target_alias)?);
+                    Some(keys)
+                }
+                Operator::Eq => {
+                    // Check both `source.col = target.col` and `target.col = source.col`.
+                    if let Some(key) = eq_columns_to_join_key(left, right, source_alias, target_alias) {
+                        Some(vec![key])
+                    } else if let Some(key) = eq_columns_to_join_key(right, left, source_alias, target_alias) {
+                        Some(vec![key])
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Given two `Expr`s that are being compared with `=`, check whether `lhs`
+/// refers to the source alias and `rhs` refers to the target alias.
+/// Returns the bare column name if so.
+fn eq_columns_to_join_key(
+    source_side: &Expr,
+    target_side: &Expr,
+    source_alias: Option<&str>,
+    target_alias: Option<&str>,
+) -> Option<String> {
+    let src_col = expr_to_bare_column(source_side, source_alias)?;
+    let tgt_col = expr_to_bare_column(target_side, target_alias)?;
+    // The column names on both sides must match (they refer to the same join key).
+    if src_col == tgt_col {
+        Some(src_col)
+    } else {
+        None
+    }
+}
+
+/// Extract the bare (un-qualified) column name from an `Expr::Column`, optionally
+/// requiring that the qualifier matches `expected_alias`.
+fn expr_to_bare_column(expr: &Expr, expected_alias: Option<&str>) -> Option<String> {
+    if let Expr::Column(col) = expr {
+        match (&col.relation, expected_alias) {
+            // Qualifier present and matches the expected alias.
+            (Some(rel), Some(alias)) if rel.table() == alias => Some(col.name.to_string()),
+            // No qualifier required and none present.
+            (None, None) => Some(col.name.to_string()),
+            // Allow a column without a qualifier when we have an alias — this can
+            // happen when the user passes a `col("source.col")` style string that
+            // DataFusion parses as a qualified column.
+            (None, Some(_)) => Some(col.name.to_string()),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Parse a SQL predicate string and extract join key column names from a
+/// conjunction of `source.col = target.col` equalities.
+///
+/// This is a best-effort string-based parser that handles the common patterns
+/// produced by the Python helpers and benchmark code.
+fn extract_join_keys_from_str(
+    predicate: &str,
+    source_alias: Option<&str>,
+    target_alias: Option<&str>,
+) -> Option<Vec<String>> {
+    // Normalise: lower-case, remove excess whitespace.
+    let normalised = predicate.trim().to_lowercase();
+
+    // Split on " and " — if the predicate is more complex we fall back to `None`.
+    let clauses: Vec<&str> = normalised.split(" and ").collect();
+
+    let mut keys = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let clause = clause.trim();
+        // Each clause must be  `<alias>.<col> = <alias>.<col>`
+        let parts: Vec<&str> = clause.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let lhs = parts[0].trim();
+        let rhs = parts[1].trim();
+
+        if let Some(key) =
+            str_eq_to_join_key(lhs, rhs, source_alias, target_alias)
+                .or_else(|| str_eq_to_join_key(rhs, lhs, source_alias, target_alias))
+        {
+            keys.push(key);
+        } else {
+            return None;
+        }
+    }
+
+    if keys.is_empty() {
+        None
+    } else {
+        Some(keys)
+    }
+}
+
+/// Check whether `lhs_str` refers to the source alias and `rhs_str` to the
+/// target alias (both of the form `alias.column`).  Returns the bare column
+/// name when the pattern matches.
+fn str_eq_to_join_key(
+    lhs_str: &str,
+    rhs_str: &str,
+    source_alias: Option<&str>,
+    target_alias: Option<&str>,
+) -> Option<String> {
+    let src_col = str_parse_qualified_col(lhs_str, source_alias)?;
+    let tgt_col = str_parse_qualified_col(rhs_str, target_alias)?;
+    if src_col == tgt_col {
+        Some(src_col)
+    } else {
+        None
+    }
+}
+
+/// Parse a `alias.column` or bare `column` string, returning just the column
+/// name if `expected_alias` matches (or is `None`).
+fn str_parse_qualified_col(s: &str, expected_alias: Option<&str>) -> Option<String> {
+    // Strip backtick quoting that the Python layer sometimes produces.
+    let s = s.trim().trim_matches('`');
+    match expected_alias {
+        Some(alias) => {
+            let prefix = format!("{}.", alias);
+            let prefix_bt = format!("{}.`", alias);
+            if let Some(rest) = s.strip_prefix(prefix.as_str()) {
+                Some(rest.trim_matches('`').to_string())
+            } else if let Some(rest) = s.strip_prefix(prefix_bt.as_str()) {
+                Some(rest.trim_end_matches('`').to_string())
+            } else {
+                None
+            }
+        }
+        None => {
+            // Bare column — must not contain a dot.
+            if s.contains('.') {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 const SOURCE_COLUMN: &str = "__delta_rs_source";
 const TARGET_COLUMN: &str = "__delta_rs_target";
@@ -1556,6 +1824,70 @@ impl std::future::IntoFuture for MergeBuilder {
                 resolve_snapshot(&this.log_store, this.snapshot.clone(), true, None).await?;
 
             PROTOCOL.can_write_to(&snapshot)?;
+
+            // -------------------------------------------------------------------
+            // Fast path: if the merge expresses pure upsert semantics, delegate
+            // to the specialised `UpsertBuilder` for significant performance
+            // gains (file-level conflict detection + anti-join write path
+            // instead of a full outer join over the entire table).
+            // -------------------------------------------------------------------
+            let schema_field_names: Vec<String> = snapshot
+                .schema()
+                .fields()
+                .map(|f| f.name().to_string())
+                .collect();
+
+            if let Some(join_keys) = try_detect_upsert_join_keys(
+                &this.predicate,
+                &this.match_operations,
+                &this.not_match_operations,
+                &this.not_match_source_operations,
+                this.merge_schema,
+                &this.source_alias,
+                &this.target_alias,
+                &schema_field_names,
+            ) {
+                debug!("merge: detected upsert semantics — routing through UpsertBuilder");
+
+                let operation_id = this.get_operation_id();
+                this.pre_execute(operation_id).await?;
+
+                let mut upsert = UpsertBuilder::new(
+                    this.log_store.clone(),
+                    snapshot,
+                    join_keys,
+                    this.source,
+                )
+                    .with_commit_properties(this.commit_properties);
+
+                if let Some(wp) = this.writer_properties {
+                    upsert = upsert.with_writer_properties(wp);
+                }
+
+                let (table, upsert_metrics) = upsert.await?;
+
+                if let Some(handler) = this.custom_execute_handler {
+                    handler.post_execute(&this.log_store, operation_id).await?;
+                }
+
+                // Map UpsertMetrics → MergeMetrics.
+                // num_conflicting_records = rows that were replaced (updated).
+                let merge_metrics = MergeMetrics {
+                    num_target_rows_updated: upsert_metrics.num_conflicting_records,
+                    num_target_files_added: upsert_metrics.num_added_files,
+                    num_target_files_removed: upsert_metrics.num_removed_files,
+                    execution_time_ms: upsert_metrics.execution_time_ms,
+                    scan_time_ms: upsert_metrics.scan_time_ms,
+                    rewrite_time_ms: upsert_metrics.write_time_ms,
+                    ..Default::default()
+                };
+
+                return Ok((table, merge_metrics));
+            }
+
+            // -------------------------------------------------------------------
+            // General merge path.
+            // -------------------------------------------------------------------
 
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
