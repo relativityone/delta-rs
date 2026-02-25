@@ -460,8 +460,8 @@ pub async fn prepare_source_and_table(
         .filter(expr_fn::random().lt_eq(lit(params.sample_matched_rows)))?;
 
     let rand = cast(
-        expr_fn::random() * lit(u32::MAX),
-        arrow::datatypes::DataType::Int64,
+        expr_fn::random() * lit(i32::MAX),
+        arrow::datatypes::DataType::Int32,
     );
     let not_matched = source
         .filter(expr_fn::random().lt_eq(lit(params.sample_not_matched_rows)))?
