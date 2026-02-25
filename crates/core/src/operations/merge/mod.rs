@@ -95,12 +95,12 @@ use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
-use crate::operations::merge::upsert::UpsertBuilder;
 
 mod barrier;
 mod filter;
 mod upsert;
 
+use upsert::UpsertBuilder;
 
 // ---------------------------------------------------------------------------
 // Upsert-path detection
@@ -1825,12 +1825,8 @@ impl std::future::IntoFuture for MergeBuilder {
 
             PROTOCOL.can_write_to(&snapshot)?;
 
-            // -------------------------------------------------------------------
-            // Fast path: if the merge expresses pure upsert semantics, delegate
-            // to the specialised `UpsertBuilder` for significant performance
-            // gains (file-level conflict detection + anti-join write path
-            // instead of a full outer join over the entire table).
-            // -------------------------------------------------------------------
+            // Fast path: pure upsert semantics — file-level conflict detection +
+            // anti-join write path instead of a full outer join over the entire table.
             let schema_field_names: Vec<String> = snapshot
                 .schema()
                 .fields()
@@ -1847,7 +1843,7 @@ impl std::future::IntoFuture for MergeBuilder {
                 &this.target_alias,
                 &schema_field_names,
             ) {
-                debug!("merge: detected upsert semantics — routing through UpsertBuilder");
+                debug!("merge: detected upsert semantics — routing through upsert fast-path");
 
                 let operation_id = this.get_operation_id();
                 this.pre_execute(operation_id).await?;
@@ -1858,20 +1854,19 @@ impl std::future::IntoFuture for MergeBuilder {
                     join_keys,
                     this.source,
                 )
-                    .with_commit_properties(this.commit_properties);
+                .with_commit_properties(this.commit_properties);
 
                 if let Some(wp) = this.writer_properties {
                     upsert = upsert.with_writer_properties(wp);
                 }
 
-                let (table, upsert_metrics) = upsert.await?;
+                let (table, upsert_metrics) = upsert.execute().await?;
 
                 if let Some(handler) = this.custom_execute_handler {
                     handler.post_execute(&this.log_store, operation_id).await?;
                 }
 
-                // Map UpsertMetrics → MergeMetrics.
-                // num_conflicting_records = rows that were replaced (updated).
+                // Map upsert metrics → merge metrics.
                 let merge_metrics = MergeMetrics {
                     num_target_rows_updated: upsert_metrics.num_conflicting_records,
                     num_target_files_added: upsert_metrics.num_added_files,
@@ -1885,9 +1880,7 @@ impl std::future::IntoFuture for MergeBuilder {
                 return Ok((table, merge_metrics));
             }
 
-            // -------------------------------------------------------------------
             // General merge path.
-            // -------------------------------------------------------------------
 
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
@@ -4856,5 +4849,230 @@ mod tests {
         "| D  | 100   | 2021-02-02 | insert       | 1               |",
         "+----+-------+------------+--------------+-----------------+",
         ], &batches }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Upsert fast-path tests
+    //
+    // The upsert path is triggered when merge expresses pure upsert semantics:
+    //   - exactly one unconditional `when_matched_update` covering all columns,
+    //   - exactly one unconditional `when_not_matched_insert`,
+    //   - no `when_not_matched_by_source_*` clauses,
+    //   - no schema evolution,
+    //   - join predicate is a conjunction of source.col = target.col equalities.
+    // ---------------------------------------------------------------------------
+
+    /// Build the standard source DataFrame for upsert tests.
+    /// Schema matches the default test table: id (Utf8), value (Int32), modified (Utf8).
+    fn upsert_source(rows: Vec<(&str, i32, &str)>) -> DataFrame {
+        let ctx = SessionContext::new();
+        let schema = get_arrow_schema(&None);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(
+                    rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow::array::Int32Array::from(
+                    rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow::array::StringArray::from(
+                    rows.iter().map(|(_, _, m)| *m).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        ctx.read_batch(batch).unwrap()
+    }
+
+    /// Helper that performs an upsert-style merge (the canonical pattern that
+    /// triggers the fast-path) and returns the result.
+    async fn do_upsert(
+        table: DeltaTable,
+        source: DataFrame,
+    ) -> (DeltaTable, MergeMetrics) {
+        table
+            .merge(source, col("target.id").eq(col("source.id")))
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_matched_update(|u| {
+                u.update("id", col("source.id"))
+                    .update("value", col("source.value"))
+                    .update("modified", col("source.modified"))
+            })
+            .unwrap()
+            .when_not_matched_insert(|i| {
+                i.set("id", col("source.id"))
+                    .set("value", col("source.value"))
+                    .set("modified", col("source.modified"))
+            })
+            .unwrap()
+            .await
+            .unwrap()
+    }
+
+    /// Pure-insert upsert: source rows have no overlap with target — the fast-path
+    /// should detect zero conflicts and append the source without touching existing files.
+    #[tokio::test]
+    async fn test_upsert_no_conflicts() {
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(None).await;
+        let table = write_data(table, &schema).await;
+        // Target: A=1, B=10, C=10, D=100
+
+        // Source contains entirely new keys → no conflicts expected
+        let source = upsert_source(vec![("E", 50, "2024-01-01"), ("F", 60, "2024-01-01")]);
+        let (table, metrics) = do_upsert(table, source).await;
+
+        // Fast-path: no files should have been removed
+        assert_eq!(metrics.num_target_files_removed, 0);
+        assert!(metrics.num_target_files_added >= 1);
+        // All source rows are treated as inserts; no updates
+        assert_eq!(metrics.num_target_rows_updated, 0);
+
+        let expected = vec![
+            "+----+-------+------------+",
+            "| id | value | modified   |",
+            "+----+-------+------------+",
+            "| A  | 1     | 2021-02-01 |",
+            "| B  | 10    | 2021-02-01 |",
+            "| C  | 10    | 2021-02-02 |",
+            "| D  | 100   | 2021-02-02 |",
+            "| E  | 50    | 2024-01-01 |",
+            "| F  | 60    | 2024-01-01 |",
+            "+----+-------+------------+",
+        ];
+        let actual = get_data(&table).await;
+        assert_batches_sorted_eq!(&expected, &actual);
+    }
+
+    /// Conflict upsert: source overlaps with target — existing rows are replaced,
+    /// new rows are appended; the file containing the conflicting target row is removed.
+    #[tokio::test]
+    async fn test_upsert_with_conflicts() {
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(None).await;
+        let table = write_data(table, &schema).await;
+        // Target: A=1, B=10, C=10, D=100
+
+        // B conflicts (updated value), X is new
+        let source = upsert_source(vec![("B", 99, "2024-01-01"), ("X", 77, "2024-01-01")]);
+        let (table, metrics) = do_upsert(table, source).await;
+
+        assert!(metrics.num_target_files_removed >= 1, "conflicting file should be removed");
+        assert!(metrics.num_target_files_added >= 1);
+        assert_eq!(metrics.num_target_rows_updated, 1); // B replaced
+
+        let expected = vec![
+            "+----+-------+------------+",
+            "| id | value | modified   |",
+            "+----+-------+------------+",
+            "| A  | 1     | 2021-02-01 |",
+            "| B  | 99    | 2024-01-01 |",
+            "| C  | 10    | 2021-02-02 |",
+            "| D  | 100   | 2021-02-02 |",
+            "| X  | 77    | 2024-01-01 |",
+            "+----+-------+------------+",
+        ];
+        let actual = get_data(&table).await;
+        assert_batches_sorted_eq!(&expected, &actual);
+    }
+
+    /// All-conflict upsert: every source row matches an existing target row.
+    /// The entire target file is rewritten with updated values; no new rows appear.
+    #[tokio::test]
+    async fn test_upsert_all_rows_updated() {
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(None).await;
+        let table = write_data(table, &schema).await;
+        // Target: A=1, B=10, C=10, D=100 — all in one file
+
+        // Replace all four rows
+        let source = upsert_source(vec![
+            ("A", 11, "2024-01-01"),
+            ("B", 22, "2024-01-01"),
+            ("C", 33, "2024-01-01"),
+            ("D", 44, "2024-01-01"),
+        ]);
+        let (table, metrics) = do_upsert(table, source).await;
+
+        assert!(metrics.num_target_files_removed >= 1);
+        assert!(metrics.num_target_files_added >= 1);
+        assert_eq!(metrics.num_target_rows_updated, 4);
+
+        let expected = vec![
+            "+----+-------+------------+",
+            "| id | value | modified   |",
+            "+----+-------+------------+",
+            "| A  | 11    | 2024-01-01 |",
+            "| B  | 22    | 2024-01-01 |",
+            "| C  | 33    | 2024-01-01 |",
+            "| D  | 44    | 2024-01-01 |",
+            "+----+-------+------------+",
+        ];
+        let actual = get_data(&table).await;
+        assert_batches_sorted_eq!(&expected, &actual);
+    }
+
+    /// Partitioned-table upsert: the fast-path must respect partition boundaries.
+    /// A conflict in partition "2021-02-01" must not cause files in "2021-02-02"
+    /// to be rewritten.
+    #[tokio::test]
+    async fn test_upsert_partitioned_table() {
+        let table = setup_table(Some(vec!["modified"])).await;
+
+        // Write two batches so each partition lands in its own file
+        let schema = get_arrow_schema(&None);
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["A", "B"])),
+                Arc::new(arrow::array::Int32Array::from(vec![1, 10])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "2021-02-01",
+                    "2021-02-01",
+                ])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["C", "D"])),
+                Arc::new(arrow::array::Int32Array::from(vec![10, 100])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "2021-02-02",
+                    "2021-02-02",
+                ])),
+            ],
+        )
+        .unwrap();
+        let table = table
+            .write(vec![batch1, batch2])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+
+        // Update A (partition 2021-02-01) and add Z (partition 2021-02-01)
+        // C and D in partition 2021-02-02 must be untouched
+        let source = upsert_source(vec![("A", 55, "2021-02-01"), ("Z", 99, "2021-02-01")]);
+        let (table, metrics) = do_upsert(table, source).await;
+
+        // Only the 2021-02-01 file should be affected
+        assert_eq!(metrics.num_target_rows_updated, 1); // A replaced
+
+        let expected = vec![
+            "+----+-------+------------+",
+            "| id | value | modified   |",
+            "+----+-------+------------+",
+            "| A  | 55    | 2021-02-01 |",
+            "| B  | 10    | 2021-02-01 |",
+            "| C  | 10    | 2021-02-02 |",
+            "| D  | 100   | 2021-02-02 |",
+            "| Z  | 99    | 2021-02-01 |",
+            "+----+-------+------------+",
+        ];
+        let actual = get_data(&table).await;
+        assert_batches_sorted_eq!(&expected, &actual);
     }
 }

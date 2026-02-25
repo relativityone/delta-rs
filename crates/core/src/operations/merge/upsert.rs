@@ -1,5 +1,5 @@
-//! Upsert data from a source DataFrame into a target Delta Table.
-//! For each conflicting record (e.g., matching on primary key), only the source record is kept.
+//! Upsert fast-path, invoked exclusively from within the merge operation.
+//! For each conflicting record (matching on join keys), only the source record is kept.
 //! All non-conflicting records are appended.
 
 use crate::delta_datafusion::{DeltaSessionConfig, DeltaSessionExt};
@@ -25,16 +25,18 @@ use std::ops::Not;
 use std::sync::Arc;
 use std::time::Instant;
 
+const FILE_PATH_COLUMN: &str = "__delta_rs_path";
+
 #[derive(Default, Debug, Clone, Serialize)]
-/// Metrics collected during the Upsert operation
-pub struct UpsertMetrics {
+/// Metrics collected during the upsert fast-path execution.
+pub(super) struct UpsertMetrics {
     /// Number of files added to the target table
     pub num_added_files: usize,
     /// Number of files removed from the target table
     pub num_removed_files: usize,
-    /// Number of conflicting records detected
+    /// Number of conflicting records detected (rows replaced/updated)
     pub num_conflicting_records: usize,
-    /// Time taken to execute the entire operation
+    /// Time taken to write the output files
     pub write_time_ms: u64,
     /// Time taken to scan the target files
     pub scan_time_ms: u64,
@@ -42,8 +44,8 @@ pub struct UpsertMetrics {
     pub execution_time_ms: u64,
 }
 
-/// Builder for configuring and executing an upsert operation
-pub struct UpsertBuilder {
+/// Builder for the upsert fast-path — only constructed and consumed by the merge operation.
+pub(super) struct UpsertBuilder {
     /// The join keys used to identify conflicts between source and target records
     join_keys: Vec<String>,
     /// The source data to upsert into the target table
@@ -61,8 +63,8 @@ pub struct UpsertBuilder {
 }
 
 impl UpsertBuilder {
-    /// Create a new UpsertBuilder with required parameters
-    pub fn new(
+    /// Create a new [`UpsertBuilder`] with required parameters.
+    pub(super) fn new(
         log_store: LogStoreRef,
         snapshot: EagerSnapshot,
         join_keys: Vec<String>,
@@ -79,74 +81,34 @@ impl UpsertBuilder {
         }
     }
 
-    /// Set the Datafusion session state to use for plan execution
-    pub fn with_session_state(mut self, state: SessionState) -> Self {
-        self.state = Some(Arc::from(state));
-        self
-    }
-
-    /// Set the Parquet writer properties for output files
-    pub fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
+    /// Set the Parquet writer properties for output files.
+    pub(super) fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
         self.writer_properties = Some(writer_properties);
         self
     }
 
-    /// Set additional commit properties for the transaction
-    pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
+    /// Set additional commit properties for the transaction.
+    pub(super) fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
         self.commit_properties = commit_properties;
         self
     }
-}
 
-impl super::Operation for UpsertBuilder {
-    fn log_store(&self) -> &LogStoreRef {
-        &self.log_store
-    }
+    /// Execute the upsert fast-path and return the updated table together with metrics.
+    pub(super) async fn execute(self) -> DeltaResult<(DeltaTable, UpsertMetrics)> {
+        let exec_start = Instant::now();
 
-    fn get_custom_execute_handler(&self) -> Option<Arc<dyn super::CustomExecuteHandler>> {
-        None
-    }
-}
+        PROTOCOL.can_write_to(&self.snapshot)?;
 
-impl std::future::IntoFuture for UpsertBuilder {
-    type Output = DeltaResult<(DeltaTable, UpsertMetrics)>;
-    type IntoFuture = futures::future::BoxFuture<'static, Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            let exec_start = Instant::now();
-
-            // Validate table state and protocol
-            Self::validate_table_state(&self.snapshot)?;
-
-            // Get or create session state
-            let state = self.get_or_create_session_state()?;
-
-            // Execute the upsert operation
-            let (actions, mut metrics) = self.execute_upsert(state).await?;
-
-            // Commit the changes
-            let table = self.commit_changes(actions, &metrics).await?;
-
-            metrics.execution_time_ms =
-                Instant::now().duration_since(exec_start).as_millis() as u64;
-            Ok((table, metrics))
-        })
-    }
-}
-
-const FILE_PATH_COLUMN: &'static str = "__delta_rs_path";
-
-impl UpsertBuilder {
-    /// Validate that the table is in a valid state for upsert operations
-    fn validate_table_state(snapshot: &EagerSnapshot) -> DeltaResult<()> {
-        PROTOCOL.can_write_to(snapshot)?;
-
-        if !snapshot.load_config().require_files {
+        if !self.snapshot.load_config().require_files {
             return Err(DeltaTableError::NotInitializedWithFiles("UPSERT".into()));
         }
 
-        Ok(())
+        let state = self.get_or_create_session_state()?;
+        let (actions, mut metrics) = self.execute_upsert(state).await?;
+        let table = self.commit_changes(actions, &metrics).await?;
+
+        metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
+        Ok((table, metrics))
     }
 
     /// Get the existing session state or create a new one
@@ -704,528 +666,4 @@ impl UpsertBuilder {
         ))
     }
 }
-//
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use crate::DeltaOps;
-//     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-//     use arrow_schema::{ArrowError, DataType, Field, Schema as ArrowSchema};
-//     use datafusion::prelude::SessionContext;
-//     use delta_kernel::schema::{PrimitiveType, StructField};
-//     use std::sync::Arc;
-//
-//     fn create_batch(data: Vec<ArrayRef>) -> Result<RecordBatch, ArrowError> {
-//         RecordBatch::try_new(
-//             Arc::new(ArrowSchema::new(vec![
-//                 Field::new("date", DataType::Utf8, false),
-//                 Field::new("id", DataType::Utf8, false),
-//                 Field::new("value", DataType::Int32, false),
-//                 Field::new("workspace_id", DataType::Int32, false),
-//             ])),
-//             data,
-//         )
-//     }
-//
-//     async fn setup_with_batches(
-//         batches: Vec<RecordBatch>,
-//         partition_columns: Vec<String>,
-//     ) -> DeltaTable {
-//         let schema = vec![
-//             StructField::new(
-//                 "date".to_string(),
-//                 delta_kernel::schema::DataType::Primitive(PrimitiveType::String),
-//                 false,
-//             ),
-//             StructField::new(
-//                 "id".to_string(),
-//                 delta_kernel::schema::DataType::Primitive(PrimitiveType::String),
-//                 false,
-//             ),
-//             StructField::new(
-//                 "value".to_string(),
-//                 delta_kernel::schema::DataType::Primitive(PrimitiveType::Integer),
-//                 false,
-//             ),
-//             StructField::new(
-//                 "workspace_id".to_string(),
-//                 delta_kernel::schema::DataType::Primitive(PrimitiveType::Integer),
-//                 false,
-//             ),
-//         ];
-//
-//         let table = DeltaOps::new_in_memory()
-//             .create()
-//             .with_columns(schema)
-//             .with_partition_columns(partition_columns)
-//             .await
-//             .unwrap();
-//
-//         let mut tbl = table.clone();
-//         for batch in batches {
-//             tbl = DeltaOps(tbl).write([batch]).await.unwrap();
-//         }
-//         tbl
-//     }
-//
-//     async fn setup_test_table() -> DeltaTable {
-//         // Add some initial data
-//         let batch_1 = create_batch(vec![
-//             Arc::new(StringArray::from(vec![
-//                 "2023-01-01",
-//                 "2023-01-01",
-//                 "2023-01-01",
-//             ])),
-//             Arc::new(StringArray::from(vec!["A", "B", "C"])),
-//             Arc::new(Int32Array::from(vec![1, 2, 3])),
-//             Arc::new(Int32Array::from(vec![1, 1, 1])),
-//         ])
-//             .unwrap();
-//
-//         // Add some initial data, second batch
-//         let batch_2 = create_batch(vec![
-//             Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-01"])),
-//             Arc::new(StringArray::from(vec!["D", "E"])),
-//             Arc::new(Int32Array::from(vec![4, 5])),
-//             Arc::new(Int32Array::from(vec![1, 1])),
-//         ])
-//             .unwrap();
-//
-//         setup_with_batches(vec![batch_1, batch_2], vec!["workspace_id".to_string()]).await
-//     }
-//
-//     async fn get_table_data(table: DeltaTable) -> Vec<RecordBatch> {
-//         use datafusion::physical_plan::common::collect;
-//         let (_table, stream) = table.scan_table().await.unwrap();
-//         collect(stream).await.unwrap()
-//     }
-//
-//     fn table_rows(data: &Vec<RecordBatch>) -> usize {
-//         data.iter().map(|batch| batch.num_rows()).sum()
-//     }
-//
-//     fn assert_record(data: &Vec<RecordBatch>, expected: (&str, i32)) {
-//         // Check that the expected record was updated correctly
-//         let (expected_id, expected_value) = expected;
-//         let mut found = false;
-//         for batch in data {
-//             let id_col = batch.column_by_name("id").unwrap();
-//             let value_col = batch.column_by_name("value").unwrap();
-//
-//             // Handle both StringArray and StringViewArray
-//             let id_array: Vec<String> = if let Some(arr) = id_col.as_any().downcast_ref::<StringArray>() {
-//                 arr.iter().flatten().map(|s| s.to_string()).collect()
-//             } else if let Some(arr) = id_col.as_any().downcast_ref::<arrow::array::StringViewArray>() {
-//                 arr.iter().flatten().map(|s| s.to_string()).collect()
-//             } else {
-//                 panic!("Unexpected id column type");
-//             };
-//
-//             let value_array = value_col.as_any().downcast_ref::<Int32Array>().unwrap();
-//
-//             for i in 0..batch.num_rows() {
-//                 if id_array[i] == expected_id {
-//                     found = true;
-//                     assert_eq!(
-//                         value_array.value(i),
-//                         expected_value,
-//                         "Record value mismatch for id '{}'",
-//                         expected_id
-//                     );
-//                 }
-//             }
-//         }
-//         assert!(found, "Expected record '{}' not found", expected_id);
-//     }
-//
-//     #[tokio::test]
-//     async fn test_upsert_no_conflicts() {
-//         let table = setup_test_table().await;
-//         let input_rows = table_rows(&get_table_data(table.clone()).await);
-//
-//         let source_batch = create_batch(vec![
-//             Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-01"])),
-//             Arc::new(StringArray::from(vec!["F", "G"])),
-//             Arc::new(Int32Array::from(vec![6, 7])),
-//             Arc::new(Int32Array::from(vec![1, 1])),
-//         ])
-//             .unwrap();
-//
-//         let ctx = SessionContext::new();
-//         let source_df = ctx.read_batches(vec![source_batch]).unwrap();
-//
-//         let (updated_table, metrics) = table
-//             .upsert(
-//                 source_df,
-//                 vec!["workspace_id".to_string(), "id".to_string()],
-//             )
-//             .await
-//             .unwrap();
-//
-//         // Should have added files but no removed files since no conflicts
-//         assert_eq!(metrics.num_added_files, 1);
-//         assert_eq!(metrics.num_removed_files, 0);
-//         assert_eq!(metrics.num_conflicting_records, 0); // No conflicts
-//
-//         // Should have 6 total rows (4 original + 2 new)
-//         let data = get_table_data(updated_table).await;
-//         let total_rows: usize = table_rows(&data);
-//         assert_eq!(total_rows, input_rows + 2); // Original 5 rows + 2 new rows
-//     }
-//
-//     #[tokio::test]
-//     async fn test_upsert_with_conflicts() {
-//         let table = setup_test_table().await;
-//         let input_rows = table_rows(&get_table_data(table.clone()).await);
-//
-//         let source_batch = create_batch(vec![
-//             Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-01"])),
-//             Arc::new(StringArray::from(vec!["A", "F"])), // "A" conflicts, "F" doesn't
-//             Arc::new(Int32Array::from(vec![10, 6])),     // Updated value for A
-//             Arc::new(Int32Array::from(vec![1, 1])),      // Same workspace as existing A
-//         ])
-//             .unwrap();
-//
-//         let ctx = SessionContext::new();
-//         let source_df = ctx.read_batches(vec![source_batch]).unwrap();
-//
-//         let (updated_table, metrics) = table
-//             .upsert(
-//                 source_df,
-//                 vec!["workspace_id".to_string(), "id".to_string()],
-//             )
-//             .await
-//             .unwrap();
-//
-//         // Should have both added and removed files due to conflicts
-//         // Note: The write operation may combine files into a single output file
-//         assert!(metrics.num_added_files >= 1);
-//         assert_eq!(metrics.num_removed_files, 1);
-//         assert_eq!(metrics.num_conflicting_records, 1); // Only "A" conflicts
-//
-//         // Should still have some rows
-//         let data = get_table_data(updated_table).await;
-//         let total_rows: usize = table_rows(&data);
-//
-//         assert_record(&data, ("A", 10)); // Updated record
-//         assert_record(&data, ("F", 6)); // New record
-//
-//         assert_eq!(total_rows, input_rows + 1); // Original 5 rows + 1 new row
-//     }
-//
-//     #[tokio::test]
-//     async fn test_upsert_with_multifile_conflicts() {
-//         let table = setup_test_table().await;
-//         let input_rows = table_rows(&get_table_data(table.clone()).await);
-//
-//         let source_batch = create_batch(vec![
-//             Arc::new(StringArray::from(vec![
-//                 "2023-01-01",
-//                 "2023-01-01",
-//                 "2023-01-01",
-//             ])),
-//             Arc::new(StringArray::from(vec!["A", "E", "F"])), // "A" conflicts file 1, "E" conflicts file 2, "F" doesn't
-//             Arc::new(Int32Array::from(vec![10, 50, 6])),      // Updated value for A and E
-//             Arc::new(Int32Array::from(vec![1, 1, 1])),        // Same workspace
-//         ])
-//             .unwrap();
-//
-//         let ctx = SessionContext::new();
-//         let source_df = ctx.read_batches(vec![source_batch]).unwrap();
-//
-//         let (updated_table, metrics) = table
-//             .upsert(
-//                 source_df,
-//                 vec!["workspace_id".to_string(), "id".to_string()],
-//             )
-//             .await
-//             .unwrap();
-//
-//         // Should have both added and removed files due to conflicts
-//         // Note: The write operation may combine files
-//         assert!(metrics.num_added_files >= 1);
-//         assert_eq!(metrics.num_removed_files, 2);
-//         assert_eq!(metrics.num_conflicting_records, 2); // "A" and "E" conflict
-//
-//         // Should still have some rows
-//         let data = get_table_data(updated_table).await;
-//         let total_rows: usize = table_rows(&data);
-//
-//         assert_record(&data, ("A", 10)); // Updated record
-//         assert_record(&data, ("E", 50)); // Updated record
-//         assert_record(&data, ("F", 6)); // New record
-//
-//         assert_eq!(total_rows, input_rows + 1); // Original 5 rows + 1 new row
-//     }
-//
-//     #[tokio::test]
-//     async fn test_upsert_with_duplicate_conflicts() {
-//         let table = setup_with_batches(
-//             vec![
-//                 create_batch(vec![
-//                     Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-01"])),
-//                     Arc::new(StringArray::from(vec!["A", "B"])),
-//                     Arc::new(Int32Array::from(vec![1, 2])),
-//                     Arc::new(Int32Array::from(vec![1, 1])),
-//                 ])
-//                     .unwrap(),
-//                 create_batch(vec![
-//                     Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-01"])),
-//                     Arc::new(StringArray::from(vec!["A", "C"])),
-//                     Arc::new(Int32Array::from(vec![3, 4])),
-//                     Arc::new(Int32Array::from(vec![1, 1])),
-//                 ])
-//                     .unwrap(),
-//             ],
-//             vec!["workspace_id".to_string()],
-//         )
-//             .await;
-//
-//         let input_rows = table_rows(&get_table_data(table.clone()).await);
-//
-//         let source_batch = create_batch(vec![
-//             Arc::new(StringArray::from(vec!["2023-01-01"])),
-//             Arc::new(StringArray::from(vec!["A"])), // "A" conflicts with multiple files
-//             Arc::new(Int32Array::from(vec![10])),   // Updated value for A
-//             Arc::new(Int32Array::from(vec![1])),    // Same workspace as existing A
-//         ])
-//             .unwrap();
-//
-//         let ctx = SessionContext::new();
-//         let source_df = ctx.read_batches(vec![source_batch]).unwrap();
-//         let (updated_table, metrics) = table
-//             .upsert(
-//                 source_df,
-//                 vec!["workspace_id".to_string(), "id".to_string()],
-//             )
-//             .await
-//             .unwrap();
-//         // Should have both added and removed files due to conflicts
-//         // Note: The write operation may combine files
-//         assert!(metrics.num_added_files >= 1);
-//         assert_eq!(metrics.num_removed_files, 2);
-//         assert_eq!(metrics.num_conflicting_records, 2); // Duplicate "A" records conflict
-//         // Should still have some rows
-//         let data = get_table_data(updated_table).await;
-//         let total_rows: usize = table_rows(&data);
-//         assert_record(&data, ("A", 10)); // Updated record
-//         assert_eq!(total_rows, input_rows - 1); // Original 4 rows - 1 duplicate row + 1 updated row
-//     }
-//
-//     #[tokio::test]
-//     async fn test_upsert_empty_source() {
-//         let table = setup_test_table().await;
-//         let input_rows = table_rows(&get_table_data(table.clone()).await);
-//
-//         // Create empty source data
-//         let source_batch = create_batch(vec![
-//             Arc::new(StringArray::from(Vec::<String>::new())),
-//             Arc::new(StringArray::from(Vec::<String>::new())),
-//             Arc::new(Int32Array::from(Vec::<i32>::new())),
-//             Arc::new(Int32Array::from(Vec::<i32>::new())),
-//         ])
-//             .unwrap();
-//
-//         let ctx = SessionContext::new();
-//         let source_df = ctx.read_batches(vec![source_batch]).unwrap();
-//
-//         let (updated_table, metrics) = table
-//             .upsert(source_df, vec!["id".to_string()])
-//             .await
-//             .unwrap();
-//
-//         // No changes should be made for empty source
-//         assert_eq!(metrics.num_added_files, 0);
-//         assert_eq!(metrics.num_removed_files, 0);
-//         assert_eq!(metrics.num_conflicting_records, 0);
-//
-//         // Original data should remain unchanged
-//         let data = get_table_data(updated_table).await;
-//         let total_rows: usize = table_rows(&data);
-//         assert_eq!(total_rows, input_rows); // Original 4 rows
-//     }
-//
-//     #[tokio::test]
-//     async fn test_upsert_with_another_partition() {
-//         let table = setup_test_table().await;
-//         let input_rows = table_rows(&get_table_data(table.clone()).await);
-//
-//         let source_batch = create_batch(vec![
-//             Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-01"])),
-//             Arc::new(StringArray::from(vec!["A", "E"])),
-//             Arc::new(Int32Array::from(vec![1, 4])),
-//             Arc::new(Int32Array::from(vec![2, 2])), // Different workspace
-//         ])
-//             .unwrap();
-//
-//         let ctx = SessionContext::new();
-//         let source_df = ctx.read_batches(vec![source_batch]).unwrap();
-//
-//         let (updated_table, metrics) = table
-//             .upsert(
-//                 source_df,
-//                 vec!["workspace_id".to_string(), "id".to_string()],
-//             )
-//             .await
-//             .unwrap();
-//
-//         // Should have both added and removed files due to conflicts
-//         assert_eq!(metrics.num_added_files, 1);
-//         assert_eq!(metrics.num_removed_files, 0);
-//
-//         // Should still have some rows
-//         let data = get_table_data(updated_table).await;
-//         let total_rows: usize = table_rows(&data);
-//         assert_eq!(total_rows, input_rows + 2); // Original 5 rows + 2 new rows
-//     }
-//
-//     #[tokio::test]
-//     async fn test_upsert_with_custom_properties() {
-//         let table = setup_test_table().await;
-//         let _input_rows = table_rows(&get_table_data(table.clone()).await);
-//
-//         let source_batch = create_batch(vec![
-//             Arc::new(StringArray::from(vec!["2023-01-01"])),
-//             Arc::new(StringArray::from(vec!["F"])),
-//             Arc::new(Int32Array::from(vec![6])),
-//             Arc::new(Int32Array::from(vec![1])),
-//         ])
-//             .unwrap();
-//
-//         let ctx = SessionContext::new();
-//         let source_df = ctx.read_batches(vec![source_batch]).unwrap();
-//
-//         let mut commit_props = CommitProperties::default();
-//         commit_props
-//             .app_metadata
-//             .insert("test_key".to_string(), serde_json::json!("test_value"));
-//
-//         let (updated_table, _) = table
-//             .upsert(
-//                 source_df,
-//                 vec!["workspace_id".to_string(), "id".to_string()],
-//             )
-//             .with_commit_properties(commit_props)
-//             .await
-//             .unwrap();
-//
-//         // Verify the commit contains our custom properties
-//         let history: Vec<_> = updated_table.history(None).await.unwrap().collect();
-//         let latest_commit = &history[0];
-//
-//         // The operation metrics should be present in the commit
-//         assert!(latest_commit.operation_parameters.is_some());
-//     }
-//
-//     #[tokio::test]
-//     async fn test_upsert_with_two_partition_columns() {
-//         // Initial data across two date partitions
-//         let batch_1 = create_batch(vec![
-//             Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-02"])),
-//             Arc::new(StringArray::from(vec!["A", "B"])),
-//             Arc::new(Int32Array::from(vec![1, 2])),
-//             Arc::new(Int32Array::from(vec![1, 1])),
-//         ])
-//             .unwrap();
-//
-//         let batch_2 = create_batch(vec![
-//             Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-02"])),
-//             Arc::new(StringArray::from(vec!["C", "D"])),
-//             Arc::new(Int32Array::from(vec![3, 4])),
-//             Arc::new(Int32Array::from(vec![1, 1])),
-//         ])
-//             .unwrap();
-//
-//         let table = setup_with_batches(
-//             vec![batch_1, batch_2],
-//             vec!["workspace_id".to_string(), "date".to_string()],
-//         )
-//             .await;
-//
-//         let input_rows = table_rows(&get_table_data(table.clone()).await);
-//
-//         // Source updates A (conflict in date=2023-01-01 partition),
-//         // moves B to partition date=2023-01-01
-//         // and adds F (new row in date=2023-01-02 partition)
-//         let source_batch = create_batch(vec![
-//             Arc::new(StringArray::from(vec![
-//                 "2023-01-01",
-//                 "2023-01-01",
-//                 "2023-01-01",
-//             ])),
-//             Arc::new(StringArray::from(vec!["A", "B", "F"])),
-//             Arc::new(Int32Array::from(vec![10, 11, 6])), // Updated value for A, new value for F
-//             Arc::new(Int32Array::from(vec![1, 1, 1])),   // Same workspace
-//         ])
-//             .unwrap();
-//
-//         let ctx = SessionContext::new();
-//         let source_df = ctx.read_batches(vec![source_batch]).unwrap();
-//
-//         let (updated_table, metrics) = table
-//             .upsert(
-//                 source_df,
-//                 vec!["workspace_id".to_string(), "id".to_string()],
-//             )
-//             .await
-//             .unwrap();
-//
-//         // Expect one removed file (partition containing A) and added files for rewritten + new data
-//         assert_eq!(metrics.num_removed_files, 2); // One for A, one for B's original partition
-//         assert_eq!(metrics.num_added_files, 1);
-//
-//         let data = get_table_data(updated_table).await;
-//
-//         assert_record(&data, ("A", 10)); // Updated
-//         assert_record(&data, ("B", 11)); // Moved with updated value
-//         assert_record(&data, ("F", 6)); // New
-//
-//         let total_rows = table_rows(&data);
-//         assert_eq!(total_rows, input_rows + 1); // One new row added
-//     }
-//
-//     #[tokio::test]
-//     async fn test_upsert_with_source_column_order_difference() {
-//         // Existing table (target) schema order: date, id, value, workspace_id
-//         let table = setup_test_table().await;
-//         let input_rows = table_rows(&get_table_data(table.clone()).await);
-//
-//         // Source batch with DIFFERENT column order: workspace_id, value, id, date
-//         use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-//         let reordered_schema = Arc::new(ArrowSchema::new(vec![
-//             Field::new("workspace_id", DataType::Int32, false),
-//             Field::new("value", DataType::Int32, false),
-//             Field::new("id", DataType::Utf8, false),
-//             Field::new("date", DataType::Utf8, false),
-//         ]));
-//
-//         // Update id "A" (conflict) and add new id "Z" (no conflict)
-//         let source_batch = RecordBatch::try_new(
-//             reordered_schema,
-//             vec![
-//                 Arc::new(Int32Array::from(vec![1, 1])),      // workspace_id
-//                 Arc::new(Int32Array::from(vec![10, 99])),    // value
-//                 Arc::new(StringArray::from(vec!["A", "Z"])), // id
-//                 Arc::new(StringArray::from(vec!["2023-01-01", "2023-01-01"])), // date
-//             ],
-//         )
-//             .unwrap();
-//
-//         let ctx = SessionContext::new();
-//         let source_df = ctx.read_batches(vec![source_batch]).unwrap();
-//
-//         // Attempt upsert
-//         let result = table
-//             .upsert(
-//                 source_df,
-//                 vec!["workspace_id".to_string(), "id".to_string()],
-//             )
-//             .await;
-//
-//         let (updated_table, _) = result.unwrap();
-//         let data = get_table_data(updated_table).await;
-//         assert_record(&data, ("A", 10));
-//         assert_record(&data, ("Z", 99));
-//         assert_eq!(table_rows(&data), input_rows + 1);
-//     }
-// }
+
