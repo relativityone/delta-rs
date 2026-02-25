@@ -1825,63 +1825,7 @@ impl std::future::IntoFuture for MergeBuilder {
 
             PROTOCOL.can_write_to(&snapshot)?;
 
-            // Fast path: pure upsert semantics — file-level conflict detection +
-            // anti-join write path instead of a full outer join over the entire table.
-            let schema_field_names: Vec<String> = snapshot
-                .schema()
-                .fields()
-                .map(|f| f.name().to_string())
-                .collect();
-
-            if let Some(join_keys) = try_detect_upsert_join_keys(
-                &this.predicate,
-                &this.match_operations,
-                &this.not_match_operations,
-                &this.not_match_source_operations,
-                this.merge_schema,
-                &this.source_alias,
-                &this.target_alias,
-                &schema_field_names,
-            ) {
-                debug!("merge: detected upsert semantics — routing through upsert fast-path");
-
-                let operation_id = this.get_operation_id();
-                this.pre_execute(operation_id).await?;
-
-                let mut upsert = UpsertBuilder::new(
-                    this.log_store.clone(),
-                    snapshot,
-                    join_keys,
-                    this.source,
-                )
-                .with_commit_properties(this.commit_properties);
-
-                if let Some(wp) = this.writer_properties {
-                    upsert = upsert.with_writer_properties(wp);
-                }
-
-                let (table, upsert_metrics) = upsert.execute().await?;
-
-                if let Some(handler) = this.custom_execute_handler {
-                    handler.post_execute(&this.log_store, operation_id).await?;
-                }
-
-                // Map upsert metrics → merge metrics.
-                let merge_metrics = MergeMetrics {
-                    num_target_rows_updated: upsert_metrics.num_conflicting_records,
-                    num_target_files_added: upsert_metrics.num_added_files,
-                    num_target_files_removed: upsert_metrics.num_removed_files,
-                    execution_time_ms: upsert_metrics.execution_time_ms,
-                    scan_time_ms: upsert_metrics.scan_time_ms,
-                    rewrite_time_ms: upsert_metrics.write_time_ms,
-                    ..Default::default()
-                };
-
-                return Ok((table, merge_metrics));
-            }
-
-            // General merge path.
-
+            // Shared setup that applies to both the upsert fast-path and the general merge path.
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
@@ -1895,38 +1839,89 @@ impl std::future::IntoFuture for MergeBuilder {
                     cdc: false,
                 },
             )?;
-
             state.ensure_log_store_registered(this.log_store.as_ref())?;
+            let state = Arc::new(state);
 
-            let (snapshot, metrics) = execute(
-                this.predicate,
-                this.source,
-                this.log_store.clone(),
-                snapshot,
-                state,
-                this.writer_properties,
-                this.commit_properties,
-                this.safe_cast,
-                this.streaming,
-                this.source_alias,
-                this.target_alias,
+            // Fast path: pure upsert semantics — file-level conflict detection +
+            // anti-join write path instead of a full outer join over the entire table.
+            let schema_field_names: Vec<String> = snapshot
+                .schema()
+                .fields()
+                .map(|f| f.name().to_string())
+                .collect();
+
+            let result = if let Some(join_keys) = try_detect_upsert_join_keys(
+                &this.predicate,
+                &this.match_operations,
+                &this.not_match_operations,
+                &this.not_match_source_operations,
                 this.merge_schema,
-                this.match_operations,
-                this.not_match_operations,
-                this.not_match_source_operations,
-                operation_id,
-                this.custom_execute_handler.as_ref(),
-            )
-            .await?;
+                &this.source_alias,
+                &this.target_alias,
+                &schema_field_names,
+            ) {
+                debug!("merge: detected upsert semantics — routing through upsert fast-path");
 
-            if let Some(handler) = this.custom_execute_handler {
+                let mut upsert = UpsertBuilder::new(
+                    this.log_store.clone(),
+                    snapshot,
+                    join_keys,
+                    this.source,
+                )
+                .with_commit_properties(this.commit_properties);
+
+                if let Some(wp) = this.writer_properties {
+                    upsert = upsert.with_writer_properties(wp);
+                }
+
+                let (table, upsert_metrics) = upsert.execute(state, operation_id).await?;
+
+                // Map upsert metrics → merge metrics.
+                let merge_metrics = MergeMetrics {
+                    num_target_rows_updated: upsert_metrics.num_conflicting_records,
+                    num_target_files_added: upsert_metrics.num_added_files,
+                    num_target_files_removed: upsert_metrics.num_removed_files,
+                    execution_time_ms: upsert_metrics.execution_time_ms,
+                    scan_time_ms: upsert_metrics.scan_time_ms,
+                    rewrite_time_ms: upsert_metrics.write_time_ms,
+                    ..Default::default()
+                };
+
+                Ok((table, merge_metrics))
+            } else {
+                // General merge path — full outer join over the table.
+                let (snapshot, metrics) = execute(
+                    this.predicate,
+                    this.source,
+                    this.log_store.clone(),
+                    snapshot,
+                    Arc::try_unwrap(state).unwrap_or_else(|arc| (*arc).clone()),
+                    this.writer_properties,
+                    this.commit_properties,
+                    this.safe_cast,
+                    this.streaming,
+                    this.source_alias,
+                    this.target_alias,
+                    this.merge_schema,
+                    this.match_operations,
+                    this.not_match_operations,
+                    this.not_match_source_operations,
+                    operation_id,
+                    this.custom_execute_handler.as_ref(),
+                )
+                .await?;
+
+                Ok((
+                    DeltaTable::new_with_state(this.log_store.clone(), DeltaTableState { snapshot }),
+                    metrics,
+                ))
+            };
+
+            if let Some(handler) = &this.custom_execute_handler {
                 handler.post_execute(&this.log_store, operation_id).await?;
             }
 
-            Ok((
-                DeltaTable::new_with_state(this.log_store, DeltaTableState { snapshot }),
-                metrics,
-            ))
+            result
         })
     }
 }
