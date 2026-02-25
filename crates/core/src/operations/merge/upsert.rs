@@ -1,14 +1,6 @@
 //! Upsert fast-path, invoked exclusively from within the merge operation.
 //! For each conflicting record (matching on join keys), only the source record is kept.
 //! All non-conflicting records are appended.
-//!
-//! The caller (`MergeBuilder::into_future`) is responsible for:
-//!   - resolving the snapshot,
-//!   - protocol write-checks,
-//!   - creating/resolving the `SessionState`,
-//!   - emitting `pre_execute` / `post_execute` hooks,
-//!   - generating the `operation_id`.
-//! `UpsertBuilder` therefore only handles the core data-path logic and the commit.
 
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
 use crate::kernel::{Action, EagerSnapshot, Remove};
@@ -36,7 +28,6 @@ use uuid::Uuid;
 const FILE_PATH_COLUMN: &str = "__delta_rs_path";
 
 #[derive(Default, Debug, Clone, Serialize)]
-/// Metrics collected during the upsert fast-path execution.
 pub(super) struct UpsertMetrics {
     /// Number of files added to the target table
     pub num_added_files: usize,
@@ -52,13 +43,6 @@ pub(super) struct UpsertMetrics {
     pub execution_time_ms: u64,
 }
 
-/// Builder for the upsert fast-path — only constructed and consumed by the merge operation.
-///
-/// The caller is expected to have already:
-///   - resolved the snapshot,
-///   - performed the protocol write-check,
-///   - created the `SessionState` (with the log-store registered),
-///   - called `pre_execute`.
 pub(super) struct UpsertBuilder {
     /// The join keys used to identify conflicts between source and target records
     join_keys: Vec<String>,
@@ -104,7 +88,7 @@ impl UpsertBuilder {
         self
     }
 
-    /// Execute the upsert fast-path and return the updated table together with metrics.
+    /// Execute the upsert return the updated table together with metrics.
     ///
     /// `state` must already have the log-store registered.
     /// `operation_id` is forwarded to the commit so that the caller can correlate it with

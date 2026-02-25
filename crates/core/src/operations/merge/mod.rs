@@ -102,10 +102,6 @@ mod upsert;
 
 use upsert::UpsertBuilder;
 
-// ---------------------------------------------------------------------------
-// Upsert-path detection
-// ---------------------------------------------------------------------------
-
 /// Attempt to detect whether the merge configuration matches "upsert" semantics:
 ///   - Exactly one `when_matched_update` clause with **no** predicate.
 ///   - Exactly one `when_not_matched_insert` clause with **no** predicate.
@@ -285,10 +281,8 @@ fn extract_join_keys_from_str(
     source_alias: Option<&str>,
     target_alias: Option<&str>,
 ) -> Option<Vec<String>> {
-    // Normalise: lower-case, remove excess whitespace.
     let normalised = predicate.trim().to_lowercase();
 
-    // Split on " and " — if the predicate is more complex we fall back to `None`.
     let clauses: Vec<&str> = normalised.split(" and ").collect();
 
     let mut keys = Vec::with_capacity(clauses.len());
@@ -364,8 +358,6 @@ fn str_parse_qualified_col(s: &str, expected_alias: Option<&str>) -> Option<Stri
         }
     }
 }
-
-// ---------------------------------------------------------------------------
 
 const SOURCE_COLUMN: &str = "__delta_rs_source";
 const TARGET_COLUMN: &str = "__delta_rs_target";
@@ -1825,7 +1817,6 @@ impl std::future::IntoFuture for MergeBuilder {
 
             PROTOCOL.can_write_to(&snapshot)?;
 
-            // Shared setup that applies to both the upsert fast-path and the general merge path.
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
@@ -1842,8 +1833,6 @@ impl std::future::IntoFuture for MergeBuilder {
             state.ensure_log_store_registered(this.log_store.as_ref())?;
             let state = Arc::new(state);
 
-            // Fast path: pure upsert semantics — file-level conflict detection +
-            // anti-join write path instead of a full outer join over the entire table.
             let schema_field_names: Vec<String> = snapshot
                 .schema()
                 .fields()
@@ -1860,8 +1849,6 @@ impl std::future::IntoFuture for MergeBuilder {
                 &this.target_alias,
                 &schema_field_names,
             ) {
-                debug!("merge: detected upsert semantics — routing through upsert fast-path");
-
                 let mut upsert = UpsertBuilder::new(
                     this.log_store.clone(),
                     snapshot,
@@ -1876,7 +1863,6 @@ impl std::future::IntoFuture for MergeBuilder {
 
                 let (table, upsert_metrics) = upsert.execute(state, operation_id).await?;
 
-                // Map upsert metrics → merge metrics.
                 let merge_metrics = MergeMetrics {
                     num_target_rows_updated: upsert_metrics.num_conflicting_records,
                     num_target_files_added: upsert_metrics.num_added_files,
@@ -1889,7 +1875,6 @@ impl std::future::IntoFuture for MergeBuilder {
 
                 Ok((table, merge_metrics))
             } else {
-                // General merge path — full outer join over the table.
                 let (snapshot, metrics) = execute(
                     this.predicate,
                     this.source,
@@ -4846,17 +4831,6 @@ mod tests {
         ], &batches }
     }
 
-    // ---------------------------------------------------------------------------
-    // Upsert fast-path tests
-    //
-    // The upsert path is triggered when merge expresses pure upsert semantics:
-    //   - exactly one unconditional `when_matched_update` covering all columns,
-    //   - exactly one unconditional `when_not_matched_insert`,
-    //   - no `when_not_matched_by_source_*` clauses,
-    //   - no schema evolution,
-    //   - join predicate is a conjunction of source.col = target.col equalities.
-    // ---------------------------------------------------------------------------
-
     /// Build the standard source DataFrame for upsert tests.
     /// Schema matches the default test table: id (Utf8), value (Int32), modified (Utf8).
     fn upsert_source(rows: Vec<(&str, i32, &str)>) -> DataFrame {
@@ -4881,7 +4855,7 @@ mod tests {
     }
 
     /// Helper that performs an upsert-style merge (the canonical pattern that
-    /// triggers the fast-path) and returns the result.
+    /// triggers the upsert) and returns the result.
     async fn do_upsert(
         table: DeltaTable,
         source: DataFrame,
@@ -4906,23 +4880,17 @@ mod tests {
             .unwrap()
     }
 
-    /// Pure-insert upsert: source rows have no overlap with target — the fast-path
-    /// should detect zero conflicts and append the source without touching existing files.
     #[tokio::test]
     async fn test_upsert_no_conflicts() {
         let schema = get_arrow_schema(&None);
         let table = setup_table(None).await;
         let table = write_data(table, &schema).await;
-        // Target: A=1, B=10, C=10, D=100
 
-        // Source contains entirely new keys → no conflicts expected
         let source = upsert_source(vec![("E", 50, "2024-01-01"), ("F", 60, "2024-01-01")]);
         let (table, metrics) = do_upsert(table, source).await;
 
-        // Fast-path: no files should have been removed
         assert_eq!(metrics.num_target_files_removed, 0);
         assert!(metrics.num_target_files_added >= 1);
-        // All source rows are treated as inserts; no updates
         assert_eq!(metrics.num_target_rows_updated, 0);
 
         let expected = vec![
@@ -4941,14 +4909,11 @@ mod tests {
         assert_batches_sorted_eq!(&expected, &actual);
     }
 
-    /// Conflict upsert: source overlaps with target — existing rows are replaced,
-    /// new rows are appended; the file containing the conflicting target row is removed.
     #[tokio::test]
     async fn test_upsert_with_conflicts() {
         let schema = get_arrow_schema(&None);
         let table = setup_table(None).await;
         let table = write_data(table, &schema).await;
-        // Target: A=1, B=10, C=10, D=100
 
         // B conflicts (updated value), X is new
         let source = upsert_source(vec![("B", 99, "2024-01-01"), ("X", 77, "2024-01-01")]);
@@ -4973,14 +4938,11 @@ mod tests {
         assert_batches_sorted_eq!(&expected, &actual);
     }
 
-    /// All-conflict upsert: every source row matches an existing target row.
-    /// The entire target file is rewritten with updated values; no new rows appear.
     #[tokio::test]
     async fn test_upsert_all_rows_updated() {
         let schema = get_arrow_schema(&None);
         let table = setup_table(None).await;
         let table = write_data(table, &schema).await;
-        // Target: A=1, B=10, C=10, D=100 — all in one file
 
         // Replace all four rows
         let source = upsert_source(vec![
@@ -5009,9 +4971,6 @@ mod tests {
         assert_batches_sorted_eq!(&expected, &actual);
     }
 
-    /// Partitioned-table upsert: the fast-path must respect partition boundaries.
-    /// A conflict in partition "2021-02-01" must not cause files in "2021-02-02"
-    /// to be rewritten.
     #[tokio::test]
     async fn test_upsert_partitioned_table() {
         let table = setup_table(Some(vec!["modified"])).await;
@@ -5048,12 +5007,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Update A (partition 2021-02-01) and add Z (partition 2021-02-01)
-        // C and D in partition 2021-02-02 must be untouched
         let source = upsert_source(vec![("A", 55, "2021-02-01"), ("Z", 99, "2021-02-01")]);
         let (table, metrics) = do_upsert(table, source).await;
 
-        // Only the 2021-02-01 file should be affected
         assert_eq!(metrics.num_target_rows_updated, 1); // A replaced
 
         let expected = vec![
