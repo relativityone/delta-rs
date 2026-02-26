@@ -127,14 +127,18 @@ impl UpsertBuilder {
         state: &SessionState,
         operation_id: Uuid,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
-        // Get unique partition values from source to limit scan scope.
-        // Only consider partition columns that are also join keys.
-        let partition_filters: HashMap<String, Vec<String>> = self
-            .extract_partition_filters()
-            .await?
-            .into_iter()
-            .filter(|(k, _)| self.join_keys.contains(k))
+        let relevant_partition_cols: Vec<String> = self
+            .snapshot
+            .metadata()
+            .partition_columns()
+            .iter()
+            .filter(|col| self.join_keys.contains(col))
+            .cloned()
             .collect();
+
+        let partition_filters: HashMap<String, Vec<String>> = self
+            .extract_partition_filters(&relevant_partition_cols)
+            .await?;
 
         // Create target DataFrame with partition filtering
         let target_df = self.create_target_dataframe(state, &partition_filters)?;
@@ -162,18 +166,14 @@ impl UpsertBuilder {
         }
     }
 
-    /// Extract partition values from source to optimize target scanning
-    /// This method attempts to identify partition columns from the table schema
-    /// and extract unique values from the source data to limit the scan scope
-    async fn extract_partition_filters(&self) -> DeltaResult<HashMap<String, Vec<String>>> {
+    /// For each partition column, extract the unique values present in the source DataFrame.
+    async fn extract_partition_filters(
+        &self,
+        columns: &[String],
+    ) -> DeltaResult<HashMap<String, Vec<String>>> {
         let mut partition_filters = HashMap::new();
-        let partition_columns = self.snapshot.metadata().partition_columns();
 
-        if partition_columns.is_empty() {
-            return Ok(partition_filters);
-        }
-
-        for partition_col in partition_columns {
+        for partition_col in columns {
             if let Ok(batches) = self
                 .source
                 .clone()
