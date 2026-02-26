@@ -1904,16 +1904,23 @@ impl std::future::IntoFuture for MergeBuilder {
                 .map(|f| f.name().to_string())
                 .collect();
 
-            let result = if let Some(join_keys) = try_detect_upsert_join_keys(
-                &this.predicate,
-                &this.match_operations,
-                &this.not_match_operations,
-                &this.not_match_source_operations,
-                this.merge_schema,
-                &this.source_alias,
-                &this.target_alias,
-                &schema_field_names,
-            ) {
+            let canonical_only_feature = should_write_cdc(&snapshot)? || this.streaming;
+
+            let result = if let Some(join_keys) = (!canonical_only_feature)
+                .then(|| {
+                    try_detect_upsert_join_keys(
+                        &this.predicate,
+                        &this.match_operations,
+                        &this.not_match_operations,
+                        &this.not_match_source_operations,
+                        this.merge_schema,
+                        &this.source_alias,
+                        &this.target_alias,
+                        &schema_field_names,
+                    )
+                })
+                .flatten()
+            {
                 let mut upsert =
                     UpsertBuilder::new(this.log_store.clone(), snapshot, join_keys, this.source)
                         .with_commit_properties(this.commit_properties);
