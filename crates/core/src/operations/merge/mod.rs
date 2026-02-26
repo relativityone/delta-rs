@@ -348,7 +348,7 @@ fn extract_join_keys_from_str(
     source_alias: Option<&str>,
     target_alias: Option<&str>,
 ) -> Option<Vec<String>> {
-    let normalised = predicate.trim().to_lowercase();
+    let normalised = predicate.replace('\n', "").trim().to_lowercase();
 
     let clauses: Vec<&str> = normalised.split(" and ").collect();
 
@@ -5136,7 +5136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upsert_string_predicate_with_and() {
+    async fn test_upsert_string_predicate_with_newline() {
         let schema = get_arrow_schema(&None);
         let table = setup_table(None).await;
         let table = write_data(table, &schema).await;
@@ -5147,7 +5147,8 @@ mod tests {
         let (table, metrics) = table
             .merge(
                 source,
-                "target.id = source.id AND `target.modified` = source.`modified`",
+                r#"target.id = source.id AND
+    target.modified = source.modified"#,
             )
             .with_source_alias("source")
             .with_target_alias("target")
