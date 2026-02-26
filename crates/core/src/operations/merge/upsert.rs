@@ -310,7 +310,7 @@ impl UpsertBuilder {
             state,
             physical_plan,
             partition_columns,
-            self.log_store.object_store(None),
+            self.log_store.object_store(Some(operation_id)),
             Some(self.snapshot.table_properties().target_file_size().get() as usize),
             None,
             self.writer_properties.clone(),
