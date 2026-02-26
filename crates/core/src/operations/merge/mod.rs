@@ -1918,6 +1918,10 @@ impl std::future::IntoFuture for MergeBuilder {
                     UpsertBuilder::new(this.log_store.clone(), snapshot, join_keys, this.source)
                         .with_commit_properties(this.commit_properties);
 
+                if let Some(handler) = &this.custom_execute_handler {
+                    upsert = upsert.with_custom_execute_handler(handler.clone());
+                }
+
                 if let Some(wp) = this.writer_properties {
                     upsert = upsert.with_writer_properties(wp);
                 }

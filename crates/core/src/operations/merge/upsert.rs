@@ -10,6 +10,7 @@ use crate::operations::write::WriterStatsConfig;
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::table::config::TablePropertiesExt;
+use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
 use arrow_array::Array;
 use datafusion::common::JoinType;
@@ -548,13 +549,14 @@ impl UpsertBuilder {
         })
     }
 
-    /// Commit all changes to the Delta log.
-    async fn commit_changes(
-        &self,
-        actions: Vec<Action>,
-        metrics: &UpsertMetrics,
-        operation_id: Uuid,
-    ) -> DeltaResult<DeltaTable> {
+    fn table_from_current_snapshot(&self) -> DeltaTable {
+        DeltaTable::new_with_state(
+            self.log_store.clone(),
+            DeltaTableState::new(self.snapshot.clone()),
+        )
+    }
+
+    fn build_commit_properties(&self, metrics: &UpsertMetrics) -> CommitProperties {
         let mut app_metadata = self.commit_properties.app_metadata.clone();
         app_metadata.insert("readVersion".to_owned(), self.snapshot.version().into());
         if let Ok(metrics_json) = serde_json::to_value(metrics) {
@@ -563,27 +565,49 @@ impl UpsertBuilder {
 
         let mut commit_properties = self.commit_properties.clone();
         commit_properties.app_metadata = app_metadata;
+        commit_properties
+    }
 
-        let merge_predicate_sql = self
-            .join_keys
+    fn merge_predicate_sql(&self) -> String {
+        self.join_keys
             .iter()
             .map(|k| format!("source.{k} = target.{k}"))
             .collect::<Vec<_>>()
-            .join(" AND ");
+            .join(" AND ")
+    }
 
-        let operation = DeltaOperation::Merge {
+    fn build_merge_operation(&self) -> DeltaOperation {
+        const UPDATE_ACTION_TYPE: &str = "update";
+        const INSERT_ACTION_TYPE: &str = "insert";
+
+        DeltaOperation::Merge {
             predicate: None,
-            merge_predicate: Some(merge_predicate_sql),
+            merge_predicate: Some(self.merge_predicate_sql()),
             matched_predicates: vec![MergePredicate {
-                action_type: "update".to_owned(),
+                action_type: UPDATE_ACTION_TYPE.to_owned(),
                 predicate: None,
             }],
             not_matched_predicates: vec![MergePredicate {
-                action_type: "insert".to_owned(),
+                action_type: INSERT_ACTION_TYPE.to_owned(),
                 predicate: None,
             }],
             not_matched_by_source_predicates: vec![],
-        };
+        }
+    }
+
+    /// Commit all changes to the Delta log.
+    async fn commit_changes(
+        &self,
+        actions: Vec<Action>,
+        metrics: &UpsertMetrics,
+        operation_id: Uuid,
+    ) -> DeltaResult<DeltaTable> {
+        if actions.is_empty() {
+            return Ok(self.table_from_current_snapshot());
+        }
+
+        let commit_properties = self.build_commit_properties(metrics);
+        let operation = self.build_merge_operation();
 
         let commit = CommitBuilder::from(commit_properties)
             .with_actions(actions)
