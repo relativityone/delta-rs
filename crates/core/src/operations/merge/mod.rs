@@ -5147,8 +5147,8 @@ mod tests {
         let (table, metrics) = table
             .merge(
                 source,
-                r#"target.id = source.id AND
-    target.modified = source.modified"#,
+                r#"`target.id` = source.id AND
+    target.modified = source.`modified`"#,
             )
             .with_source_alias("source")
             .with_target_alias("target")
