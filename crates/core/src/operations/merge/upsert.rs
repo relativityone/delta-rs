@@ -396,7 +396,7 @@ impl UpsertBuilder {
             let file_view = file_view?;
             let path = file_view.path().to_string();
             if conflicting_file_names.contains(&path) {
-                remove_actions.push(self.logical_file_to_remove(file_view));
+                remove_actions.push(Action::Remove(file_view.remove_action(true)));
             }
         }
 
@@ -481,43 +481,6 @@ impl UpsertBuilder {
         }
 
         Ok(conflicting_files.into_iter().collect())
-    }
-
-    /// Convert a LogicalFileView to a Remove action
-    fn logical_file_to_remove(&self, f: crate::kernel::LogicalFileView) -> Action {
-        // Convert partition values from LogicalFileView to HashMap
-        let partition_values = f
-            .partition_values()
-            .map(|pv| {
-                pv.fields()
-                    .iter()
-                    .zip(pv.values().iter())
-                    .map(|(k, v)| {
-                        let value = match v {
-                            delta_kernel::expressions::Scalar::Integer(i) => Some(i.to_string()),
-                            delta_kernel::expressions::Scalar::String(s) => Some(s.clone()),
-                            delta_kernel::expressions::Scalar::Long(l) => Some(l.to_string()),
-                            delta_kernel::expressions::Scalar::Null(_) => None,
-                            _ => None,
-                        };
-                        (k.name().to_string(), value)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Action::Remove(Remove {
-            path: f.path().to_string(),
-            data_change: true,
-            extended_file_metadata: None,
-            size: None,
-            tags: None,
-            deletion_vector: None,
-            base_row_id: None,
-            deletion_timestamp: Some(chrono::Utc::now().timestamp_millis()),
-            partition_values: Some(partition_values),
-            default_row_commit_version: None,
-        })
     }
 
     /// Right-anti-join: return target rows whose join keys do NOT appear in the source.
