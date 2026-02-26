@@ -160,40 +160,102 @@ fn try_detect_upsert_join_keys(
         return None;
     }
 
-    // 5. The update must be a full-row replacement: every schema field must have
-    //    an entry in the operations HashMap.  Partial updates cannot be safely
-    //    routed through UpsertBuilder (which always replaces whole rows).
-    if !operations_cover_all_columns(&match_op.operations, schema_fields) {
+    // 5. Both the update and the insert must be full-row replacements where every
+    //    schema field is mapped to the *same-named* column from the source side
+    //    (identity mapping).  Partial updates/inserts and non-identity expressions
+    //    cannot be safely routed through UpsertBuilder.
+    let src_alias: Option<&str> = source_alias.as_deref();
+    if !operations_are_full_identity_mappings(&match_op.operations, schema_fields, src_alias) {
+        return None;
+    }
+    if !operations_are_full_identity_mappings(&not_match_op.operations, schema_fields, src_alias) {
         return None;
     }
 
     // 6. The predicate must be a conjunction of `source.col = target.col` equalities.
-    let src_alias: Option<&str> = source_alias.as_deref();
     let tgt_alias: Option<&str> = target_alias.as_deref();
 
     match predicate {
-        Expression::DataFusion(expr) => {
-            extract_join_keys_from_expr(expr, src_alias, tgt_alias)
-        }
-        Expression::String(s) => {
-            extract_join_keys_from_str(s, src_alias, tgt_alias)
-        }
+        Expression::DataFusion(expr) => extract_join_keys_from_expr(expr, src_alias, tgt_alias),
+        Expression::String(s) => extract_join_keys_from_str(s, src_alias, tgt_alias),
     }
 }
 
-/// Check that the `operations` HashMap contains an entry for every field name
-/// in `schema_fields`.  The HashMap keys are `Column` values whose `name`
-/// fields (ignoring any table qualifier) must cover all column names.
-fn operations_cover_all_columns(
+/// Check that the `operations` HashMap is a **full identity mapping**: every
+/// field in `schema_fields` must be present as a key, and its expression must
+/// resolve to `source.<col_name>` (i.e. the same-named column from the source
+/// side).  Non-identity expressions such as `target.v + 1`, `lit(42)`, or
+/// `source.a` mapped to target column `b` all cause this to return `false`,
+/// which prevents the fast-path upsert from silently producing wrong results.
+fn operations_are_full_identity_mappings(
     operations: &HashMap<Column, Expression>,
     schema_fields: &[String],
+    source_alias: Option<&str>,
 ) -> bool {
     if operations.len() < schema_fields.len() {
         return false;
     }
-    let op_names: std::collections::HashSet<&str> =
-        operations.keys().map(|c| c.name.as_str()).collect();
-    schema_fields.iter().all(|f| op_names.contains(f.as_str()))
+    // Build a lookup: target column name -> expression
+    let op_map: std::collections::HashMap<&str, &Expression> = operations
+        .iter()
+        .map(|(c, e)| (c.name.as_str(), e))
+        .collect();
+
+    schema_fields
+        .iter()
+        .all(|field| match op_map.get(field.as_str()) {
+            Some(expr) => expression_is_source_column(expr, field, source_alias),
+            None => false,
+        })
+}
+
+/// Return `true` when `expr` is a plain column reference to `source.<col_name>`
+/// (or bare `<col_name>` when no alias is in use).
+///
+/// Handles both the `Expression::DataFusion` and `Expression::String` variants.
+fn expression_is_source_column(
+    expr: &Expression,
+    col_name: &str,
+    source_alias: Option<&str>,
+) -> bool {
+    match expr {
+        Expression::DataFusion(df_expr) => {
+            if let Expr::Column(col) = df_expr {
+                // The bare column name must match.
+                if col.name != col_name {
+                    return false;
+                }
+                match (&col.relation, source_alias) {
+                    // Qualifier present and matches the source alias.
+                    (Some(rel), Some(alias)) => rel.table() == alias,
+                    // No qualifier and no alias expected — bare column reference.
+                    (None, None) => true,
+                    // Column has no qualifier but we do have an alias — still accept
+                    // because DataFusion sometimes strips the qualifier during planning.
+                    (None, Some(_)) => true,
+                    // Column has a qualifier but we have no alias (or it's a different
+                    // qualifier, e.g. pointing at "target") — reject.
+                    (Some(_), None) => false,
+                }
+            } else {
+                false
+            }
+        }
+        Expression::String(s) => {
+            let s = s.trim();
+            match source_alias {
+                Some(alias) => {
+                    // Accept `alias.col_name` (case-insensitive to be lenient).
+                    let expected = format!("{}.{}", alias, col_name);
+                    s.eq_ignore_ascii_case(&expected)
+                }
+                None => {
+                    // No alias — the expression must be exactly the bare column name.
+                    s.eq_ignore_ascii_case(col_name)
+                }
+            }
+        }
+    }
 }
 
 /// Walk a DataFusion `Expr` tree and collect column names from a conjunction of
@@ -212,14 +274,22 @@ fn extract_join_keys_from_expr(
             match op {
                 Operator::And => {
                     let mut keys = extract_join_keys_from_expr(left, source_alias, target_alias)?;
-                    keys.extend(extract_join_keys_from_expr(right, source_alias, target_alias)?);
+                    keys.extend(extract_join_keys_from_expr(
+                        right,
+                        source_alias,
+                        target_alias,
+                    )?);
                     Some(keys)
                 }
                 Operator::Eq => {
                     // Check both `source.col = target.col` and `target.col = source.col`.
-                    if let Some(key) = eq_columns_to_join_key(left, right, source_alias, target_alias) {
+                    if let Some(key) =
+                        eq_columns_to_join_key(left, right, source_alias, target_alias)
+                    {
                         Some(vec![key])
-                    } else if let Some(key) = eq_columns_to_join_key(right, left, source_alias, target_alias) {
+                    } else if let Some(key) =
+                        eq_columns_to_join_key(right, left, source_alias, target_alias)
+                    {
                         Some(vec![key])
                     } else {
                         None
@@ -296,9 +366,8 @@ fn extract_join_keys_from_str(
         let lhs = parts[0].trim();
         let rhs = parts[1].trim();
 
-        if let Some(key) =
-            str_eq_to_join_key(lhs, rhs, source_alias, target_alias)
-                .or_else(|| str_eq_to_join_key(rhs, lhs, source_alias, target_alias))
+        if let Some(key) = str_eq_to_join_key(lhs, rhs, source_alias, target_alias)
+            .or_else(|| str_eq_to_join_key(rhs, lhs, source_alias, target_alias))
         {
             keys.push(key);
         } else {
@@ -306,11 +375,7 @@ fn extract_join_keys_from_str(
         }
     }
 
-    if keys.is_empty() {
-        None
-    } else {
-        Some(keys)
-    }
+    if keys.is_empty() { None } else { Some(keys) }
 }
 
 /// Check whether `lhs_str` refers to the source alias and `rhs_str` to the
@@ -1849,13 +1914,9 @@ impl std::future::IntoFuture for MergeBuilder {
                 &this.target_alias,
                 &schema_field_names,
             ) {
-                let mut upsert = UpsertBuilder::new(
-                    this.log_store.clone(),
-                    snapshot,
-                    join_keys,
-                    this.source,
-                )
-                .with_commit_properties(this.commit_properties);
+                let mut upsert =
+                    UpsertBuilder::new(this.log_store.clone(), snapshot, join_keys, this.source)
+                        .with_commit_properties(this.commit_properties);
 
                 if let Some(wp) = this.writer_properties {
                     upsert = upsert.with_writer_properties(wp);
@@ -1897,7 +1958,10 @@ impl std::future::IntoFuture for MergeBuilder {
                 .await?;
 
                 Ok((
-                    DeltaTable::new_with_state(this.log_store.clone(), DeltaTableState { snapshot }),
+                    DeltaTable::new_with_state(
+                        this.log_store.clone(),
+                        DeltaTableState { snapshot },
+                    ),
                     metrics,
                 ))
             };
@@ -4856,10 +4920,7 @@ mod tests {
 
     /// Helper that performs an upsert-style merge (the canonical pattern that
     /// triggers the upsert) and returns the result.
-    async fn do_upsert(
-        table: DeltaTable,
-        source: DataFrame,
-    ) -> (DeltaTable, MergeMetrics) {
+    async fn do_upsert(table: DeltaTable, source: DataFrame) -> (DeltaTable, MergeMetrics) {
         table
             .merge(source, col("target.id").eq(col("source.id")))
             .with_source_alias("source")
@@ -4919,7 +4980,10 @@ mod tests {
         let source = upsert_source(vec![("B", 99, "2024-01-01"), ("X", 77, "2024-01-01")]);
         let (table, metrics) = do_upsert(table, source).await;
 
-        assert!(metrics.num_target_files_removed >= 1, "conflicting file should be removed");
+        assert!(
+            metrics.num_target_files_removed >= 1,
+            "conflicting file should be removed"
+        );
         assert!(metrics.num_target_files_added >= 1);
         assert_eq!(metrics.num_target_rows_updated, 1); // B replaced
 
@@ -5021,6 +5085,89 @@ mod tests {
             "| C  | 10    | 2021-02-02 |",
             "| D  | 100   | 2021-02-02 |",
             "| Z  | 99    | 2021-02-01 |",
+            "+----+-------+------------+",
+        ];
+        let actual = get_data(&table).await;
+        assert_batches_sorted_eq!(&expected, &actual);
+    }
+
+    #[tokio::test]
+    async fn test_merge_non_identity_when_matched() {
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(None).await;
+        let table = write_data(table, &schema).await;
+
+        let source = upsert_source(vec![("A", 99, "2024-06-01")]);
+
+        let (table, _metrics) = table
+            .merge(source, col("target.id").eq(col("source.id")))
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_matched_update(|u| {
+                u.update("id", col("source.id"))
+                    .update("value", col("source.value") + lit(1i32))
+                    .update("modified", col("source.modified"))
+            })
+            .unwrap()
+            .when_not_matched_insert(|i| {
+                i.set("id", col("source.id"))
+                    .set("value", col("source.value"))
+                    .set("modified", col("source.modified"))
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        let expected = vec![
+            "+----+-------+------------+",
+            "| id | value | modified   |",
+            "+----+-------+------------+",
+            "| A  | 100   | 2024-06-01 |",
+            "| B  | 10    | 2021-02-01 |",
+            "| C  | 10    | 2021-02-02 |",
+            "| D  | 100   | 2021-02-02 |",
+            "+----+-------+------------+",
+        ];
+        let actual = get_data(&table).await;
+        assert_batches_sorted_eq!(&expected, &actual);
+    }
+
+    #[tokio::test]
+    async fn test_merge_non_identity_when_not_matched() {
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(None).await;
+        let table = write_data(table, &schema).await;
+
+        let source = upsert_source(vec![("E", 99, "2024-06-01")]);
+
+        let (table, _metrics) = table
+            .merge(source, col("target.id").eq(col("source.id")))
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_matched_update(|u| {
+                u.update("id", col("source.id"))
+                    .update("value", col("source.value"))
+                    .update("modified", col("source.modified"))
+            })
+            .unwrap()
+            .when_not_matched_insert(|i| {
+                i.set("id", col("source.id"))
+                    .set("value", col("source.value") + lit(1i32))
+                    .set("modified", col("source.modified"))
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        let expected = vec![
+            "+----+-------+------------+",
+            "| id | value | modified   |",
+            "+----+-------+------------+",
+            "| A  | 1     | 2021-02-01 |",
+            "| B  | 10    | 2021-02-01 |",
+            "| C  | 10    | 2021-02-02 |",
+            "| D  | 100   | 2021-02-02 |",
+            "| E  | 100   | 2024-06-01 |",
             "+----+-------+------------+",
         ];
         let actual = get_data(&table).await;

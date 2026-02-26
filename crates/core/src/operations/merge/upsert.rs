@@ -5,8 +5,8 @@
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
 use crate::kernel::{Action, EagerSnapshot};
 use crate::logstore::LogStoreRef;
-use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::write::WriterStatsConfig;
+use crate::operations::write::execution::write_execution_plan_v2;
 use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::table::config::TablePropertiesExt;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
@@ -14,7 +14,7 @@ use arrow_array::Array;
 use datafusion::common::JoinType;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::expr::InList;
-use datafusion::logical_expr::{col, lit, Expr};
+use datafusion::logical_expr::{Expr, col, lit};
 use datafusion::prelude::DataFrame;
 use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
@@ -266,7 +266,7 @@ impl UpsertBuilder {
                 None,
                 filters,
             )?
-                .build()?,
+            .build()?,
         );
 
         Ok(target_df)
@@ -275,9 +275,10 @@ impl UpsertBuilder {
     /// Select only the join-key columns from the source for use in the anti-join.
     fn find_conflicts_keys_only(&self) -> DeltaResult<DataFrame> {
         let source_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
-        self.source.clone().select(source_keys).map_err(|e| {
-            DeltaTableError::Generic(format!("Error selecting source keys: {e}"))
-        })
+        self.source
+            .clone()
+            .select(source_keys)
+            .map_err(|e| DeltaTableError::Generic(format!("Error selecting source keys: {e}")))
     }
 
     /// No conflicts — simply append the source data.
@@ -429,8 +430,16 @@ impl UpsertBuilder {
             .join(
                 target_subset,
                 JoinType::Inner,
-                source_key_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice(),
-                target_key_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice(),
+                source_key_cols
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                target_key_cols
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
                 None,
             )
             .map_err(Into::into)
@@ -492,7 +501,13 @@ impl UpsertBuilder {
         let key_strs: Vec<&str> = self.join_keys.iter().map(|s| s.as_str()).collect();
         conflicts_df
             .clone()
-            .join(target_df.clone(), JoinType::RightAnti, &key_strs, &key_strs, None)
+            .join(
+                target_df.clone(),
+                JoinType::RightAnti,
+                &key_strs,
+                &key_strs,
+                None,
+            )
             .map_err(Into::into)
     }
 
@@ -512,7 +527,8 @@ impl UpsertBuilder {
 
         let canonical_schema = self.snapshot.arrow_schema();
         let source_aligned = reorder_to_schema(self.source.clone(), canonical_schema.as_ref())?;
-        let target_aligned = reorder_to_schema(target_no_conflict.clone(), canonical_schema.as_ref())?;
+        let target_aligned =
+            reorder_to_schema(target_no_conflict.clone(), canonical_schema.as_ref())?;
 
         source_aligned.union(target_aligned).map_err(|e| {
             DeltaTableError::Generic(format!("Union failed after schema alignment: {e}"))
