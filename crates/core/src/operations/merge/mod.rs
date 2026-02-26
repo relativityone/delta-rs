@@ -343,9 +343,6 @@ fn expr_to_bare_column(expr: &Expr, expected_alias: Option<&str>) -> Option<Stri
 
 /// Parse a SQL predicate string and extract join key column names from a
 /// conjunction of `source.col = target.col` equalities.
-///
-/// This is a best-effort string-based parser that handles the common patterns
-/// produced by the Python helpers and benchmark code.
 fn extract_join_keys_from_str(
     predicate: &str,
     source_alias: Option<&str>,
@@ -5137,6 +5134,56 @@ mod tests {
             "| B  | 10    | 2021-02-01 |",
             "| C  | 10    | 2021-02-02 |",
             "| D  | 100   | 2021-02-02 |",
+            "+----+-------+------------+",
+        ];
+        let actual = get_data(&table).await;
+        assert_batches_sorted_eq!(&expected, &actual);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_string_predicate() {
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(None).await;
+        let table = write_data(table, &schema).await;
+
+        // C conflicts (updated value), Y is new
+        let source = upsert_source(vec![("C", 42, "2021-02-02"), ("Y", 7, "2024-03-01")]);
+
+        let (table, metrics) = table
+            .merge(source, "target.id = source.id AND target.modified = source.modified")
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_matched_update(|u| {
+                u.update("id", col("source.id"))
+                    .update("value", col("source.value"))
+                    .update("modified", col("source.modified"))
+            })
+            .unwrap()
+            .when_not_matched_insert(|i| {
+                i.set("id", col("source.id"))
+                    .set("value", col("source.value"))
+                    .set("modified", col("source.modified"))
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        assert!(
+            metrics.num_target_files_removed >= 1,
+            "conflicting file should be removed"
+        );
+        assert!(metrics.num_target_files_added >= 1);
+        assert_eq!(metrics.num_target_rows_updated, 1); // C replaced
+
+        let expected = vec![
+            "+----+-------+------------+",
+            "| id | value | modified   |",
+            "+----+-------+------------+",
+            "| A  | 1     | 2021-02-01 |",
+            "| B  | 10    | 2021-02-01 |",
+            "| C  | 42    | 2021-02-02 |",
+            "| D  | 100   | 2021-02-02 |",
+            "| Y  | 7     | 2024-03-01 |",
             "+----+-------+------------+",
         ];
         let actual = get_data(&table).await;
