@@ -5,6 +5,7 @@
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
 use crate::kernel::{Action, EagerSnapshot};
 use crate::logstore::LogStoreRef;
+use crate::operations::CustomExecuteHandler;
 use crate::operations::write::WriterStatsConfig;
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::protocol::{DeltaOperation, MergePredicate};
@@ -56,6 +57,8 @@ pub(super) struct UpsertBuilder {
     writer_properties: Option<WriterProperties>,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
+    /// Handler for post-commit hooks
+    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
 impl UpsertBuilder {
@@ -73,6 +76,7 @@ impl UpsertBuilder {
             log_store,
             writer_properties: None,
             commit_properties: CommitProperties::default(),
+            custom_execute_handler: None,
         }
     }
 
@@ -85,6 +89,15 @@ impl UpsertBuilder {
     /// Set additional commit properties for the transaction.
     pub(super) fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
         self.commit_properties = commit_properties;
+        self
+    }
+
+    /// Set the custom execute handler for post-commit hooks.
+    pub(super) fn with_custom_execute_handler(
+        mut self,
+        handler: Arc<dyn CustomExecuteHandler>,
+    ) -> Self {
+        self.custom_execute_handler = Some(handler);
         self
     }
 
@@ -575,6 +588,7 @@ impl UpsertBuilder {
         let commit = CommitBuilder::from(commit_properties)
             .with_actions(actions)
             .with_operation_id(operation_id)
+            .with_post_commit_hook_handler(self.custom_execute_handler.clone())
             .build(Some(&self.snapshot), self.log_store.clone(), operation)
             .await?;
 
