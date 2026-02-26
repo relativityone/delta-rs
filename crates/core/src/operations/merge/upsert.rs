@@ -3,11 +3,11 @@
 //! All non-conflicting records are appended.
 
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::{Action, EagerSnapshot, Remove};
+use crate::kernel::{Action, EagerSnapshot};
 use crate::logstore::LogStoreRef;
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::write::WriterStatsConfig;
-use crate::protocol::{DeltaOperation, SaveMode};
+use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::table::config::TablePropertiesExt;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
 use arrow_array::Array;
@@ -535,15 +535,25 @@ impl UpsertBuilder {
         let mut commit_properties = self.commit_properties.clone();
         commit_properties.app_metadata = app_metadata;
 
-        let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns().to_vec();
-        let operation = DeltaOperation::Write {
-            mode: SaveMode::Append,
-            partition_by: if partition_columns.is_empty() {
-                None
-            } else {
-                Some(partition_columns)
-            },
+        let merge_predicate_sql = self
+            .join_keys
+            .iter()
+            .map(|k| format!("source.{k} = target.{k}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let operation = DeltaOperation::Merge {
             predicate: None,
+            merge_predicate: Some(merge_predicate_sql),
+            matched_predicates: vec![MergePredicate {
+                action_type: "update".to_owned(),
+                predicate: None,
+            }],
+            not_matched_predicates: vec![MergePredicate {
+                action_type: "insert".to_owned(),
+                predicate: None,
+            }],
+            not_matched_by_source_predicates: vec![],
         };
 
         let commit = CommitBuilder::from(commit_properties)
