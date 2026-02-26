@@ -355,7 +355,6 @@ fn extract_join_keys_from_str(
     let mut keys = Vec::with_capacity(clauses.len());
     for clause in clauses {
         let clause = clause.trim();
-        // Each clause must be  `<alias>.<col> = <alias>.<col>`
         let parts: Vec<&str> = clause.splitn(2, '=').collect();
         if parts.len() != 2 {
             return None;
@@ -396,16 +395,12 @@ fn str_eq_to_join_key(
 /// Parse a `alias.column` or bare `column` string, returning just the column
 /// name if `expected_alias` matches (or is `None`).
 fn str_parse_qualified_col(s: &str, expected_alias: Option<&str>) -> Option<String> {
-    // Strip backtick quoting that the Python layer sometimes produces.
     let s = s.trim().trim_matches('`');
     match expected_alias {
         Some(alias) => {
             let prefix = format!("{}.", alias);
-            let prefix_bt = format!("{}.`", alias);
             if let Some(rest) = s.strip_prefix(prefix.as_str()) {
                 Some(rest.trim_matches('`').to_string())
-            } else if let Some(rest) = s.strip_prefix(prefix_bt.as_str()) {
-                Some(rest.trim_end_matches('`').to_string())
             } else {
                 None
             }
@@ -5150,7 +5145,10 @@ mod tests {
         let source = upsert_source(vec![("C", 42, "2021-02-02"), ("Y", 7, "2024-03-01")]);
 
         let (table, metrics) = table
-            .merge(source, "target.id = source.id AND target.modified = source.modified")
+            .merge(
+                source,
+                "target.id = source.id AND `target.modified` = source.`modified`",
+            )
             .with_source_alias("source")
             .with_target_alias("target")
             .when_matched_update(|u| {
