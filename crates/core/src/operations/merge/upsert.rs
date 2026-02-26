@@ -14,14 +14,14 @@ use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
 use arrow_array::Array;
 use datafusion::common::JoinType;
+use datafusion::common::ScalarValue;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Expr, col, lit};
 use datafusion::prelude::DataFrame;
-use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Not;
 use std::sync::Arc;
 use std::time::Instant;
@@ -136,7 +136,7 @@ impl UpsertBuilder {
             .cloned()
             .collect();
 
-        let partition_filters: HashMap<String, Vec<String>> = self
+        let partition_filters: HashMap<String, HashSet<ScalarValue>> = self
             .extract_partition_filters(&relevant_partition_cols)
             .await?;
 
@@ -166,73 +166,46 @@ impl UpsertBuilder {
         }
     }
 
-    /// For each partition column, extract the unique values present in the source DataFrame.
+    /// For each partition column, extract the unique typed values present in the source DataFrame.
     async fn extract_partition_filters(
         &self,
         columns: &[String],
-    ) -> DeltaResult<HashMap<String, Vec<String>>> {
-        let mut partition_filters = HashMap::new();
+    ) -> DeltaResult<HashMap<String, HashSet<ScalarValue>>> {
+        if columns.is_empty() {
+            return Ok(HashMap::new());
+        }
 
-        for partition_col in columns {
-            if let Ok(batches) = self
-                .source
-                .clone()
-                .select(vec![col(partition_col)])? // No clone needed
-                .collect()
-                .await
-            {
-                // Collect all values from all batches into a single Vec<String>
-                let mut all_values = Vec::new();
-                for batch in batches {
-                    if let Ok(column_index) = batch.schema().index_of(partition_col) {
-                        let column = batch.column(column_index);
+        let select_exprs: Vec<Expr> = columns.iter().map(|c| col(c)).collect();
+        let batches = self.source.clone().select(select_exprs)?.collect().await?;
 
-                        if let Some(int_array) =
-                            column.as_any().downcast_ref::<arrow::array::Int32Array>()
-                        {
-                            all_values.extend(int_array.iter().flatten().map(|v| v.to_string()));
-                        } else if let Some(str_array) =
-                            column.as_any().downcast_ref::<arrow::array::StringArray>()
-                        {
-                            all_values.extend(str_array.iter().flatten().map(|v| v.to_string()));
-                        } else if let Some(int64_array) =
-                            column.as_any().downcast_ref::<arrow::array::Int64Array>()
-                        {
-                            all_values.extend(int64_array.iter().flatten().map(|v| v.to_string()));
-                        } else if let Some(uint32_array) =
-                            column.as_any().downcast_ref::<arrow::array::UInt32Array>()
-                        {
-                            all_values.extend(uint32_array.iter().flatten().map(|v| v.to_string()));
-                        } else if let Some(uint64_array) =
-                            column.as_any().downcast_ref::<arrow::array::UInt64Array>()
-                        {
-                            all_values.extend(uint64_array.iter().flatten().map(|v| v.to_string()));
-                        } else {
-                            return Err(DeltaTableError::Generic(format!(
-                                "Unsupported partition column type for '{}'",
-                                partition_col
-                            )));
-                        }
+        let mut seen: Vec<HashSet<ScalarValue>> =
+            (0..columns.len()).map(|_| HashSet::new()).collect();
+
+        for batch in &batches {
+            for (col_idx, seen_set) in seen.iter_mut().enumerate() {
+                let column = batch.column(col_idx);
+                for row_idx in 0..column.len() {
+                    if column.is_null(row_idx) {
+                        continue;
                     }
-                }
-
-                // Deduplicate values across all batches
-                let values: Vec<String> = all_values.into_iter().unique().collect();
-
-                if !values.is_empty() {
-                    partition_filters.insert(partition_col.to_string(), values);
+                    seen_set.insert(ScalarValue::try_from_array(column.as_ref(), row_idx)?);
                 }
             }
         }
 
-        Ok(partition_filters)
+        Ok(columns
+            .iter()
+            .zip(seen)
+            .filter(|(_, set)| !set.is_empty())
+            .map(|(col_name, set)| (col_name.to_string(), set))
+            .collect())
     }
 
     /// Create a DataFrame for the target table with optional partition filtering.
     fn create_target_dataframe(
         &self,
         state: &SessionState,
-        partition_filters: &HashMap<String, Vec<String>>,
+        partition_filters: &HashMap<String, HashSet<ScalarValue>>,
     ) -> DeltaResult<DataFrame> {
         let scan_config = crate::delta_datafusion::DeltaScanConfigBuilder::default()
             .with_file_column_name(&FILE_PATH_COLUMN.to_string())
@@ -246,30 +219,15 @@ impl UpsertBuilder {
             scan_config,
         )?);
 
-        // Create partition filters to limit scan scope
         let mut filters = Vec::new();
         for (column, values) in partition_filters {
             if !values.is_empty() {
-                let filter_values: Vec<Expr> = values
-                    .iter()
-                    .map(|v| {
-                        // Try to parse as integer first, then as string
-                        if let Ok(int_val) = v.parse::<i32>() {
-                            lit(int_val)
-                        } else if let Ok(int64_val) = v.parse::<i64>() {
-                            lit(int64_val)
-                        } else {
-                            lit(v.clone())
-                        }
-                    })
-                    .collect();
-
-                let filter_expr = Expr::InList(InList {
+                let filter_values: Vec<Expr> = values.iter().map(|sv| lit(sv.clone())).collect();
+                filters.push(Expr::InList(InList {
                     expr: Box::new(col(column)),
                     list: filter_values,
                     negated: false,
-                });
-                filters.push(filter_expr);
+                }));
             }
         }
 
