@@ -114,7 +114,7 @@ impl UpsertBuilder {
     ) -> DeltaResult<(DeltaTable, UpsertMetrics)> {
         let exec_start = Instant::now();
 
-        let (actions, mut metrics) = self.execute_upsert(state.as_ref()).await?;
+        let (actions, mut metrics) = self.execute_upsert(state.as_ref(), operation_id).await?;
         let table = self.commit_changes(actions, &metrics, operation_id).await?;
 
         metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
@@ -125,6 +125,7 @@ impl UpsertBuilder {
     async fn execute_upsert(
         &self,
         state: &SessionState,
+        operation_id: Uuid,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         // Get unique partition values from source to limit scan scope.
         // Only consider partition columns that are also join keys.
@@ -154,10 +155,10 @@ impl UpsertBuilder {
             .not();
 
         if has_conflicts {
-            self.execute_upsert_with_conflicts(state, &target_df, conflicts_df)
+            self.execute_upsert_with_conflicts(state, &target_df, conflicts_df, operation_id)
                 .await
         } else {
-            self.execute_simple_append(state).await
+            self.execute_simple_append(state, operation_id).await
         }
     }
 
@@ -299,6 +300,7 @@ impl UpsertBuilder {
     async fn execute_simple_append(
         &self,
         state: &SessionState,
+        operation_id: Uuid,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         let logical_plan = self.source.clone().into_unoptimized_plan();
         let physical_plan = state.create_physical_plan(&logical_plan).await?;
@@ -336,6 +338,7 @@ impl UpsertBuilder {
         state: &SessionState,
         target_df: &DataFrame,
         conflicts_df: DataFrame,
+        operation_id: Uuid,
     ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
         let conflicting_file_names = Self::extract_file_paths_from_conflicts(&conflicts_df).await?;
         let remove_actions = self.files_to_remove(&conflicting_file_names).await?;
@@ -362,7 +365,7 @@ impl UpsertBuilder {
             state,
             physical_plan,
             partition_columns,
-            self.log_store.object_store(None),
+            self.log_store.object_store(Some(operation_id)),
             Some(self.snapshot.table_properties().target_file_size().get() as usize),
             None,
             self.writer_properties.clone(),
