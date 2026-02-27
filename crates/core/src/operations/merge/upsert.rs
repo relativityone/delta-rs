@@ -436,31 +436,19 @@ impl UpsertBuilder {
         let mut conflicting_files = HashSet::new();
         for batch in &conflicting_paths {
             let file_path_col = batch.column(0);
-
-            if let Some(dict_array) = file_path_col
-                .as_any()
-                .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt16Type>>()
-            {
-                let keys = dict_array.keys();
-                let values = dict_array.values();
-                if let Some(str_values) =
-                    values.as_any().downcast_ref::<arrow::array::StringArray>()
-                {
-                    for key in keys.iter().flatten() {
-                        conflicting_files.insert(str_values.value(key as usize).to_string());
-                    }
-                }
-            } else if let Some(str_array) = file_path_col
+            let as_utf8 =
+                arrow::compute::cast(file_path_col.as_ref(), &arrow::datatypes::DataType::Utf8)
+                    .map_err(|e| {
+                        DeltaTableError::Generic(format!(
+                            "Failed to cast file path column to Utf8: {e}"
+                        ))
+                    })?;
+            let str_array = as_utf8
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
-            {
-                for value in str_array.iter().flatten() {
-                    conflicting_files.insert(value.to_string());
-                }
-            } else {
-                return Err(DeltaTableError::Generic(
-                    "Unsupported file path column type during conflict extraction".into(),
-                ));
+                .expect("cast to Utf8 must yield StringArray");
+            for value in str_array.iter().flatten() {
+                conflicting_files.insert(value.to_string());
             }
         }
 
