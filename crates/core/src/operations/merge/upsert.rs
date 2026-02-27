@@ -2,6 +2,7 @@
 //! For each conflicting record (matching on join keys), only the source record is kept.
 //! All non-conflicting records are appended.
 
+use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
 use crate::kernel::{Action, EagerSnapshot};
 use crate::logstore::LogStoreRef;
@@ -114,8 +115,11 @@ impl UpsertBuilder {
     ) -> DeltaResult<(DeltaTable, UpsertMetrics)> {
         let exec_start = Instant::now();
 
-        let (actions, mut metrics) = self.execute_upsert(state.as_ref(), operation_id).await?;
-        let table = self.commit_changes(actions, &metrics, operation_id).await?;
+        let (actions, mut metrics, partition_filters) =
+            self.execute_upsert(state.as_ref(), operation_id).await?;
+        let table = self
+            .commit_changes(actions, &metrics, &partition_filters, operation_id)
+            .await?;
 
         metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
         Ok((table, metrics))
@@ -126,7 +130,11 @@ impl UpsertBuilder {
         &self,
         state: &SessionState,
         operation_id: Uuid,
-    ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
+    ) -> DeltaResult<(
+        Vec<Action>,
+        UpsertMetrics,
+        HashMap<String, HashSet<ScalarValue>>,
+    )> {
         let relevant_partition_cols: Vec<String> = self
             .snapshot
             .metadata()
@@ -159,10 +167,13 @@ impl UpsertBuilder {
             .not();
 
         if has_conflicts {
-            self.execute_upsert_with_conflicts(state, &target_df, conflicts_df, operation_id)
-                .await
+            let (actions, metrics) = self
+                .execute_upsert_with_conflicts(state, &target_df, conflicts_df, operation_id)
+                .await?;
+            Ok((actions, metrics, partition_filters))
         } else {
-            self.execute_simple_append(state, operation_id).await
+            let (actions, metrics) = self.execute_simple_append(state, operation_id).await?;
+            Ok((actions, metrics, partition_filters))
         }
     }
 
@@ -517,21 +528,43 @@ impl UpsertBuilder {
         commit_properties
     }
 
-    fn merge_predicate_sql(&self) -> String {
-        self.join_keys
+    fn build_predicate_expr(
+        join_keys: &[String],
+        partition_filters: &HashMap<String, HashSet<ScalarValue>>,
+    ) -> Option<String> {
+        let mut clauses: Vec<Expr> = join_keys
             .iter()
-            .map(|k| format!("source.{k} = target.{k}"))
-            .collect::<Vec<_>>()
-            .join(" AND ")
+            .map(|k| col(format!("source.{k}")).eq(col(format!("target.{k}"))))
+            .collect();
+
+        for (col_name, values) in partition_filters {
+            if values.is_empty() {
+                continue;
+            }
+            let list: Vec<Expr> = values.iter().map(|sv| lit(sv.clone())).collect();
+            clauses.push(Expr::InList(InList {
+                expr: Box::new(col(format!("target.{col_name}"))),
+                list,
+                negated: false,
+            }));
+        }
+
+        clauses
+            .into_iter()
+            .reduce(|acc, clause| acc.and(clause))
+            .and_then(|expr| fmt_expr_to_sql(&expr).ok())
     }
 
-    fn build_merge_operation(&self) -> DeltaOperation {
+    fn build_merge_operation(
+        &self,
+        partition_filters: &HashMap<String, HashSet<ScalarValue>>,
+    ) -> DeltaOperation {
         const UPDATE_ACTION_TYPE: &str = "update";
         const INSERT_ACTION_TYPE: &str = "insert";
 
         DeltaOperation::Merge {
-            predicate: None,
-            merge_predicate: Some(self.merge_predicate_sql()),
+            predicate: Self::build_predicate_expr(&self.join_keys, partition_filters),
+            merge_predicate: Self::build_predicate_expr(&self.join_keys, &HashMap::new()),
             matched_predicates: vec![MergePredicate {
                 action_type: UPDATE_ACTION_TYPE.to_owned(),
                 predicate: None,
@@ -549,6 +582,7 @@ impl UpsertBuilder {
         &self,
         actions: Vec<Action>,
         metrics: &UpsertMetrics,
+        partition_filters: &HashMap<String, HashSet<ScalarValue>>,
         operation_id: Uuid,
     ) -> DeltaResult<DeltaTable> {
         if actions.is_empty() {
@@ -556,7 +590,7 @@ impl UpsertBuilder {
         }
 
         let commit_properties = self.build_commit_properties(metrics);
-        let operation = self.build_merge_operation();
+        let operation = self.build_merge_operation(partition_filters);
 
         let commit = CommitBuilder::from(commit_properties)
             .with_actions(actions)
