@@ -174,7 +174,14 @@ fn try_detect_upsert_join_keys(
 
     // 6. The predicate must be a conjunction of `source.col = target.col` equalities.
     let tgt_alias: Option<&str> = target_alias.as_deref();
+    extract_join_keys(predicate, src_alias, tgt_alias)
+}
 
+fn extract_join_keys(
+    predicate: &Expression,
+    src_alias: Option<&str>,
+    tgt_alias: Option<&str>,
+) -> Option<Vec<String>> {
     match predicate {
         Expression::DataFusion(expr) => extract_join_keys_from_expr(expr, src_alias, tgt_alias),
         Expression::String(s) => extract_join_keys_from_str(s, src_alias, tgt_alias),
@@ -348,8 +355,12 @@ fn extract_join_keys_from_str(
     source_alias: Option<&str>,
     target_alias: Option<&str>,
 ) -> Option<Vec<String>> {
-    let normalised = predicate.replace('\n', "").trim().to_lowercase();
-
+    let normalised = predicate
+        .lines()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_lowercase();
     let clauses: Vec<&str> = normalised.split(" and ").collect();
 
     let mut keys = Vec::with_capacity(clauses.len());
@@ -1982,7 +1993,9 @@ impl std::future::IntoFuture for MergeBuilder {
 mod tests {
     use crate::DeltaTable;
     use crate::TableProperty;
+    use crate::delta_datafusion::Expression;
     use crate::kernel::{Action, DataType, PrimitiveType, StructField};
+    use crate::operations::merge::extract_join_keys;
     use crate::operations::merge::filter::generalize_filter;
     use crate::protocol::*;
     use crate::writer::test_utils::datafusion::get_data;
@@ -5136,115 +5149,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upsert_string_predicate_with_newline() {
-        let schema = get_arrow_schema(&None);
-        let table = setup_table(None).await;
-        let table = write_data(table, &schema).await;
-
-        // C conflicts (updated value), Y is new
-        let source = upsert_source(vec![("C", 42, "2021-02-02"), ("Y", 7, "2024-03-01")]);
-
-        let (table, metrics) = table
-            .merge(
-                source,
-                r#"`target.id` = source.id AND
-    target.modified = source.`modified`"#,
-            )
-            .with_source_alias("source")
-            .with_target_alias("target")
-            .when_matched_update(|u| {
-                u.update("id", col("source.id"))
-                    .update("value", col("source.value"))
-                    .update("modified", col("source.modified"))
-            })
-            .unwrap()
-            .when_not_matched_insert(|i| {
-                i.set("id", col("source.id"))
-                    .set("value", col("source.value"))
-                    .set("modified", col("source.modified"))
-            })
-            .unwrap()
-            .await
-            .unwrap();
-
-        assert!(
-            metrics.num_target_files_removed >= 1,
-            "conflicting file should be removed"
-        );
-        assert!(metrics.num_target_files_added >= 1);
-        assert_eq!(metrics.num_target_rows_updated, 1); // C replaced
-
-        let expected = vec![
-            "+----+-------+------------+",
-            "| id | value | modified   |",
-            "+----+-------+------------+",
-            "| A  | 1     | 2021-02-01 |",
-            "| B  | 10    | 2021-02-01 |",
-            "| C  | 42    | 2021-02-02 |",
-            "| D  | 100   | 2021-02-02 |",
-            "| Y  | 7     | 2024-03-01 |",
-            "+----+-------+------------+",
-        ];
-        let actual = get_data(&table).await;
-        assert_batches_sorted_eq!(&expected, &actual);
-    }
-
-    #[tokio::test]
-    async fn test_upsert_predicate_with_and() {
-        let schema = get_arrow_schema(&None);
-        let table = setup_table(None).await;
-        let table = write_data(table, &schema).await;
-
-        // C conflicts (updated value), Y is new
-        let source = upsert_source(vec![("C", 42, "2021-02-02"), ("Y", 7, "2024-03-01")]);
-
-        let (table, metrics) = table
-            .merge(
-                source,
-                col("target.id")
-                    .eq(col("source.id"))
-                    .and(col("target.modified").eq(col("source.modified"))),
-            )
-            .with_source_alias("source")
-            .with_target_alias("target")
-            .when_matched_update(|u| {
-                u.update("id", col("source.id"))
-                    .update("value", col("source.value"))
-                    .update("modified", col("source.modified"))
-            })
-            .unwrap()
-            .when_not_matched_insert(|i| {
-                i.set("id", col("source.id"))
-                    .set("value", col("source.value"))
-                    .set("modified", col("source.modified"))
-            })
-            .unwrap()
-            .await
-            .unwrap();
-
-        assert!(
-            metrics.num_target_files_removed >= 1,
-            "conflicting file should be removed"
-        );
-        assert!(metrics.num_target_files_added >= 1);
-        assert_eq!(metrics.num_target_rows_updated, 1); // C replaced
-
-        let expected = vec![
-            "+----+-------+------------+",
-            "| id | value | modified   |",
-            "+----+-------+------------+",
-            "| A  | 1     | 2021-02-01 |",
-            "| B  | 10    | 2021-02-01 |",
-            "| C  | 42    | 2021-02-02 |",
-            "| D  | 100   | 2021-02-02 |",
-            "| Y  | 7     | 2024-03-01 |",
-            "+----+-------+------------+",
-        ];
-        let actual = get_data(&table).await;
-        assert_batches_sorted_eq!(&expected, &actual);
-    }
-
-    #[tokio::test]
     async fn test_merge_non_identity_when_not_matched() {
         let schema = get_arrow_schema(&None);
         let table = setup_table(None).await;
@@ -5284,5 +5188,134 @@ mod tests {
         ];
         let actual = get_data(&table).await;
         assert_batches_sorted_eq!(&expected, &actual);
+    }
+
+    #[test]
+    fn test_extract_join_keys_str_single_equality() {
+        let pred = Expression::String("target.id = source.id".to_string());
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert_eq!(keys, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn test_extract_join_keys_str_conjunction() {
+        let pred = Expression::String(
+            "target.id = source.id AND target.modified = source.modified".to_string(),
+        );
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        let mut keys = keys.expect("should detect join keys");
+        keys.sort();
+        assert_eq!(keys, vec!["id".to_string(), "modified".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_join_keys_str_reversed_order() {
+        let pred = Expression::String("source.id = target.id".to_string());
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert_eq!(keys, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn test_extract_join_keys_str_newline_in_predicate() {
+        let pred = Expression::String(
+            "`target.id` = source.id \r\n AND\ntarget.modified = source.`modified`".to_string(),
+        );
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        let mut keys = keys.expect("should detect join keys despite newline");
+        keys.sort();
+        assert_eq!(keys, vec!["id".to_string(), "modified".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_join_keys_str_non_equality_predicate() {
+        let pred = Expression::String("target.id > source.id".to_string());
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert!(keys.is_none());
+    }
+
+    #[test]
+    fn test_extract_join_keys_str_literal_in_predicate() {
+        let pred = Expression::String("target.id = source.id AND target.value = 42".to_string());
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert!(keys.is_none());
+    }
+
+    #[test]
+    fn test_extract_join_keys_str_same_side_equality() {
+        let pred = Expression::String("target.id = target.other".to_string());
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert!(keys.is_none());
+    }
+
+    #[test]
+    fn test_extract_join_keys_str_or_conjunction() {
+        let pred = Expression::String(
+            "target.id = source.id OR target.modified = source.modified".to_string(),
+        );
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert!(keys.is_none());
+    }
+
+    #[test]
+    fn test_extract_join_keys_expr_single_equality() {
+        let pred = Expression::DataFusion(col("target.id").eq(col("source.id")));
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert_eq!(keys, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn test_extract_join_keys_expr_conjunction() {
+        let pred = Expression::DataFusion(
+            col("target.id")
+                .eq(col("source.id"))
+                .and(col("target.modified").eq(col("source.modified"))),
+        );
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        let mut keys = keys.expect("should detect join keys");
+        keys.sort();
+        assert_eq!(keys, vec!["id".to_string(), "modified".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_join_keys_expr_reversed_order() {
+        let pred = Expression::DataFusion(col("source.id").eq(col("target.id")));
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert_eq!(keys, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn test_extract_join_keys_expr_non_equality() {
+        let pred = Expression::DataFusion(col("target.id").gt(col("source.id")));
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert!(keys.is_none());
+    }
+
+    #[test]
+    fn test_extract_join_keys_expr_literal_operand() {
+        let pred = Expression::DataFusion(
+            col("target.id")
+                .eq(col("source.id"))
+                .and(col("target.value").eq(lit(42i32))),
+        );
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert!(keys.is_none());
+    }
+
+    #[test]
+    fn test_extract_join_keys_expr_same_side_equality() {
+        let pred = Expression::DataFusion(col("target.id").eq(col("target.other")));
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert!(keys.is_none());
+    }
+
+    #[test]
+    fn test_extract_join_keys_expr_or_conjunction() {
+        let pred = Expression::DataFusion(
+            col("target.id")
+                .eq(col("source.id"))
+                .or(col("target.modified").eq(col("source.modified"))),
+        );
+        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
+        assert!(keys.is_none());
     }
 }
