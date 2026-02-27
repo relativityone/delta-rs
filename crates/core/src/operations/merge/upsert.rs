@@ -570,8 +570,18 @@ impl UpsertBuilder {
         const UPDATE_ACTION_TYPE: &str = "update";
         const INSERT_ACTION_TYPE: &str = "insert";
 
+        let non_partition_join_keys: Vec<_> = self
+            .join_keys
+            .iter()
+            .filter(|k| !partition_filters.contains_key(*k))
+            .cloned()
+            .collect();
+
         DeltaOperation::Merge {
-            predicate: Self::build_predicate_expr(&self.join_keys, partition_filters),
+            predicate: Self::build_predicate_expr(
+                non_partition_join_keys.as_ref(),
+                partition_filters,
+            ),
             merge_predicate: Self::build_predicate_expr(&self.join_keys, &HashMap::new()),
             matched_predicates: vec![MergePredicate {
                 action_type: UPDATE_ACTION_TYPE.to_owned(),
