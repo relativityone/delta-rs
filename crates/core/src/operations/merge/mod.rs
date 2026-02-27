@@ -1994,6 +1994,7 @@ mod tests {
     use crate::DeltaTable;
     use crate::TableProperty;
     use crate::delta_datafusion::Expression;
+    use crate::delta_datafusion::expr::fmt_expr_to_sql;
     use crate::kernel::{Action, DataType, PrimitiveType, StructField};
     use crate::operations::merge::extract_join_keys;
     use crate::operations::merge::filter::generalize_filter;
@@ -5190,132 +5191,92 @@ mod tests {
         assert_batches_sorted_eq!(&expected, &actual);
     }
 
-    #[test]
-    fn test_extract_join_keys_str_single_equality() {
-        let pred = Expression::String("target.id = source.id".to_string());
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert_eq!(keys, Some(vec!["id".to_string()]));
-    }
+    /// Helper to assert that both the DataFusion expression path and the String path of extract_join_keys produce the same expected result for a given expression.
+    fn assert_both_paths(expr: Expr, expected: Option<&[&str]>) {
+        let expected: Option<Vec<String>> = expected.map(|ks| {
+            let mut v: Vec<String> = ks.iter().map(|k| k.to_string()).collect();
+            v.sort();
+            v
+        });
 
-    #[test]
-    fn test_extract_join_keys_str_conjunction() {
-        let pred = Expression::String(
-            "target.id = source.id AND target.modified = source.modified".to_string(),
+        let mut got_expr = extract_join_keys(
+            &Expression::DataFusion(expr.clone()),
+            Some("source"),
+            Some("target"),
         );
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        let mut keys = keys.expect("should detect join keys");
-        keys.sort();
-        assert_eq!(keys, vec!["id".to_string(), "modified".to_string()]);
+        if let Some(keys) = got_expr.as_mut() {
+            keys.sort();
+        }
+        assert_eq!(got_expr, expected, "DataFusion path");
+
+        let sql =
+            fmt_expr_to_sql(&expr).expect("fmt_expr_to_sql should succeed for test expression");
+        let mut got_str =
+            extract_join_keys(&Expression::String(sql), Some("source"), Some("target"));
+        if let Some(keys) = got_str.as_mut() {
+            keys.sort();
+        }
+        assert_eq!(got_str, expected, "String path");
     }
 
     #[test]
-    fn test_extract_join_keys_str_reversed_order() {
-        let pred = Expression::String("source.id = target.id".to_string());
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert_eq!(keys, Some(vec!["id".to_string()]));
+    fn test_extract_join_keys_single_equality() {
+        assert_both_paths(col("target.id").eq(col("source.id")), Some(&["id"]));
     }
 
     #[test]
-    fn test_extract_join_keys_str_newline_in_predicate() {
+    fn test_extract_join_keys_conjunction() {
+        assert_both_paths(
+            col("target.id")
+                .eq(col("source.id"))
+                .and(col("target.modified").eq(col("source.modified"))),
+            Some(&["id", "modified"]),
+        );
+    }
+
+    #[test]
+    fn test_extract_join_keys_reversed_operand_order() {
+        assert_both_paths(col("source.id").eq(col("target.id")), Some(&["id"]));
+    }
+
+    #[test]
+    fn test_extract_join_keys_non_equality_predicate() {
+        assert_both_paths(col("target.id").gt(col("source.id")), None);
+    }
+
+    #[test]
+    fn test_extract_join_keys_literal_operand() {
+        assert_both_paths(
+            col("target.id")
+                .eq(col("source.id"))
+                .and(col("target.value").eq(lit(42i32))),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_extract_join_keys_same_side_equality() {
+        assert_both_paths(col("target.id").eq(col("target.other")), None);
+    }
+
+    #[test]
+    fn test_extract_join_keys_or_conjunction() {
+        assert_both_paths(
+            col("target.id")
+                .eq(col("source.id"))
+                .or(col("target.modified").eq(col("source.modified"))),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_extract_join_keys_str_newline_and_backtick_formatting() {
         let pred = Expression::String(
             "`target.id` = source.id \r\n AND\ntarget.modified = source.`modified`".to_string(),
         );
         let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        let mut keys = keys.expect("should detect join keys despite newline");
+        let mut keys = keys.expect("should detect join keys despite unusual formatting");
         keys.sort();
         assert_eq!(keys, vec!["id".to_string(), "modified".to_string()]);
-    }
-
-    #[test]
-    fn test_extract_join_keys_str_non_equality_predicate() {
-        let pred = Expression::String("target.id > source.id".to_string());
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert!(keys.is_none());
-    }
-
-    #[test]
-    fn test_extract_join_keys_str_literal_in_predicate() {
-        let pred = Expression::String("target.id = source.id AND target.value = 42".to_string());
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert!(keys.is_none());
-    }
-
-    #[test]
-    fn test_extract_join_keys_str_same_side_equality() {
-        let pred = Expression::String("target.id = target.other".to_string());
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert!(keys.is_none());
-    }
-
-    #[test]
-    fn test_extract_join_keys_str_or_conjunction() {
-        let pred = Expression::String(
-            "target.id = source.id OR target.modified = source.modified".to_string(),
-        );
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert!(keys.is_none());
-    }
-
-    #[test]
-    fn test_extract_join_keys_expr_single_equality() {
-        let pred = Expression::DataFusion(col("target.id").eq(col("source.id")));
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert_eq!(keys, Some(vec!["id".to_string()]));
-    }
-
-    #[test]
-    fn test_extract_join_keys_expr_conjunction() {
-        let pred = Expression::DataFusion(
-            col("target.id")
-                .eq(col("source.id"))
-                .and(col("target.modified").eq(col("source.modified"))),
-        );
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        let mut keys = keys.expect("should detect join keys");
-        keys.sort();
-        assert_eq!(keys, vec!["id".to_string(), "modified".to_string()]);
-    }
-
-    #[test]
-    fn test_extract_join_keys_expr_reversed_order() {
-        let pred = Expression::DataFusion(col("source.id").eq(col("target.id")));
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert_eq!(keys, Some(vec!["id".to_string()]));
-    }
-
-    #[test]
-    fn test_extract_join_keys_expr_non_equality() {
-        let pred = Expression::DataFusion(col("target.id").gt(col("source.id")));
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert!(keys.is_none());
-    }
-
-    #[test]
-    fn test_extract_join_keys_expr_literal_operand() {
-        let pred = Expression::DataFusion(
-            col("target.id")
-                .eq(col("source.id"))
-                .and(col("target.value").eq(lit(42i32))),
-        );
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert!(keys.is_none());
-    }
-
-    #[test]
-    fn test_extract_join_keys_expr_same_side_equality() {
-        let pred = Expression::DataFusion(col("target.id").eq(col("target.other")));
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert!(keys.is_none());
-    }
-
-    #[test]
-    fn test_extract_join_keys_expr_or_conjunction() {
-        let pred = Expression::DataFusion(
-            col("target.id")
-                .eq(col("source.id"))
-                .or(col("target.modified").eq(col("source.modified"))),
-        );
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        assert!(keys.is_none());
     }
 }
