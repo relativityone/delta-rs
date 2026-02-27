@@ -30,6 +30,12 @@ use uuid::Uuid;
 
 const FILE_PATH_COLUMN: &str = "__delta_rs_path";
 
+struct UpsertExecutionResult {
+    actions: Vec<Action>,
+    metrics: UpsertMetrics,
+    partition_filters: HashMap<String, HashSet<ScalarValue>>,
+}
+
 #[derive(Default, Debug, Clone, Serialize)]
 pub(super) struct UpsertMetrics {
     /// Number of files added to the target table
@@ -115,14 +121,12 @@ impl UpsertBuilder {
     ) -> DeltaResult<(DeltaTable, UpsertMetrics)> {
         let exec_start = Instant::now();
 
-        let (actions, mut metrics, partition_filters) =
-            self.execute_upsert(state.as_ref(), operation_id).await?;
-        let table = self
-            .commit_changes(actions, &metrics, &partition_filters, operation_id)
-            .await?;
+        let mut result = self.execute_upsert(state.as_ref(), operation_id).await?;
+        let table = self.commit_changes(&result, operation_id).await?;
 
-        metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
-        Ok((table, metrics))
+        result.metrics.execution_time_ms =
+            Instant::now().duration_since(exec_start).as_millis() as u64;
+        Ok((table, result.metrics))
     }
 
     /// Execute the main upsert logic
@@ -130,11 +134,7 @@ impl UpsertBuilder {
         &self,
         state: &SessionState,
         operation_id: Uuid,
-    ) -> DeltaResult<(
-        Vec<Action>,
-        UpsertMetrics,
-        HashMap<String, HashSet<ScalarValue>>,
-    )> {
+    ) -> DeltaResult<UpsertExecutionResult> {
         let relevant_partition_cols: Vec<String> = self
             .snapshot
             .metadata()
@@ -170,10 +170,18 @@ impl UpsertBuilder {
             let (actions, metrics) = self
                 .execute_upsert_with_conflicts(state, &target_df, conflicts_df, operation_id)
                 .await?;
-            Ok((actions, metrics, partition_filters))
+            Ok(UpsertExecutionResult {
+                actions,
+                metrics,
+                partition_filters,
+            })
         } else {
             let (actions, metrics) = self.execute_simple_append(state, operation_id).await?;
-            Ok((actions, metrics, partition_filters))
+            Ok(UpsertExecutionResult {
+                actions,
+                metrics,
+                partition_filters,
+            })
         }
     }
 
@@ -580,20 +588,18 @@ impl UpsertBuilder {
     /// Commit all changes to the Delta log.
     async fn commit_changes(
         &self,
-        actions: Vec<Action>,
-        metrics: &UpsertMetrics,
-        partition_filters: &HashMap<String, HashSet<ScalarValue>>,
+        result: &UpsertExecutionResult,
         operation_id: Uuid,
     ) -> DeltaResult<DeltaTable> {
-        if actions.is_empty() {
+        if result.actions.is_empty() {
             return Ok(self.table_from_current_snapshot());
         }
 
-        let commit_properties = self.build_commit_properties(metrics);
-        let operation = self.build_merge_operation(partition_filters);
+        let commit_properties = self.build_commit_properties(&result.metrics);
+        let operation = self.build_merge_operation(&result.partition_filters);
 
         let commit = CommitBuilder::from(commit_properties)
-            .with_actions(actions)
+            .with_actions(result.actions.clone())
             .with_operation_id(operation_id)
             .with_post_commit_hook_handler(self.custom_execute_handler.clone())
             .build(Some(&self.snapshot), self.log_store.clone(), operation)
