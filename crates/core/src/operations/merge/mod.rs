@@ -1824,7 +1824,8 @@ async fn execute(
     let source_count = find_metric_node(SOURCE_COUNT_ID, &write).ok_or_else(err)?;
     let op_count = find_metric_node(OUTPUT_COUNT_ID, &write).ok_or_else(err)?;
     let barrier = find_node::<MergeBarrierExec>(&write).ok_or_else(err)?;
-    let scan_count = find_node::<DeltaScan>(&write).ok_or_else(err)?;
+    //TODO DeltaScan seems optional for fast upsert path. We should default to 0
+    let scan_count = find_node::<DeltaScan>(&write);
 
     let table_partition_cols = current_metadata.partition_columns().clone();
     let writer_stats_config = WriterStatsConfig::from_config(snapshot.table_configuration());
@@ -1868,7 +1869,7 @@ async fn execute(
 
     let source_count_metrics = source_count.metrics().unwrap();
     let target_count_metrics = op_count.metrics().unwrap();
-    let scan_count_metrics = scan_count.metrics().unwrap();
+    let scan_count_metrics = scan_count.map(|sc| sc.metrics().unwrap());
 
     metrics.num_source_rows = get_metric(&source_count_metrics, SOURCE_COUNT_METRIC);
     metrics.num_target_rows_inserted = get_metric(&target_count_metrics, TARGET_INSERTED_METRIC);
@@ -1878,8 +1879,8 @@ async fn execute(
     metrics.num_output_rows = metrics.num_target_rows_inserted
         + metrics.num_target_rows_updated
         + metrics.num_target_rows_copied;
-    metrics.num_target_files_scanned = get_metric(&scan_count_metrics, "files_scanned");
-    metrics.num_target_files_skipped_during_scan = get_metric(&scan_count_metrics, "files_pruned");
+    metrics.num_target_files_scanned = scan_count_metrics.clone().map(|m| get_metric(&m, "files_scanned")).unwrap_or(0);
+    metrics.num_target_files_skipped_during_scan = scan_count_metrics.map(|m| get_metric(&m, "files_pruned")).unwrap_or(0);
     metrics.execution_time_ms = Instant::now().duration_since(exec_start).as_millis() as u64;
 
     let app_metadata = &mut commit_properties.app_metadata;
@@ -5043,6 +5044,7 @@ mod tests {
         let source = upsert_source(vec![("B", 99, "2024-01-01"), ("X", 77, "2024-01-01")]);
         let (table, metrics) = do_upsert(table, source).await;
 
+        println!("Metrics: {metrics:#?}");
         assert!(
             metrics.num_target_files_removed >= 1,
             "conflicting file should be removed"
@@ -5080,6 +5082,7 @@ mod tests {
         ]);
         let (table, metrics) = do_upsert(table, source).await;
 
+        println!("Metrics: {metrics:#?}");
         assert!(metrics.num_target_files_removed >= 1);
         assert!(metrics.num_target_files_added >= 1);
         assert_eq!(metrics.num_target_rows_updated, 4);
