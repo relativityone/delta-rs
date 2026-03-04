@@ -1273,456 +1273,549 @@ async fn execute(
     let target = DataFrame::new(state.clone(), target);
     let target = target.with_column(TARGET_COLUMN, lit(true))?;
 
-    let join = source.join(target, JoinType::Full, &[], &[], Some(predicate.clone()))?;
-    let join_schema_df = join.schema().to_owned();
+    let (projected, match_operations, not_match_target_operations, not_match_source_operations, schema_action) = if (false) {
+        let source_alias_str = source_alias.as_deref();
+        let target_alias_str = target_alias.as_deref();
+        let join_keys = extract_join_keys_from_expr(&predicate, source_alias_str, target_alias_str);
 
-    let match_operations: Vec<MergeOperation> = match_operations
-        .into_iter()
-        .map(|op| MergeOperation::try_from(op, &join_schema_df, &state, &target_alias))
-        .collect::<Result<Vec<MergeOperation>, DeltaTableError>>()?;
+        let source = source.drop_columns(&[SOURCE_COLUMN])?;
+        let target = target.drop_columns(&[TARGET_COLUMN])?;
 
-    let not_match_target_operations: Vec<MergeOperation> = not_match_target_operations
-        .into_iter()
-        .map(|op| MergeOperation::try_from(op, &join_schema_df, &state, &target_alias))
-        .collect::<Result<Vec<MergeOperation>, DeltaTableError>>()?;
+        let mut upsert =
+            UpsertBuilder::new(log_store.clone(), snapshot.clone(), join_keys.unwrap(), source)
+                .with_commit_properties(commit_properties.clone());
+        let upsert_df = upsert.execute_m_upsert(target).await?;
 
-    let not_match_source_operations: Vec<MergeOperation> = not_match_source_operations
-        .into_iter()
-        .map(|op| MergeOperation::try_from(op, &join_schema_df, &state, &target_alias))
-        .collect::<Result<Vec<MergeOperation>, DeltaTableError>>()?;
-
-    // merge_arrow_schema is used to tell whether the two schema can be merge but we use the operation statement to pick new columns
-    // this avoid the side effect of adding unnecessary columns (eg. target.id = source.ID) "ID" will not be added since "id" exist in target and end user intended it to be "id"
-    let mut new_schema = None;
-    let mut schema_action = None;
-    if merge_schema {
-        let merge_schema = merge_arrow_schema(
-            snapshot.input_schema(),
-            source_schema.inner().clone(),
-            false,
-        )?;
-
-        let mut schema_builder = SchemaBuilder::from(merge_schema.deref());
-
-        modify_schema(
-            &mut schema_builder,
-            target_schema,
-            source_schema,
-            &match_operations,
-        )?;
-
-        modify_schema(
-            &mut schema_builder,
-            target_schema,
-            source_schema,
-            &not_match_source_operations,
-        )?;
-
-        modify_schema(
-            &mut schema_builder,
-            target_schema,
-            source_schema,
-            &not_match_target_operations,
-        )?;
-        let schema = Arc::new(schema_builder.finish());
-        new_schema = Some(schema.clone());
-        let schema_struct: StructType = schema.try_into_kernel()?;
-        if &schema_struct != snapshot.schema().as_ref() {
-            let action = Action::Metadata(new_metadata(
-                &schema_struct,
-                current_metadata.partition_columns(),
-                snapshot.metadata().configuration(),
-            )?);
-            schema_action = Some(action);
-        }
-    }
-
-    let matched = col(SOURCE_COLUMN)
-        .is_true()
-        .and(col(TARGET_COLUMN).is_true());
-    let not_matched_target = col(SOURCE_COLUMN)
-        .is_true()
-        .and(col(TARGET_COLUMN).is_null());
-    let not_matched_source = col(SOURCE_COLUMN)
-        .is_null()
-        .and(col(TARGET_COLUMN))
-        .is_true();
-
-    // Plus 3 for the default operations for each match category
-    let operations_size = match_operations.len()
-        + not_match_source_operations.len()
-        + not_match_target_operations.len()
-        + 3;
-
-    let mut when_expr = Vec::with_capacity(operations_size);
-    let mut then_expr = Vec::with_capacity(operations_size);
-    let mut ops = Vec::with_capacity(operations_size);
-
-    fn update_case(
-        operations: Vec<MergeOperation>,
-        ops: &mut Vec<(HashMap<Column, Expr>, OperationType)>,
-        when_expr: &mut Vec<Expr>,
-        then_expr: &mut Vec<Expr>,
-        base_expr: &Expr,
-    ) -> DeltaResult<Vec<MergePredicate>> {
-        let mut predicates = Vec::with_capacity(operations.len());
-
-        for op in operations {
-            let predicate = match &op.predicate {
-                Some(predicate) => base_expr.clone().and(predicate.to_owned()),
-                None => base_expr.clone(),
-            };
-
-            when_expr.push(predicate);
-            then_expr.push(lit(ops.len() as i32));
-
-            ops.push((op.operations, op.r#type));
-
-            let action_type = match op.r#type {
-                OperationType::Update => "update",
-                OperationType::Delete => "delete",
-                OperationType::Insert => "insert",
-                OperationType::SourceDelete => {
-                    return Err(DeltaTableError::Generic("Invalid action type".to_string()));
-                }
-                OperationType::Copy => {
-                    return Err(DeltaTableError::Generic("Invalid action type".to_string()));
-                }
-            };
-
-            let action_type = action_type.to_string();
-            let predicate = op
-                .predicate
-                .map(|expr| fmt_expr_to_sql(&expr))
-                .transpose()?;
-
-            predicates.push(MergePredicate {
-                action_type,
-                predicate,
-            });
-        }
-        Ok(predicates)
-    }
-
-    let match_operations = update_case(
-        match_operations,
-        &mut ops,
-        &mut when_expr,
-        &mut then_expr,
-        &matched,
-    )?;
-
-    let not_match_target_operations = update_case(
-        not_match_target_operations,
-        &mut ops,
-        &mut when_expr,
-        &mut then_expr,
-        &not_matched_target,
-    )?;
-
-    let not_match_source_operations = update_case(
-        not_match_source_operations,
-        &mut ops,
-        &mut when_expr,
-        &mut then_expr,
-        &not_matched_source,
-    )?;
-
-    when_expr.push(matched);
-    then_expr.push(lit(ops.len() as i32));
-    ops.push((HashMap::new(), OperationType::Copy));
-
-    when_expr.push(not_matched_target);
-    then_expr.push(lit(ops.len() as i32));
-    ops.push((HashMap::new(), OperationType::SourceDelete));
-
-    when_expr.push(not_matched_source);
-    then_expr.push(lit(ops.len() as i32));
-    ops.push((HashMap::new(), OperationType::Copy));
-
-    let case = CaseBuilder::new(None, when_expr, then_expr, None).end()?;
-
-    let projection = join.with_column(OPERATION_COLUMN, case)?;
-
-    let mut new_columns = vec![];
-
-    let mut write_projection = Vec::new();
-    let mut write_projection_with_cdf = Vec::new();
-
-    let schema = if let Some(schema) = new_schema {
-        Arc::new(schema.try_into_kernel()?)
-    } else {
-        snapshot.schema()
-    };
-
-    for delta_field in schema.fields() {
-        let mut when_expr = Vec::with_capacity(operations_size);
-        let mut then_expr = Vec::with_capacity(operations_size);
-
-        let qualifier = match &target_alias {
-            Some(alias) => Some(TableReference::Bare {
-                table: alias.to_owned().into(),
-            }),
-            None => TableReference::none(),
-        };
-        let mut null_target_column = None;
-
-        let source_qualifier = match &source_alias {
-            Some(alias) => Some(TableReference::Bare {
-                table: alias.to_owned().into(),
-            }),
-            None => TableReference::none(),
-        };
-        let name = delta_field.name();
-        let mut cast_type: DataType = delta_field.data_type().try_into_arrow()?;
-
-        // Receive the correct column reference given that some columns are only in source table
-        let column = if let Some(field) = snapshot.schema().field(name) {
-            if field == delta_field {
-                Column::new(qualifier.clone(), name)
-            } else {
-                // when there is a change in the field such as an added column in a nested data types casts will break with the new field data type
-                let col_ref = Column::new(source_qualifier.clone(), name);
-                cast_type = source_schema.data_type(&col_ref)?.to_owned();
-                col_ref
-            }
-        } else {
-            null_target_column = Some(cast(
-                lit(ScalarValue::Null).alias(name),
-                delta_field.data_type().try_into_arrow()?,
-            ));
-            Column::new(source_qualifier.clone(), name)
-        };
-
-        for (idx, (operations, _)) in ops.iter().enumerate() {
-            let op = operations
-                .get(&column)
-                .map(|expr| expr.to_owned())
-                .unwrap_or_else(|| col(column.clone()));
-
-            when_expr.push(lit(idx as i32));
-            then_expr.push(op);
-        }
-
-        let case = CaseBuilder::new(
-            Some(Box::new(col(OPERATION_COLUMN))),
-            when_expr,
-            then_expr,
-            None,
-        )
-        .end()?;
-
-        let name = "__delta_rs_c_".to_owned() + delta_field.name();
-
-        write_projection.push(cast(
-            Expr::Column(Column::from_name(name.clone())).alias(delta_field.name()),
-            cast_type.clone(),
-        ));
-
-        write_projection_with_cdf.push(
-            when(
-                col(CDC_COLUMN_NAME).not_eq(lit("update_preimage")),
-                cast(
-                    Expr::Column(Column::from_name(name.clone())),
-                    cast_type.clone(),
-                ),
-            )
-            .otherwise(null_target_column.unwrap_or(cast(
-                Expr::Column(Column::new(qualifier, delta_field.name())),
-                cast_type,
-            )))? // We take the column from target table but in case of schema evolution we assign the column as null
-            .alias(delta_field.name()),
-        );
-        new_columns.push((name, case));
-    }
-
-    write_projection_with_cdf.push(col("_change_type"));
-
-    let mut insert_when = Vec::with_capacity(ops.len());
-    let mut insert_then = Vec::with_capacity(ops.len());
-
-    let mut update_when = Vec::with_capacity(ops.len());
-    let mut update_then = Vec::with_capacity(ops.len());
-
-    let mut target_delete_when = Vec::with_capacity(ops.len());
-    let mut target_delete_then = Vec::with_capacity(ops.len());
-
-    let mut delete_when = Vec::with_capacity(ops.len());
-    let mut delete_then = Vec::with_capacity(ops.len());
-
-    let mut copy_when = Vec::with_capacity(ops.len());
-    let mut copy_then = Vec::with_capacity(ops.len());
-
-    for (idx, (_operations, r#type)) in ops.iter().enumerate() {
-        let op = idx as i32;
-
-        // Used to indicate the record should be dropped prior to write
-        delete_when.push(lit(op));
-        delete_then.push(lit(matches!(
-            r#type,
-            OperationType::Delete | OperationType::SourceDelete
-        )));
-
-        // Use the null count on these arrays to determine how many records satisfy the predicate
-        insert_when.push(lit(op));
-        insert_then.push(
-            when(
-                lit(matches!(r#type, OperationType::Insert)),
-                lit(ScalarValue::Boolean(None)),
-            )
-            .otherwise(lit(false))?,
-        );
-
-        update_when.push(lit(op));
-        update_then.push(
-            when(
-                lit(matches!(r#type, OperationType::Update)),
-                lit(ScalarValue::Boolean(None)),
-            )
-            .otherwise(lit(false))?,
-        );
-
-        target_delete_when.push(lit(op));
-        target_delete_then.push(
-            when(
-                lit(matches!(r#type, OperationType::Delete)),
-                lit(ScalarValue::Boolean(None)),
-            )
-            .otherwise(lit(false))?,
-        );
-
-        copy_when.push(lit(op));
-        copy_then.push(
-            when(
-                lit(matches!(r#type, OperationType::Copy)),
-                lit(ScalarValue::Boolean(None)),
-            )
-            .otherwise(lit(false))?,
-        );
-    }
-
-    fn build_case(when: Vec<Expr>, then: Vec<Expr>) -> DataFusionResult<Expr> {
-        CaseBuilder::new(
-            Some(Box::new(col(OPERATION_COLUMN))),
-            when,
-            then,
-            Some(Box::new(lit(false))),
-        )
-        .end()
-    }
-
-    new_columns.push((
-        DELETE_COLUMN.to_owned(),
-        build_case(delete_when, delete_then)?,
-    ));
-    new_columns.push((
-        TARGET_INSERT_COLUMN.to_owned(),
-        build_case(insert_when, insert_then)?,
-    ));
-    new_columns.push((
-        TARGET_UPDATE_COLUMN.to_owned(),
-        build_case(update_when, update_then)?,
-    ));
-    new_columns.push((
-        TARGET_DELETE_COLUMN.to_owned(),
-        build_case(target_delete_when, target_delete_then)?,
-    ));
-    new_columns.push((
-        TARGET_COPY_COLUMN.to_owned(),
-        build_case(copy_when, copy_then)?,
-    ));
-
-    let new_columns = {
-        let plan = projection.into_unoptimized_plan();
-        let mut fields: Vec<Expr> = plan
+        let write_projection: Vec<Expr> = snapshot
             .schema()
-            .columns()
-            .iter()
-            .map(|f| col(f.clone()))
+            .fields()
+            .map(|f| col(f.name()))
             .collect();
 
-        fields.extend(new_columns.into_iter().map(|(name, ex)| ex.alias(name)));
-
-        LogicalPlanBuilder::from(plan).project(fields)?.build()?
-    };
-
-    let distribute_expr = col(file_column.as_str());
-
-    let merge_barrier = LogicalPlan::Extension(Extension {
-        node: Arc::new(MergeBarrier {
-            input: new_columns.clone(),
-            expr: distribute_expr,
-            file_column,
-        }),
-    });
-
-    // We should observe the metrics before we union the merge plan with the cdf_merge plan
-    // so that we get the metrics only for the merge plan.
-    let operation_count = LogicalPlan::Extension(Extension {
-        node: Arc::new(MetricObserver {
-            id: OUTPUT_COUNT_ID.into(),
-            input: merge_barrier,
-            enable_pushdown: false,
-        }),
-    });
-
-    let operation_count = DataFrame::new(state.clone(), operation_count);
-
-    let mut projected = if should_cdc {
-        operation_count
-            .clone()
+        // Build the same barrier input shape used by canonical merge so survivors are
+        // computed by MergeBarrierExec from __delta_rs_path.
+        let barrier_input = upsert_df
             .with_column(
-                CDC_COLUMN_NAME,
-                when(col(TARGET_DELETE_COLUMN).is_null(), lit("delete")) // nulls are equal to True
-                    .when(col(DELETE_COLUMN).is_null(), lit("source_delete"))
-                    .when(col(TARGET_COPY_COLUMN).is_null(), lit("copy"))
-                    .when(col(TARGET_INSERT_COLUMN).is_null(), lit("insert"))
-                    .when(col(TARGET_UPDATE_COLUMN).is_null(), lit("update"))
-                    .end()?,
+                OPERATION_COLUMN,
+                when(col(file_column.as_str()).is_not_null(), lit(1i32))
+                    .otherwise(lit(0i32))?,
             )?
-            .drop_columns(&["__delta_rs_path"])? // WEIRD bug caused by interaction with unnest_columns, has to be dropped otherwise throws schema error
+            .with_column(DELETE_COLUMN, lit(false))?
             .with_column(
-                "__delta_rs_update_expanded",
+                TARGET_INSERT_COLUMN,
                 when(
-                    col(CDC_COLUMN_NAME).eq(lit("update")),
-                    lit(ScalarValue::List(ScalarValue::new_list(
-                        &[
-                            ScalarValue::Utf8(Some("update_preimage".into())),
-                            ScalarValue::Utf8(Some("update_postimage".into())),
-                        ],
-                        &DataType::List(Field::new("element", DataType::Utf8, false).into()),
-                        true,
-                    ))),
+                    col(OPERATION_COLUMN).eq(lit(0i32)),
+                    lit(ScalarValue::Boolean(None)),
                 )
-                .end()?,
+                .otherwise(lit(false))?,
             )?
-            .unnest_columns(&["__delta_rs_update_expanded"])?
             .with_column(
-                CDC_COLUMN_NAME,
+                TARGET_UPDATE_COLUMN,
                 when(
-                    col(CDC_COLUMN_NAME).eq(lit("update")),
-                    col("__delta_rs_update_expanded"),
+                    col(OPERATION_COLUMN).eq(lit(1i32)),
+                    lit(ScalarValue::Boolean(None)),
                 )
-                .otherwise(col(CDC_COLUMN_NAME))?,
+                .otherwise(lit(false))?,
             )?
-            .drop_columns(&["__delta_rs_update_expanded"])?
-            .select(write_projection_with_cdf)?
-    } else {
-        operation_count
+            .with_column(TARGET_DELETE_COLUMN, lit(false))?
+            .with_column(TARGET_COPY_COLUMN, lit(false))?;
+
+        let merge_barrier = LogicalPlan::Extension(Extension {
+            node: Arc::new(MergeBarrier {
+                input: barrier_input.into_unoptimized_plan(),
+                expr: col(file_column.as_str()),
+                file_column: file_column.clone(),
+            }),
+        });
+
+        let operation_count = LogicalPlan::Extension(Extension {
+            node: Arc::new(MetricObserver {
+                id: OUTPUT_COUNT_ID.into(),
+                input: merge_barrier,
+                enable_pushdown: false,
+            }),
+        });
+
+        let projected = DataFrame::new(state.clone(), operation_count)
             .filter(col(DELETE_COLUMN).is_false())?
-            .select(write_projection)?
+            .select(write_projection)?;
+
+        let match_operations = vec![MergePredicate {
+            action_type: "update".to_owned(),
+            predicate: None,
+        }];
+
+        let not_matched_predicates = vec![MergePredicate {
+            action_type: "insert".to_owned(),
+            predicate: None,
+        }];
+
+        let not_matched_by_source_predicates = vec![];
+        (
+            projected,
+            match_operations,
+            not_matched_predicates,
+            not_matched_by_source_predicates,
+            None
+        )
+    }
+    else {
+        let join = source.join(target, JoinType::Full, &[], &[], Some(predicate.clone()))?;
+        let join_schema_df = join.schema().to_owned();
+
+        let match_operations: Vec<MergeOperation> = match_operations
+            .into_iter()
+            .map(|op| MergeOperation::try_from(op, &join_schema_df, &state, &target_alias))
+            .collect::<Result<Vec<MergeOperation>, DeltaTableError>>()?;
+
+        let not_match_target_operations: Vec<MergeOperation> = not_match_target_operations
+            .into_iter()
+            .map(|op| MergeOperation::try_from(op, &join_schema_df, &state, &target_alias))
+            .collect::<Result<Vec<MergeOperation>, DeltaTableError>>()?;
+
+        let not_match_source_operations: Vec<MergeOperation> = not_match_source_operations
+            .into_iter()
+            .map(|op| MergeOperation::try_from(op, &join_schema_df, &state, &target_alias))
+            .collect::<Result<Vec<MergeOperation>, DeltaTableError>>()?;
+
+        // merge_arrow_schema is used to tell whether the two schema can be merge but we use the operation statement to pick new columns
+        // this avoid the side effect of adding unnecessary columns (eg. target.id = source.ID) "ID" will not be added since "id" exist in target and end user intended it to be "id"
+        let mut new_schema = None;
+        let mut schema_action = None;
+        if merge_schema {
+            let merge_schema = merge_arrow_schema(
+                snapshot.input_schema(),
+                source_schema.inner().clone(),
+                false,
+            )?;
+
+            let mut schema_builder = SchemaBuilder::from(merge_schema.deref());
+
+            modify_schema(
+                &mut schema_builder,
+                target_schema,
+                source_schema,
+                &match_operations,
+            )?;
+
+            modify_schema(
+                &mut schema_builder,
+                target_schema,
+                source_schema,
+                &not_match_source_operations,
+            )?;
+
+            modify_schema(
+                &mut schema_builder,
+                target_schema,
+                source_schema,
+                &not_match_target_operations,
+            )?;
+            let schema = Arc::new(schema_builder.finish());
+            new_schema = Some(schema.clone());
+            let schema_struct: StructType = schema.try_into_kernel()?;
+            if &schema_struct != snapshot.schema().as_ref() {
+                let action = Action::Metadata(new_metadata(
+                    &schema_struct,
+                    current_metadata.partition_columns(),
+                    snapshot.metadata().configuration(),
+                )?);
+                schema_action = Some(action);
+            }
+        }
+
+        let matched = col(SOURCE_COLUMN)
+            .is_true()
+            .and(col(TARGET_COLUMN).is_true());
+        let not_matched_target = col(SOURCE_COLUMN)
+            .is_true()
+            .and(col(TARGET_COLUMN).is_null());
+        let not_matched_source = col(SOURCE_COLUMN)
+            .is_null()
+            .and(col(TARGET_COLUMN))
+            .is_true();
+
+        // Plus 3 for the default operations for each match category
+        let operations_size = match_operations.len()
+            + not_match_source_operations.len()
+            + not_match_target_operations.len()
+            + 3;
+
+        let mut when_expr = Vec::with_capacity(operations_size);
+        let mut then_expr = Vec::with_capacity(operations_size);
+        let mut ops = Vec::with_capacity(operations_size);
+
+        fn update_case(
+            operations: Vec<MergeOperation>,
+            ops: &mut Vec<(HashMap<Column, Expr>, OperationType)>,
+            when_expr: &mut Vec<Expr>,
+            then_expr: &mut Vec<Expr>,
+            base_expr: &Expr,
+        ) -> DeltaResult<Vec<MergePredicate>> {
+            let mut predicates = Vec::with_capacity(operations.len());
+
+            for op in operations {
+                let predicate = match &op.predicate {
+                    Some(predicate) => base_expr.clone().and(predicate.to_owned()),
+                    None => base_expr.clone(),
+                };
+
+                when_expr.push(predicate);
+                then_expr.push(lit(ops.len() as i32));
+
+                ops.push((op.operations, op.r#type));
+
+                let action_type = match op.r#type {
+                    OperationType::Update => "update",
+                    OperationType::Delete => "delete",
+                    OperationType::Insert => "insert",
+                    OperationType::SourceDelete => {
+                        return Err(DeltaTableError::Generic("Invalid action type".to_string()));
+                    }
+                    OperationType::Copy => {
+                        return Err(DeltaTableError::Generic("Invalid action type".to_string()));
+                    }
+                };
+
+                let action_type = action_type.to_string();
+                let predicate = op
+                    .predicate
+                    .map(|expr| fmt_expr_to_sql(&expr))
+                    .transpose()?;
+
+                predicates.push(MergePredicate {
+                    action_type,
+                    predicate,
+                });
+            }
+            Ok(predicates)
+        }
+
+        let match_operations = update_case(
+            match_operations,
+            &mut ops,
+            &mut when_expr,
+            &mut then_expr,
+            &matched,
+        )?;
+
+        let not_match_target_operations = update_case(
+            not_match_target_operations,
+            &mut ops,
+            &mut when_expr,
+            &mut then_expr,
+            &not_matched_target,
+        )?;
+
+        let not_match_source_operations = update_case(
+            not_match_source_operations,
+            &mut ops,
+            &mut when_expr,
+            &mut then_expr,
+            &not_matched_source,
+        )?;
+
+        when_expr.push(matched);
+        then_expr.push(lit(ops.len() as i32));
+        ops.push((HashMap::new(), OperationType::Copy));
+
+        when_expr.push(not_matched_target);
+        then_expr.push(lit(ops.len() as i32));
+        ops.push((HashMap::new(), OperationType::SourceDelete));
+
+        when_expr.push(not_matched_source);
+        then_expr.push(lit(ops.len() as i32));
+        ops.push((HashMap::new(), OperationType::Copy));
+
+        let case = CaseBuilder::new(None, when_expr, then_expr, None).end()?;
+
+        let projection = join.with_column(OPERATION_COLUMN, case)?;
+
+        let mut new_columns = vec![];
+
+        let mut write_projection = Vec::new();
+        let mut write_projection_with_cdf = Vec::new();
+
+        let schema = if let Some(schema) = new_schema {
+            Arc::new(schema.try_into_kernel()?)
+        } else {
+            snapshot.schema()
+        };
+
+        for delta_field in schema.fields() {
+            let mut when_expr = Vec::with_capacity(operations_size);
+            let mut then_expr = Vec::with_capacity(operations_size);
+
+            let qualifier = match &target_alias {
+                Some(alias) => Some(TableReference::Bare {
+                    table: alias.to_owned().into(),
+                }),
+                None => TableReference::none(),
+            };
+            let mut null_target_column = None;
+
+            let source_qualifier = match &source_alias {
+                Some(alias) => Some(TableReference::Bare {
+                    table: alias.to_owned().into(),
+                }),
+                None => TableReference::none(),
+            };
+            let name = delta_field.name();
+            let mut cast_type: DataType = delta_field.data_type().try_into_arrow()?;
+
+            // Receive the correct column reference given that some columns are only in source table
+            let column = if let Some(field) = snapshot.schema().field(name) {
+                if field == delta_field {
+                    Column::new(qualifier.clone(), name)
+                } else {
+                    // when there is a change in the field such as an added column in a nested data types casts will break with the new field data type
+                    let col_ref = Column::new(source_qualifier.clone(), name);
+                    cast_type = source_schema.data_type(&col_ref)?.to_owned();
+                    col_ref
+                }
+            } else {
+                null_target_column = Some(cast(
+                    lit(ScalarValue::Null).alias(name),
+                    delta_field.data_type().try_into_arrow()?,
+                ));
+                Column::new(source_qualifier.clone(), name)
+            };
+
+            for (idx, (operations, _)) in ops.iter().enumerate() {
+                let op = operations
+                    .get(&column)
+                    .map(|expr| expr.to_owned())
+                    .unwrap_or_else(|| col(column.clone()));
+
+                when_expr.push(lit(idx as i32));
+                then_expr.push(op);
+            }
+
+            let case = CaseBuilder::new(
+                Some(Box::new(col(OPERATION_COLUMN))),
+                when_expr,
+                then_expr,
+                None,
+            )
+                .end()?;
+
+            let name = "__delta_rs_c_".to_owned() + delta_field.name();
+
+            write_projection.push(cast(
+                Expr::Column(Column::from_name(name.clone())).alias(delta_field.name()),
+                cast_type.clone(),
+            ));
+
+            write_projection_with_cdf.push(
+                when(
+                    col(CDC_COLUMN_NAME).not_eq(lit("update_preimage")),
+                    cast(
+                        Expr::Column(Column::from_name(name.clone())),
+                        cast_type.clone(),
+                    ),
+                )
+                    .otherwise(null_target_column.unwrap_or(cast(
+                        Expr::Column(Column::new(qualifier, delta_field.name())),
+                        cast_type,
+                    )))? // We take the column from target table but in case of schema evolution we assign the column as null
+                    .alias(delta_field.name()),
+            );
+            new_columns.push((name, case));
+        }
+
+        write_projection_with_cdf.push(col("_change_type"));
+
+        let mut insert_when = Vec::with_capacity(ops.len());
+        let mut insert_then = Vec::with_capacity(ops.len());
+
+        let mut update_when = Vec::with_capacity(ops.len());
+        let mut update_then = Vec::with_capacity(ops.len());
+
+        let mut target_delete_when = Vec::with_capacity(ops.len());
+        let mut target_delete_then = Vec::with_capacity(ops.len());
+
+        let mut delete_when = Vec::with_capacity(ops.len());
+        let mut delete_then = Vec::with_capacity(ops.len());
+
+        let mut copy_when = Vec::with_capacity(ops.len());
+        let mut copy_then = Vec::with_capacity(ops.len());
+
+        for (idx, (_operations, r#type)) in ops.iter().enumerate() {
+            let op = idx as i32;
+
+            // Used to indicate the record should be dropped prior to write
+            delete_when.push(lit(op));
+            delete_then.push(lit(matches!(
+                r#type,
+                OperationType::Delete | OperationType::SourceDelete
+            )));
+
+            // Use the null count on these arrays to determine how many records satisfy the predicate
+            insert_when.push(lit(op));
+            insert_then.push(
+                when(
+                    lit(matches!(r#type, OperationType::Insert)),
+                    lit(ScalarValue::Boolean(None)),
+                )
+                    .otherwise(lit(false))?,
+            );
+
+            update_when.push(lit(op));
+            update_then.push(
+                when(
+                    lit(matches!(r#type, OperationType::Update)),
+                    lit(ScalarValue::Boolean(None)),
+                )
+                    .otherwise(lit(false))?,
+            );
+
+            target_delete_when.push(lit(op));
+            target_delete_then.push(
+                when(
+                    lit(matches!(r#type, OperationType::Delete)),
+                    lit(ScalarValue::Boolean(None)),
+                )
+                    .otherwise(lit(false))?,
+            );
+
+            copy_when.push(lit(op));
+            copy_then.push(
+                when(
+                    lit(matches!(r#type, OperationType::Copy)),
+                    lit(ScalarValue::Boolean(None)),
+                )
+                    .otherwise(lit(false))?,
+            );
+        }
+
+        fn build_case(when: Vec<Expr>, then: Vec<Expr>) -> DataFusionResult<Expr> {
+            CaseBuilder::new(
+                Some(Box::new(col(OPERATION_COLUMN))),
+                when,
+                then,
+                Some(Box::new(lit(false))),
+            )
+                .end()
+        }
+
+        new_columns.push((
+            DELETE_COLUMN.to_owned(),
+            build_case(delete_when, delete_then)?,
+        ));
+        new_columns.push((
+            TARGET_INSERT_COLUMN.to_owned(),
+            build_case(insert_when, insert_then)?,
+        ));
+        new_columns.push((
+            TARGET_UPDATE_COLUMN.to_owned(),
+            build_case(update_when, update_then)?,
+        ));
+        new_columns.push((
+            TARGET_DELETE_COLUMN.to_owned(),
+            build_case(target_delete_when, target_delete_then)?,
+        ));
+        new_columns.push((
+            TARGET_COPY_COLUMN.to_owned(),
+            build_case(copy_when, copy_then)?,
+        ));
+
+        let new_columns = {
+            let plan = projection.into_unoptimized_plan();
+            let mut fields: Vec<Expr> = plan
+                .schema()
+                .columns()
+                .iter()
+                .map(|f| col(f.clone()))
+                .collect();
+
+            fields.extend(new_columns.into_iter().map(|(name, ex)| ex.alias(name)));
+
+            LogicalPlanBuilder::from(plan).project(fields)?.build()?
+        };
+
+        let distribute_expr = col(file_column.as_str());
+
+        let merge_barrier = LogicalPlan::Extension(Extension {
+            node: Arc::new(MergeBarrier {
+                input: new_columns.clone(),
+                expr: distribute_expr,
+                file_column,
+            }),
+        });
+
+        // We should observe the metrics before we union the merge plan with the cdf_merge plan
+        // so that we get the metrics only for the merge plan.
+        let operation_count = LogicalPlan::Extension(Extension {
+            node: Arc::new(MetricObserver {
+                id: OUTPUT_COUNT_ID.into(),
+                input: merge_barrier,
+                enable_pushdown: false,
+            }),
+        });
+
+        let operation_count = DataFrame::new(state.clone(), operation_count);
+
+        let mut projected = if should_cdc {
+            operation_count
+                .clone()
+                .with_column(
+                    CDC_COLUMN_NAME,
+                    when(col(TARGET_DELETE_COLUMN).is_null(), lit("delete")) // nulls are equal to True
+                        .when(col(DELETE_COLUMN).is_null(), lit("source_delete"))
+                        .when(col(TARGET_COPY_COLUMN).is_null(), lit("copy"))
+                        .when(col(TARGET_INSERT_COLUMN).is_null(), lit("insert"))
+                        .when(col(TARGET_UPDATE_COLUMN).is_null(), lit("update"))
+                        .end()?,
+                )?
+                .drop_columns(&["__delta_rs_path"])? // WEIRD bug caused by interaction with unnest_columns, has to be dropped otherwise throws schema error
+                .with_column(
+                    "__delta_rs_update_expanded",
+                    when(
+                        col(CDC_COLUMN_NAME).eq(lit("update")),
+                        lit(ScalarValue::List(ScalarValue::new_list(
+                            &[
+                                ScalarValue::Utf8(Some("update_preimage".into())),
+                                ScalarValue::Utf8(Some("update_postimage".into())),
+                            ],
+                            &DataType::List(Field::new("element", DataType::Utf8, false).into()),
+                            true,
+                        ))),
+                    )
+                        .end()?,
+                )?
+                .unnest_columns(&["__delta_rs_update_expanded"])?
+                .with_column(
+                    CDC_COLUMN_NAME,
+                    when(
+                        col(CDC_COLUMN_NAME).eq(lit("update")),
+                        col("__delta_rs_update_expanded"),
+                    )
+                        .otherwise(col(CDC_COLUMN_NAME))?,
+                )?
+                .drop_columns(&["__delta_rs_update_expanded"])?
+                .select(write_projection_with_cdf)?
+        } else {
+            operation_count
+                .filter(col(DELETE_COLUMN).is_false())?
+                .select(write_projection)?
+        };
+
+        if let Some(generated_col_expressions) = generated_col_exp
+            && let Some(missing_generated_columns) = missing_generated_col
+        {
+            projected = add_generated_columns(
+                projected,
+                &generated_col_expressions,
+                &missing_generated_columns,
+                &state,
+            )?;
+        }
+
+        (projected, match_operations, not_match_target_operations, not_match_source_operations, schema_action)
     };
 
-    if let Some(generated_col_expressions) = generated_col_exp
-        && let Some(missing_generated_columns) = missing_generated_col
-    {
-        projected = add_generated_columns(
-            projected,
-            &generated_col_expressions,
-            &missing_generated_columns,
-            &state,
-        )?;
-    }
+    //print schema
+    println!("Final projected schema: {:#?}", projected.schema());
 
     let merge_final = &projected.into_unoptimized_plan();
     let write = state.create_physical_plan(merge_final).await?;
@@ -1907,78 +2000,31 @@ impl std::future::IntoFuture for MergeBuilder {
                 .map(|f| f.name().to_string())
                 .collect();
 
-            let canonical_only_feature = should_write_cdc(&snapshot)? || this.streaming;
+            let (snapshot, metrics) = execute(
+                this.predicate,
+                this.source,
+                this.log_store.clone(),
+                snapshot,
+                Arc::try_unwrap(state).unwrap_or_else(|arc| (*arc).clone()),
+                this.writer_properties,
+                this.commit_properties,
+                this.safe_cast,
+                this.streaming,
+                this.source_alias,
+                this.target_alias,
+                this.merge_schema,
+                this.match_operations,
+                this.not_match_operations,
+                this.not_match_source_operations,
+                operation_id,
+                this.custom_execute_handler.as_ref(),
+            )
+            .await?;
 
-            let result = if let Some(join_keys) = (!canonical_only_feature)
-                .then(|| {
-                    try_detect_upsert_join_keys(
-                        &this.predicate,
-                        &this.match_operations,
-                        &this.not_match_operations,
-                        &this.not_match_source_operations,
-                        this.merge_schema,
-                        &this.source_alias,
-                        &this.target_alias,
-                        &schema_field_names,
-                    )
-                })
-                .flatten()
-            {
-                let mut upsert =
-                    UpsertBuilder::new(this.log_store.clone(), snapshot, join_keys, this.source)
-                        .with_commit_properties(this.commit_properties);
-
-                if let Some(handler) = &this.custom_execute_handler {
-                    upsert = upsert.with_custom_execute_handler(handler.clone());
-                }
-
-                if let Some(wp) = this.writer_properties {
-                    upsert = upsert.with_writer_properties(wp);
-                }
-
-                let (table, upsert_metrics) = upsert.execute(state, operation_id).await?;
-
-                let merge_metrics = MergeMetrics {
-                    num_target_rows_updated: upsert_metrics.num_conflicting_records,
-                    num_target_files_added: upsert_metrics.num_added_files,
-                    num_target_files_removed: upsert_metrics.num_removed_files,
-                    execution_time_ms: upsert_metrics.execution_time_ms,
-                    scan_time_ms: upsert_metrics.scan_time_ms,
-                    rewrite_time_ms: upsert_metrics.write_time_ms,
-                    ..Default::default()
-                };
-
-                Ok((table, merge_metrics))
-            } else {
-                let (snapshot, metrics) = execute(
-                    this.predicate,
-                    this.source,
-                    this.log_store.clone(),
-                    snapshot,
-                    Arc::try_unwrap(state).unwrap_or_else(|arc| (*arc).clone()),
-                    this.writer_properties,
-                    this.commit_properties,
-                    this.safe_cast,
-                    this.streaming,
-                    this.source_alias,
-                    this.target_alias,
-                    this.merge_schema,
-                    this.match_operations,
-                    this.not_match_operations,
-                    this.not_match_source_operations,
-                    operation_id,
-                    this.custom_execute_handler.as_ref(),
-                )
-                .await?;
-
-                Ok((
-                    DeltaTable::new_with_state(
-                        this.log_store.clone(),
-                        DeltaTableState { snapshot },
-                    ),
-                    metrics,
-                ))
-            };
+            let result = Ok((
+                DeltaTable::new_with_state(this.log_store.clone(), DeltaTableState { snapshot }),
+                metrics,
+            ));
 
             if let Some(handler) = &this.custom_execute_handler {
                 handler.post_execute(&this.log_store, operation_id).await?;
@@ -2072,7 +2118,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         // write some data
         table
             .write(vec![batch.clone()])
@@ -2104,7 +2150,7 @@ mod tests {
                 )),
             ],
         )
-        .unwrap();
+            .unwrap();
         // write some data
         table
             .write(vec![batch.clone()])
@@ -2128,7 +2174,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         ctx.read_batch(batch).unwrap()
     }
 
@@ -2291,7 +2337,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (merged_table, _) = table
@@ -2348,7 +2394,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (after_table, metrics) = table
@@ -2454,7 +2500,7 @@ mod tests {
                 )),
             ],
         )
-        .unwrap();
+            .unwrap();
 
         let ctx = SessionContext::new();
 
@@ -2564,7 +2610,7 @@ mod tests {
                 )),
             ],
         )
-        .unwrap();
+            .unwrap();
 
         let ctx = SessionContext::new();
 
@@ -2641,7 +2687,7 @@ mod tests {
                 Arc::new(arrow::array::StringArray::from(vec!["B1", "C1", "X1"])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, _) = table
@@ -2704,7 +2750,7 @@ mod tests {
                 Arc::new(arrow::array::StringArray::from(vec!["B1", "C1", "X1"])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, _) = table
@@ -2776,7 +2822,7 @@ mod tests {
                 Arc::new(arrow::array::StringArray::from(vec!["B1", "C1", "X1"])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, _) = table
@@ -2849,7 +2895,7 @@ mod tests {
                 Arc::new(arrow::array::StringArray::from(vec!["B1", "C1", "X1"])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, _) = table
@@ -3083,7 +3129,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3176,7 +3222,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
         let (table, _metrics) = table
             .merge(
@@ -3238,7 +3284,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3316,7 +3362,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3419,7 +3465,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3488,7 +3534,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3556,7 +3602,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3619,7 +3665,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3688,7 +3734,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3752,7 +3798,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3818,7 +3864,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -3905,7 +3951,7 @@ mod tests {
                 Arc::new(arrow::array::StringArray::from(vec!["B1", "C1", "X1"])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, metrics) = table
@@ -4011,7 +4057,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let table = write_data(table, &arrow_schema).await;
@@ -4065,13 +4111,13 @@ mod tests {
             &mut placeholders,
             false,
         )
-        .unwrap();
+            .unwrap();
 
         let expected_filter = Expr::Placeholder(Placeholder {
             id: "id_0".to_owned(),
             field: None,
         })
-        .eq(col(Column::new(target.clone().into(), "id")));
+            .eq(col(Column::new(target.clone().into(), "id")));
 
         assert_eq!(generalized, expected_filter);
     }
@@ -4098,19 +4144,19 @@ mod tests {
             &mut placeholders,
             false,
         )
-        .unwrap();
+            .unwrap();
 
         // id_1 = target.id OR (id_2 and target.id is null)
         let expected_filter = Expr::Placeholder(Placeholder {
             id: "id_0".to_owned(),
             field: None,
         })
-        .eq(target_id.clone())
-        .or(Expr::Placeholder(Placeholder {
-            id: "id_1".to_owned(),
-            field: None,
-        })
-        .and(target_id.clone().is_null()));
+            .eq(target_id.clone())
+            .or(Expr::Placeholder(Placeholder {
+                id: "id_1".to_owned(),
+                field: None,
+            })
+                .and(target_id.clone().is_null()));
 
         assert_eq!(placeholders.len(), 2);
 
@@ -4143,13 +4189,13 @@ mod tests {
             &mut placeholders,
             false,
         )
-        .unwrap();
+            .unwrap();
 
         let expected_filter = Expr::Placeholder(Placeholder {
             id: "id_0".to_owned(),
             field: None,
         })
-        .eq(col(Column::new(target.clone().into(), "id")));
+            .eq(col(Column::new(target.clone().into(), "id")));
 
         assert_eq!(generalized, expected_filter);
 
@@ -4183,15 +4229,15 @@ mod tests {
             &mut placeholders,
             false,
         )
-        .unwrap();
+            .unwrap();
 
         // id_0 = target.id and target.id = 'C'
         let expected_filter = Expr::Placeholder(Placeholder {
             id: "id_0".to_owned(),
             field: None,
         })
-        .eq(col(Column::new(target.clone().into(), "id")))
-        .and(col(Column::new(target.clone().into(), "id")).eq(lit("C")));
+            .eq(col(Column::new(target.clone().into(), "id")))
+            .and(col(Column::new(target.clone().into(), "id")).eq(lit("C")));
 
         assert_eq!(generalized, expected_filter);
     }
@@ -4214,7 +4260,7 @@ mod tests {
             &mut placeholders,
             false,
         )
-        .unwrap();
+            .unwrap();
         let expected_filter_l = Expr::Placeholder(Placeholder {
             id: "id_0_min".to_owned(),
             field: None,
@@ -4248,13 +4294,13 @@ mod tests {
             &mut placeholders,
             false,
         )
-        .unwrap();
+            .unwrap();
 
         let expected_filter = Expr::Placeholder(Placeholder {
             id: "id_0".to_owned(),
             field: None,
         })
-        .eq(col(Column::new(target.clone().into(), "id")));
+            .eq(col(Column::new(target.clone().into(), "id")));
 
         assert_eq!(generalized, expected_filter);
     }
@@ -4304,7 +4350,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
 
         let table = table
             .write(vec![batch.clone()])
@@ -4328,7 +4374,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, _metrics) = table
@@ -4402,7 +4448,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
 
         let batch2 = RecordBatch::try_new(
             Arc::clone(&arrow_schema.clone()),
@@ -4418,7 +4464,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
 
         let table = table
             .write(vec![batch1, batch2])
@@ -4443,7 +4489,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, _metrics) = table
@@ -4529,7 +4575,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
 
         let table = table
             .write(vec![batch.clone()])
@@ -4553,7 +4599,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let source = ctx.read_batch(batch).unwrap();
 
         let (table, _metrics) = table
@@ -4619,7 +4665,7 @@ mod tests {
             &table.object_store(),
             Some(&object_store::path::Path::from("_change_data")),
         )
-        .await
+            .await
         {
             assert_eq!(
                 0,
@@ -4931,7 +4977,7 @@ mod tests {
                 )),
             ],
         )
-        .unwrap();
+            .unwrap();
         ctx.read_batch(batch).unwrap()
     }
 
@@ -5069,7 +5115,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let batch2 = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -5081,7 +5127,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let table = table
             .write(vec![batch1, batch2])
             .with_save_mode(SaveMode::Append)
@@ -5189,94 +5235,5 @@ mod tests {
         ];
         let actual = get_data(&table).await;
         assert_batches_sorted_eq!(&expected, &actual);
-    }
-
-    /// Helper to assert that both the DataFusion expression path and the String path of extract_join_keys produce the same expected result for a given expression.
-    fn assert_both_paths(expr: Expr, expected: Option<&[&str]>) {
-        let expected: Option<Vec<String>> = expected.map(|ks| {
-            let mut v: Vec<String> = ks.iter().map(|k| k.to_string()).collect();
-            v.sort();
-            v
-        });
-
-        let mut got_expr = extract_join_keys(
-            &Expression::DataFusion(expr.clone()),
-            Some("source"),
-            Some("target"),
-        );
-        if let Some(keys) = got_expr.as_mut() {
-            keys.sort();
-        }
-        assert_eq!(got_expr, expected, "DataFusion path");
-
-        let sql =
-            fmt_expr_to_sql(&expr).expect("fmt_expr_to_sql should succeed for test expression");
-        let mut got_str =
-            extract_join_keys(&Expression::String(sql), Some("source"), Some("target"));
-        if let Some(keys) = got_str.as_mut() {
-            keys.sort();
-        }
-        assert_eq!(got_str, expected, "String path");
-    }
-
-    #[test]
-    fn test_extract_join_keys_single_equality() {
-        assert_both_paths(col("target.id").eq(col("source.id")), Some(&["id"]));
-    }
-
-    #[test]
-    fn test_extract_join_keys_conjunction() {
-        assert_both_paths(
-            col("target.id")
-                .eq(col("source.id"))
-                .and(col("target.modified").eq(col("source.modified"))),
-            Some(&["id", "modified"]),
-        );
-    }
-
-    #[test]
-    fn test_extract_join_keys_reversed_operand_order() {
-        assert_both_paths(col("source.id").eq(col("target.id")), Some(&["id"]));
-    }
-
-    #[test]
-    fn test_extract_join_keys_non_equality_predicate() {
-        assert_both_paths(col("target.id").gt(col("source.id")), None);
-    }
-
-    #[test]
-    fn test_extract_join_keys_literal_operand() {
-        assert_both_paths(
-            col("target.id")
-                .eq(col("source.id"))
-                .and(col("target.value").eq(lit(42i32))),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_extract_join_keys_same_side_equality() {
-        assert_both_paths(col("target.id").eq(col("target.other")), None);
-    }
-
-    #[test]
-    fn test_extract_join_keys_or_conjunction() {
-        assert_both_paths(
-            col("target.id")
-                .eq(col("source.id"))
-                .or(col("target.modified").eq(col("source.modified"))),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_extract_join_keys_str_newline_and_backtick_formatting() {
-        let pred = Expression::String(
-            "`target.id` = source.id \r\n AND\ntarget.modified = source.`modified`".to_string(),
-        );
-        let keys = extract_join_keys(&pred, Some("source"), Some("target"));
-        let mut keys = keys.expect("should detect join keys despite unusual formatting");
-        keys.sort();
-        assert_eq!(keys, vec!["id".to_string(), "modified".to_string()]);
     }
 }

@@ -13,13 +13,14 @@ use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::table::config::TablePropertiesExt;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
+use arrow::datatypes::DataType as ArrowDataType;
 use arrow_array::Array;
 use datafusion::common::JoinType;
 use datafusion::common::ScalarValue;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Expr, col, lit};
-use datafusion::prelude::DataFrame;
+use datafusion::prelude::{DataFrame, cast};
 use parquet::file::properties::WriterProperties;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -127,6 +128,151 @@ impl UpsertBuilder {
         result.metrics.execution_time_ms =
             Instant::now().duration_since(exec_start).as_millis() as u64;
         Ok((table, result.metrics))
+    }
+
+    pub(super) async fn execute_m_upsert(
+        self,
+        target: DataFrame,
+    ) -> DeltaResult<DataFrame> {
+        let conflicts_df =
+            Self::extract_conflicts_dataframe(&target, &self.source, &self.join_keys)
+                .await?
+                .cache()
+                .await?;
+
+        let has_conflicts = conflicts_df
+            .clone()
+            .limit(0, Some(1))?
+            .collect()
+            .await?
+            .is_empty()
+            .not();
+
+        if has_conflicts {
+            let conflicting_file_names = Self::extract_file_paths_from_conflicts(&conflicts_df).await?;
+
+            // Keep __delta_rs_path for rows from affected target files.
+            let filtered_target_with_path =
+                Self::filter_conflicting_files_with_path(&target, &conflicting_file_names)?;
+
+            // Attach target file path to conflicting source rows so updates can be attributed
+            // to the original target file during MergeBarrier partitioning.
+            let source_with_path = self
+                .attach_conflict_file_path_to_source(&conflicts_df)?;
+
+            let conflicts_keys = self.find_conflicts_keys_only()?;
+            let non_conflicting_target =
+                self.get_non_conflicting_target_rows(&filtered_target_with_path, &conflicts_keys)?;
+
+            self.union_source_with_target_with_file_path(&source_with_path, &non_conflicting_target)
+        } else {
+            // Pure inserts: no target files to remove.
+            self.source
+                .clone()
+                .with_column(
+                    FILE_PATH_COLUMN,
+                    cast(
+                        lit(ScalarValue::Utf8(None)),
+                        ArrowDataType::Dictionary(
+                            Box::new(ArrowDataType::UInt16),
+                            Box::new(ArrowDataType::Utf8),
+                        ),
+                    ),
+                )
+                .map_err(Into::into)
+        }
+    }
+
+    fn filter_conflicting_files_with_path(
+        target_df: &DataFrame,
+        conflicting_file_names: &[String],
+    ) -> DeltaResult<DataFrame> {
+        target_df
+            .clone()
+            .filter(col(FILE_PATH_COLUMN).in_list(
+                conflicting_file_names.iter().map(|p| lit(p)).collect(),
+                false,
+            ))
+            .map_err(Into::into)
+    }
+
+    fn attach_conflict_file_path_to_source(&self, conflicts_df: &DataFrame) -> DeltaResult<DataFrame> {
+        // Avoid duplicate unqualified key names after join by aliasing conflict keys.
+        let rhs_key_names: Vec<String> = self
+            .join_keys
+            .iter()
+            .map(|k| format!("__delta_rs_conflict_key_{k}"))
+            .collect();
+
+        let mut rhs_select_exprs: Vec<Expr> = self
+            .join_keys
+            .iter()
+            .zip(rhs_key_names.iter())
+            .map(|(src_key, rhs_key)| col(src_key).alias(rhs_key))
+            .collect();
+        rhs_select_exprs.push(col(FILE_PATH_COLUMN));
+
+        let conflict_key_to_path = conflicts_df
+            .clone()
+            .select(rhs_select_exprs)?
+            .distinct()?;
+
+        let left_on: Vec<&str> = self.join_keys.iter().map(|s| s.as_str()).collect();
+        let right_on: Vec<&str> = rhs_key_names.iter().map(|s| s.as_str()).collect();
+
+        let joined = self
+            .source
+            .clone()
+            .join(
+                conflict_key_to_path,
+                JoinType::Left,
+                &left_on,
+                &right_on,
+                None,
+            )?;
+
+        // Keep only source columns + file path required by MergeBarrier partitioning.
+        let mut projected_cols: Vec<Expr> = self
+            .snapshot
+            .arrow_schema()
+            .fields()
+            .iter()
+            .map(|f| col(f.name()))
+            .collect();
+        projected_cols.push(col(FILE_PATH_COLUMN));
+
+        joined.select(projected_cols).map_err(Into::into)
+    }
+
+    fn union_source_with_target_with_file_path(
+        &self,
+        source_with_path: &DataFrame,
+        target_no_conflict_with_path: &DataFrame,
+    ) -> DeltaResult<DataFrame> {
+        fn reorder_to_schema(df: DataFrame, columns: &[String]) -> DeltaResult<DataFrame> {
+            let exprs: Vec<Expr> = columns.iter().map(col).collect();
+            df.select(exprs).map_err(|e| {
+                DeltaTableError::Generic(format!(
+                    "Failed to reorder DataFrame to reference schema: {e}"
+                ))
+            })
+        }
+
+        let mut canonical_columns: Vec<String> = self
+            .snapshot
+            .arrow_schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        canonical_columns.push(FILE_PATH_COLUMN.to_string());
+
+        let source_aligned = reorder_to_schema(source_with_path.clone(), &canonical_columns)?;
+        let target_aligned = reorder_to_schema(target_no_conflict_with_path.clone(), &canonical_columns)?;
+
+        source_aligned.union(target_aligned).map_err(|e| {
+            DeltaTableError::Generic(format!("Union failed after schema alignment: {e}"))
+        })
     }
 
     /// Execute the main upsert logic
