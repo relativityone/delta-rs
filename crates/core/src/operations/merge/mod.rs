@@ -37,7 +37,7 @@ use arrow_schema::{DataType, Field, SchemaBuilder};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, ExprSchema, ScalarValue, TableReference, plan_err};
+use datafusion::common::{plan_err, Column, DFSchema, ExprSchema, ScalarValue, TableReference};
 use datafusion::datasource::provider_as_source;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -45,10 +45,10 @@ use datafusion::logical_expr::build_join_schema;
 use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::{
-    Expr, JoinType, col, conditional_expressions::CaseBuilder, lit, when,
+    col, conditional_expressions::CaseBuilder, lit, when, Expr, JoinType,
 };
 use datafusion::logical_expr::{
-    Extension, LogicalPlan, LogicalPlanBuilder, UNNAMED_TABLE, UserDefinedLogicalNode,
+    Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode, UNNAMED_TABLE,
 };
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::physical_plan::metrics::MetricBuilder;
@@ -56,7 +56,7 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::{
     execution::context::SessionState,
     physical_plan::ExecutionPlan,
-    prelude::{DataFrame, cast},
+    prelude::{cast, DataFrame},
 };
 
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow as _, TryIntoKernel as _};
@@ -72,25 +72,25 @@ use self::barrier::{MergeBarrier, MergeBarrierExec};
 use super::{CustomExecuteHandler, Operation};
 use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::delta_datafusion::logical::MetricObserver;
-use crate::delta_datafusion::physical::{MetricObserverExec, find_metric_node, get_metric};
+use crate::delta_datafusion::physical::{find_metric_node, get_metric, MetricObserverExec};
 use crate::delta_datafusion::planner::DeltaPlanner;
 use crate::delta_datafusion::{
-    DataFusionMixins, DeltaColumn, DeltaScan, DeltaScanConfigBuilder, DeltaSessionExt,
-    DeltaTableProvider, SessionFallbackPolicy, SessionResolveContext, create_session,
-    resolve_session_state,
+    create_session, resolve_session_state, DataFusionMixins, DeltaColumn, DeltaScan,
+    DeltaScanConfigBuilder, DeltaSessionExt, DeltaTableProvider, SessionFallbackPolicy,
+    SessionResolveContext,
 };
-use crate::delta_datafusion::{Expression, into_expr, maybe_into_expr};
+use crate::delta_datafusion::{into_expr, maybe_into_expr, Expression};
 use crate::kernel::schema::cast::{merge_arrow_field, merge_arrow_schema};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
-use crate::kernel::{Action, EagerSnapshot, StructTypeExt, new_metadata, resolve_snapshot};
+use crate::kernel::{new_metadata, resolve_snapshot, Action, EagerSnapshot, StructTypeExt};
 use crate::logstore::LogStoreRef;
 use crate::operations::cdc::*;
 use crate::operations::merge::barrier::find_node;
-use crate::operations::write::WriterStatsConfig;
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::write::generated_columns::{
     add_generated_columns, add_missing_generated_columns, gc_is_enabled,
 };
+use crate::operations::write::WriterStatsConfig;
 use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
@@ -117,7 +117,7 @@ use upsert::UpsertBuilder;
 /// conditions are met, or `None` if the merge cannot be routed through the
 /// faster upsert path.
 fn try_detect_upsert_join_keys(
-    predicate: &Expression,
+    predicate: &Expr,
     match_operations: &[MergeOperationConfig],
     not_match_operations: &[MergeOperationConfig],
     not_match_source_operations: &[MergeOperationConfig],
@@ -174,18 +174,7 @@ fn try_detect_upsert_join_keys(
 
     // 6. The predicate must be a conjunction of `source.col = target.col` equalities.
     let tgt_alias: Option<&str> = target_alias.as_deref();
-    extract_join_keys(predicate, src_alias, tgt_alias)
-}
-
-fn extract_join_keys(
-    predicate: &Expression,
-    src_alias: Option<&str>,
-    tgt_alias: Option<&str>,
-) -> Option<Vec<String>> {
-    match predicate {
-        Expression::DataFusion(expr) => extract_join_keys_from_expr(expr, src_alias, tgt_alias),
-        Expression::String(s) => extract_join_keys_from_str(s, src_alias, tgt_alias),
-    }
+    extract_join_keys_from_expr(predicate, src_alias, tgt_alias)
 }
 
 /// Check that the `operations` HashMap is a **full identity mapping**: every
@@ -199,7 +188,7 @@ fn operations_are_full_identity_mappings(
     schema_fields: &[String],
     source_alias: Option<&str>,
 ) -> bool {
-    if operations.len() < schema_fields.len() {
+    if operations.len() != schema_fields.len() {
         return false;
     }
     // Build a lookup: target column name -> expression
@@ -345,85 +334,6 @@ fn expr_to_bare_column(expr: &Expr, expected_alias: Option<&str>) -> Option<Stri
         }
     } else {
         None
-    }
-}
-
-/// Parse a SQL predicate string and extract join key column names from a
-/// conjunction of `source.col = target.col` equalities.
-fn extract_join_keys_from_str(
-    predicate: &str,
-    source_alias: Option<&str>,
-    target_alias: Option<&str>,
-) -> Option<Vec<String>> {
-    let normalised = predicate
-        .lines()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_lowercase();
-    let clauses: Vec<&str> = normalised.split(" and ").collect();
-
-    let mut keys = Vec::with_capacity(clauses.len());
-    for clause in clauses {
-        let clause = clause.trim();
-        let parts: Vec<&str> = clause.splitn(2, '=').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        let lhs = parts[0].trim();
-        let rhs = parts[1].trim();
-
-        if let Some(key) = str_eq_to_join_key(lhs, rhs, source_alias, target_alias)
-            .or_else(|| str_eq_to_join_key(rhs, lhs, source_alias, target_alias))
-        {
-            keys.push(key);
-        } else {
-            return None;
-        }
-    }
-
-    if keys.is_empty() { None } else { Some(keys) }
-}
-
-/// Check whether `lhs_str` refers to the source alias and `rhs_str` to the
-/// target alias (both of the form `alias.column`).  Returns the bare column
-/// name when the pattern matches.
-fn str_eq_to_join_key(
-    lhs_str: &str,
-    rhs_str: &str,
-    source_alias: Option<&str>,
-    target_alias: Option<&str>,
-) -> Option<String> {
-    let src_col = str_parse_qualified_col(lhs_str, source_alias)?;
-    let tgt_col = str_parse_qualified_col(rhs_str, target_alias)?;
-    if src_col == tgt_col {
-        Some(src_col)
-    } else {
-        None
-    }
-}
-
-/// Parse a `alias.column` or bare `column` string, returning just the column
-/// name if `expected_alias` matches (or is `None`).
-fn str_parse_qualified_col(s: &str, expected_alias: Option<&str>) -> Option<String> {
-    let s = s.trim().trim_matches('`');
-    match expected_alias {
-        Some(alias) => {
-            let prefix = format!("{}.", alias);
-            if let Some(rest) = s.strip_prefix(prefix.as_str()) {
-                Some(rest.trim_matches('`').to_string())
-            } else {
-                None
-            }
-        }
-        None => {
-            // Bare column — must not contain a dot.
-            if s.contains('.') {
-                None
-            } else {
-                Some(s.to_string())
-            }
-        }
     }
 }
 
@@ -1273,18 +1183,26 @@ async fn execute(
     let target = DataFrame::new(state.clone(), target);
     let target = target.with_column(TARGET_COLUMN, lit(true))?;
 
+
     let (projected, match_operations, not_match_target_operations, not_match_source_operations, schema_action) = if (false) {
+        let source = source.with_column(TARGET_COLUMN, lit(ScalarValue::Boolean(None)))?;
+        let target = target.with_column(SOURCE_COLUMN, lit(ScalarValue::Boolean(None)))?;
+
         let source_alias_str = source_alias.as_deref();
         let target_alias_str = target_alias.as_deref();
-        let join_keys = extract_join_keys_from_expr(&predicate, source_alias_str, target_alias_str);
+        let join_keys = extract_join_keys_from_expr(&predicate, source_alias_str, target_alias_str)
+            .unwrap();
 
-        let source = source.drop_columns(&[SOURCE_COLUMN])?;
-        let target = target.drop_columns(&[TARGET_COLUMN])?;
-
-        let mut upsert =
-            UpsertBuilder::new(log_store.clone(), snapshot.clone(), join_keys.unwrap(), source)
-                .with_commit_properties(commit_properties.clone());
+        let upsert = UpsertBuilder::new(
+            log_store.clone(),
+            snapshot.clone(),
+            join_keys,
+            source.clone(),
+        )
+        .with_commit_properties(commit_properties.clone());
         let upsert_df = upsert.execute_m_upsert(target).await?;
+
+        let source_row_expr = col(SOURCE_COLUMN).is_true();
 
         let write_projection: Vec<Expr> = snapshot
             .schema()
@@ -1297,8 +1215,9 @@ async fn execute(
         let barrier_input = upsert_df
             .with_column(
                 OPERATION_COLUMN,
-                when(col(file_column.as_str()).is_not_null(), lit(1i32))
-                    .otherwise(lit(0i32))?,
+                when(col(file_column.as_str()).is_null(), lit(0i32))
+                    .when(source_row_expr, lit(1i32))
+                    .otherwise(lit(2i32))?,
             )?
             .with_column(DELETE_COLUMN, lit(false))?
             .with_column(
@@ -1318,7 +1237,14 @@ async fn execute(
                 .otherwise(lit(false))?,
             )?
             .with_column(TARGET_DELETE_COLUMN, lit(false))?
-            .with_column(TARGET_COPY_COLUMN, lit(false))?;
+            .with_column(
+                TARGET_COPY_COLUMN,
+                when(
+                    col(OPERATION_COLUMN).eq(lit(2i32)),
+                    lit(ScalarValue::Boolean(None)),
+                )
+                .otherwise(lit(false))?,
+            )?;
 
         let merge_barrier = LogicalPlan::Extension(Extension {
             node: Arc::new(MergeBarrier {
@@ -2038,18 +1964,15 @@ impl std::future::IntoFuture for MergeBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::DeltaTable;
-    use crate::TableProperty;
-    use crate::delta_datafusion::Expression;
-    use crate::delta_datafusion::expr::fmt_expr_to_sql;
     use crate::kernel::{Action, DataType, PrimitiveType, StructField};
-    use crate::operations::merge::extract_join_keys;
     use crate::operations::merge::filter::generalize_filter;
     use crate::protocol::*;
     use crate::writer::test_utils::datafusion::get_data;
     use crate::writer::test_utils::get_arrow_schema;
     use crate::writer::test_utils::get_delta_schema;
     use crate::writer::test_utils::setup_table_with_configuration;
+    use crate::DeltaTable;
+    use crate::TableProperty;
     use arrow::datatypes::Schema as ArrowSchema;
     use arrow::record_batch::RecordBatch;
     use arrow_schema::DataType as ArrowDataType;
@@ -2057,10 +1980,10 @@ mod tests {
     use datafusion::assert_batches_sorted_eq;
     use datafusion::common::Column;
     use datafusion::common::TableReference;
-    use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::expr::Placeholder;
     use datafusion::logical_expr::lit;
+    use datafusion::logical_expr::Expr;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::*;
     use delta_kernel::engine::arrow_conversion::TryIntoKernel;

@@ -3,55 +3,28 @@
 //! All non-conflicting records are appended.
 
 use crate::delta_datafusion::expr::fmt_expr_to_sql;
-use crate::kernel::transaction::{CommitBuilder, CommitProperties};
+use crate::kernel::transaction::CommitProperties;
 use crate::kernel::{Action, EagerSnapshot};
 use crate::logstore::LogStoreRef;
 use crate::operations::CustomExecuteHandler;
-use crate::operations::write::WriterStatsConfig;
-use crate::operations::write::execution::write_execution_plan_v2;
 use crate::protocol::{DeltaOperation, MergePredicate};
-use crate::table::config::TablePropertiesExt;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
+use super::{SOURCE_COLUMN, TARGET_COLUMN};
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow_array::Array;
 use datafusion::common::JoinType;
 use datafusion::common::ScalarValue;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::expr::InList;
-use datafusion::logical_expr::{Expr, col, lit};
-use datafusion::prelude::{DataFrame, cast};
+use datafusion::logical_expr::{col, lit, Expr};
+use datafusion::prelude::{cast, DataFrame};
 use parquet::file::properties::WriterProperties;
-use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::ops::Not;
 use std::sync::Arc;
-use std::time::Instant;
-use uuid::Uuid;
 
 const FILE_PATH_COLUMN: &str = "__delta_rs_path";
-
-struct UpsertExecutionResult {
-    actions: Vec<Action>,
-    metrics: UpsertMetrics,
-    partition_filters: HashMap<String, HashSet<ScalarValue>>,
-}
-
-#[derive(Default, Debug, Clone, Serialize)]
-pub(super) struct UpsertMetrics {
-    /// Number of files added to the target table
-    pub num_added_files: usize,
-    /// Number of files removed from the target table
-    pub num_removed_files: usize,
-    /// Number of conflicting records detected (rows replaced/updated)
-    pub num_conflicting_records: usize,
-    /// Time taken to write the output files
-    pub write_time_ms: u64,
-    /// Time taken to scan the target files
-    pub scan_time_ms: u64,
-    /// Total execution time for the upsert operation
-    pub execution_time_ms: u64,
-}
 
 pub(super) struct UpsertBuilder {
     /// The join keys used to identify conflicts between source and target records
@@ -108,26 +81,6 @@ impl UpsertBuilder {
     ) -> Self {
         self.custom_execute_handler = Some(handler);
         self
-    }
-
-    /// Execute the upsert return the updated table together with metrics.
-    ///
-    /// `state` must already have the log-store registered.
-    /// `operation_id` is forwarded to the commit so that the caller can correlate it with
-    /// the post-execute hook.
-    pub(super) async fn execute(
-        self,
-        state: Arc<SessionState>,
-        operation_id: Uuid,
-    ) -> DeltaResult<(DeltaTable, UpsertMetrics)> {
-        let exec_start = Instant::now();
-
-        let mut result = self.execute_upsert(state.as_ref(), operation_id).await?;
-        let table = self.commit_changes(&result, operation_id).await?;
-
-        result.metrics.execution_time_ms =
-            Instant::now().duration_since(exec_start).as_millis() as u64;
-        Ok((table, result.metrics))
     }
 
     pub(super) async fn execute_m_upsert(
@@ -231,7 +184,7 @@ impl UpsertBuilder {
                 None,
             )?;
 
-        // Keep only source columns + file path required by MergeBarrier partitioning.
+        // Keep source columns + file path and lineage markers used by merge metrics routing.
         let mut projected_cols: Vec<Expr> = self
             .snapshot
             .arrow_schema()
@@ -240,6 +193,8 @@ impl UpsertBuilder {
             .map(|f| col(f.name()))
             .collect();
         projected_cols.push(col(FILE_PATH_COLUMN));
+        projected_cols.push(col(SOURCE_COLUMN));
+        projected_cols.push(col(TARGET_COLUMN));
 
         joined.select(projected_cols).map_err(Into::into)
     }
@@ -266,6 +221,8 @@ impl UpsertBuilder {
             .map(|f| f.name().to_string())
             .collect();
         canonical_columns.push(FILE_PATH_COLUMN.to_string());
+        canonical_columns.push(SOURCE_COLUMN.to_string());
+        canonical_columns.push(TARGET_COLUMN.to_string());
 
         let source_aligned = reorder_to_schema(source_with_path.clone(), &canonical_columns)?;
         let target_aligned = reorder_to_schema(target_no_conflict_with_path.clone(), &canonical_columns)?;
@@ -273,62 +230,6 @@ impl UpsertBuilder {
         source_aligned.union(target_aligned).map_err(|e| {
             DeltaTableError::Generic(format!("Union failed after schema alignment: {e}"))
         })
-    }
-
-    /// Execute the main upsert logic
-    async fn execute_upsert(
-        &self,
-        state: &SessionState,
-        operation_id: Uuid,
-    ) -> DeltaResult<UpsertExecutionResult> {
-        let relevant_partition_cols: Vec<String> = self
-            .snapshot
-            .metadata()
-            .partition_columns()
-            .iter()
-            .filter(|col| self.join_keys.contains(col))
-            .cloned()
-            .collect();
-
-        let partition_filters: HashMap<String, HashSet<ScalarValue>> = self
-            .extract_partition_filters(&relevant_partition_cols)
-            .await?;
-
-        // Create target DataFrame with partition filtering
-        let target_df = self.create_target_dataframe(state, &partition_filters)?;
-
-        // Check for conflicts between source and target and cache the result for reuse
-        let conflicts_df =
-            Self::extract_conflicts_dataframe(&target_df, &self.source, &self.join_keys)
-                .await?
-                .cache()
-                .await?;
-
-        let has_conflicts = conflicts_df
-            .clone()
-            .limit(0, Some(1))?
-            .collect()
-            .await?
-            .is_empty()
-            .not();
-
-        if has_conflicts {
-            let (actions, metrics) = self
-                .execute_upsert_with_conflicts(state, &target_df, conflicts_df, operation_id)
-                .await?;
-            Ok(UpsertExecutionResult {
-                actions,
-                metrics,
-                partition_filters,
-            })
-        } else {
-            let (actions, metrics) = self.execute_simple_append(state, operation_id).await?;
-            Ok(UpsertExecutionResult {
-                actions,
-                metrics,
-                partition_filters,
-            })
-        }
     }
 
     /// For each partition column, extract the unique typed values present in the source DataFrame.
@@ -417,100 +318,6 @@ impl UpsertBuilder {
             .clone()
             .select(source_keys)
             .map_err(|e| DeltaTableError::Generic(format!("Error selecting source keys: {e}")))
-    }
-
-    /// No conflicts — simply append the source data.
-    async fn execute_simple_append(
-        &self,
-        state: &SessionState,
-        operation_id: Uuid,
-    ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
-        let logical_plan = self.source.clone().into_unoptimized_plan();
-        let physical_plan = state.create_physical_plan(&logical_plan).await?;
-
-        let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns().to_vec();
-
-        let (add_actions, write_metrics) = write_execution_plan_v2(
-            Some(&self.snapshot),
-            state,
-            physical_plan,
-            partition_columns,
-            self.log_store.object_store(Some(operation_id)),
-            Some(self.snapshot.table_properties().target_file_size().get() as usize),
-            None,
-            self.writer_properties.clone(),
-            WriterStatsConfig::new(self.snapshot.table_properties().num_indexed_cols(), None),
-            None,
-            false,
-        )
-        .await?;
-
-        let metrics = UpsertMetrics {
-            num_added_files: add_actions.len(),
-            scan_time_ms: write_metrics.scan_time_ms,
-            write_time_ms: write_metrics.write_time_ms,
-            ..Default::default()
-        };
-
-        Ok((add_actions, metrics))
-    }
-
-    /// Conflicts detected — rewrite the affected files and append new rows.
-    async fn execute_upsert_with_conflicts(
-        &self,
-        state: &SessionState,
-        target_df: &DataFrame,
-        conflicts_df: DataFrame,
-        operation_id: Uuid,
-    ) -> DeltaResult<(Vec<Action>, UpsertMetrics)> {
-        let conflicting_file_names = Self::extract_file_paths_from_conflicts(&conflicts_df).await?;
-        let remove_actions = self.files_to_remove(&conflicting_file_names).await?;
-
-        let num_conflicting_records = conflicts_df.count().await?;
-
-        // Narrow the target scan to only the affected files, then drop the path column
-        let filtered_target_df =
-            Self::filter_conflicting_files(target_df, &conflicting_file_names)?;
-
-        // Anti-join: retain target rows whose join keys don't appear in the source
-        let conflicts_keys = self.find_conflicts_keys_only()?;
-        let non_conflicting_target =
-            self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_keys)?;
-        let result_df = self.union_source_with_target(&non_conflicting_target)?;
-
-        let logical_plan = result_df.into_unoptimized_plan();
-        let physical_plan = state.create_physical_plan(&logical_plan).await?;
-
-        let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns().to_vec();
-
-        let (add_actions, write_metrics) = write_execution_plan_v2(
-            Some(&self.snapshot),
-            state,
-            physical_plan,
-            partition_columns,
-            self.log_store.object_store(Some(operation_id)),
-            Some(self.snapshot.table_properties().target_file_size().get() as usize),
-            None,
-            self.writer_properties.clone(),
-            WriterStatsConfig::new(self.snapshot.table_properties().num_indexed_cols(), None),
-            None,
-            false,
-        )
-        .await?;
-
-        let metrics = UpsertMetrics {
-            num_added_files: add_actions.len(),
-            num_removed_files: remove_actions.len(),
-            num_conflicting_records,
-            scan_time_ms: write_metrics.scan_time_ms,
-            write_time_ms: write_metrics.write_time_ms,
-            ..Default::default()
-        };
-
-        let mut all_actions = add_actions;
-        all_actions.extend(remove_actions);
-
-        Ok((all_actions, metrics))
     }
 
     fn filter_conflicting_files(
@@ -670,18 +477,6 @@ impl UpsertBuilder {
         )
     }
 
-    fn build_commit_properties(&self, metrics: &UpsertMetrics) -> CommitProperties {
-        let mut app_metadata = self.commit_properties.app_metadata.clone();
-        app_metadata.insert("readVersion".to_owned(), self.snapshot.version().into());
-        if let Ok(metrics_json) = serde_json::to_value(metrics) {
-            app_metadata.insert("operationMetrics".to_owned(), metrics_json);
-        }
-
-        let mut commit_properties = self.commit_properties.clone();
-        commit_properties.app_metadata = app_metadata;
-        commit_properties
-    }
-
     fn build_predicate_expr(
         join_keys: &[String],
         partition_filters: &HashMap<String, HashSet<ScalarValue>>,
@@ -739,31 +534,5 @@ impl UpsertBuilder {
             }],
             not_matched_by_source_predicates: vec![],
         }
-    }
-
-    /// Commit all changes to the Delta log.
-    async fn commit_changes(
-        &self,
-        result: &UpsertExecutionResult,
-        operation_id: Uuid,
-    ) -> DeltaResult<DeltaTable> {
-        if result.actions.is_empty() {
-            return Ok(self.table_from_current_snapshot());
-        }
-
-        let commit_properties = self.build_commit_properties(&result.metrics);
-        let operation = self.build_merge_operation(&result.partition_filters);
-
-        let commit = CommitBuilder::from(commit_properties)
-            .with_actions(result.actions.clone())
-            .with_operation_id(operation_id)
-            .with_post_commit_hook_handler(self.custom_execute_handler.clone())
-            .build(Some(&self.snapshot), self.log_store.clone(), operation)
-            .await?;
-
-        Ok(DeltaTable::new_with_state(
-            self.log_store.clone(),
-            commit.snapshot(),
-        ))
     }
 }
