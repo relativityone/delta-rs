@@ -2,27 +2,20 @@
 //! For each conflicting record (matching on join keys), only the source record is kept.
 //! All non-conflicting records are appended.
 
+use super::{DELETE_COLUMN, OPERATION_COLUMN, SOURCE_COLUMN, TARGET_COLUMN, TARGET_COPY_COLUMN, TARGET_DELETE_COLUMN, TARGET_INSERT_COLUMN, TARGET_UPDATE_COLUMN};
 use crate::delta_datafusion::expr::fmt_expr_to_sql;
-use crate::kernel::transaction::CommitProperties;
-use crate::kernel::{Action, EagerSnapshot};
-use crate::logstore::LogStoreRef;
-use crate::operations::CustomExecuteHandler;
+use crate::kernel::EagerSnapshot;
 use crate::protocol::{DeltaOperation, MergePredicate};
-use crate::table::state::DeltaTableState;
-use crate::{DeltaResult, DeltaTable, DeltaTableError};
-use super::{SOURCE_COLUMN, TARGET_COLUMN};
+use crate::{DeltaResult, DeltaTableError};
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow_array::Array;
 use datafusion::common::JoinType;
 use datafusion::common::ScalarValue;
-use datafusion::execution::SessionState;
 use datafusion::logical_expr::expr::InList;
-use datafusion::logical_expr::{col, lit, Expr};
+use datafusion::logical_expr::{col, lit, when, Expr};
 use datafusion::prelude::{cast, DataFrame};
-use parquet::file::properties::WriterProperties;
 use std::collections::{HashMap, HashSet};
 use std::ops::Not;
-use std::sync::Arc;
 
 const FILE_PATH_COLUMN: &str = "__delta_rs_path";
 
@@ -33,20 +26,11 @@ pub(super) struct UpsertBuilder {
     source: DataFrame,
     /// The current state of the target table
     snapshot: EagerSnapshot,
-    /// Delta log store for handling data files
-    log_store: LogStoreRef,
-    /// Properties for Parquet writer configuration
-    writer_properties: Option<WriterProperties>,
-    /// Additional information to add to the commit
-    commit_properties: CommitProperties,
-    /// Handler for post-commit hooks
-    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
 impl UpsertBuilder {
     /// Create a new [`UpsertBuilder`] with required parameters.
     pub(super) fn new(
-        log_store: LogStoreRef,
         snapshot: EagerSnapshot,
         join_keys: Vec<String>,
         source: DataFrame,
@@ -55,32 +39,7 @@ impl UpsertBuilder {
             join_keys,
             source,
             snapshot,
-            log_store,
-            writer_properties: None,
-            commit_properties: CommitProperties::default(),
-            custom_execute_handler: None,
         }
-    }
-
-    /// Set the Parquet writer properties for output files.
-    pub(super) fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
-        self.writer_properties = Some(writer_properties);
-        self
-    }
-
-    /// Set additional commit properties for the transaction.
-    pub(super) fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
-        self.commit_properties = commit_properties;
-        self
-    }
-
-    /// Set the custom execute handler for post-commit hooks.
-    pub(super) fn with_custom_execute_handler(
-        mut self,
-        handler: Arc<dyn CustomExecuteHandler>,
-    ) -> Self {
-        self.custom_execute_handler = Some(handler);
-        self
     }
 
     pub(super) async fn execute_m_upsert(
@@ -103,21 +62,33 @@ impl UpsertBuilder {
 
         if has_conflicts {
             let conflicting_file_names = Self::extract_file_paths_from_conflicts(&conflicts_df).await?;
+            // Narrow the target scan to only the affected files, then drop the path column
+            let filtered_target_df =
+                Self::filter_conflicting_files(&target, &conflicting_file_names)?;
 
-            // Keep __delta_rs_path for rows from affected target files.
-            let filtered_target_with_path =
-                Self::filter_conflicting_files_with_path(&target, &conflicting_file_names)?;
-
-            // Attach target file path to conflicting source rows so updates can be attributed
-            // to the original target file during MergeBarrier partitioning.
-            let source_with_path = self
-                .attach_conflict_file_path_to_source(&conflicts_df)?;
-
+            // Anti-join: retain target rows whose join keys don't appear in the source
             let conflicts_keys = self.find_conflicts_keys_only()?;
             let non_conflicting_target =
-                self.get_non_conflicting_target_rows(&filtered_target_with_path, &conflicts_keys)?;
-
-            self.union_source_with_target_with_file_path(&source_with_path, &non_conflicting_target)
+                self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_keys)?;
+            let source_with_conflict_paths = self.attach_conflict_file_path_to_source(&conflicts_df)?;
+            self.union_source_with_target_with_file_path(&source_with_conflict_paths, &non_conflicting_target)?.clone()
+                .with_column(
+                    FILE_PATH_COLUMN,
+                    cast(
+                        lit(ScalarValue::Utf8(None)),
+                        ArrowDataType::Dictionary(
+                            Box::new(ArrowDataType::UInt16),
+                            Box::new(ArrowDataType::Utf8),
+                        ),
+                    ),
+                )?
+                .with_column(OPERATION_COLUMN, lit(0i32))?
+                .with_column(DELETE_COLUMN, lit(false))?
+                .with_column(TARGET_INSERT_COLUMN, lit(ScalarValue::Boolean(None)))?
+                .with_column(TARGET_UPDATE_COLUMN, lit(false))?
+                .with_column(TARGET_DELETE_COLUMN, lit(false))?
+                .with_column(TARGET_COPY_COLUMN, lit(false))
+                .map_err(Into::into)
         } else {
             // Pure inserts: no target files to remove.
             self.source
@@ -131,22 +102,15 @@ impl UpsertBuilder {
                             Box::new(ArrowDataType::Utf8),
                         ),
                     ),
-                )
+                )?
+                .with_column(OPERATION_COLUMN, lit(0i32))?
+                .with_column(DELETE_COLUMN, lit(false))?
+                .with_column(TARGET_INSERT_COLUMN, lit(ScalarValue::Boolean(None)))?
+                .with_column(TARGET_UPDATE_COLUMN, lit(false))?
+                .with_column(TARGET_DELETE_COLUMN, lit(false))?
+                .with_column(TARGET_COPY_COLUMN, lit(false))
                 .map_err(Into::into)
         }
-    }
-
-    fn filter_conflicting_files_with_path(
-        target_df: &DataFrame,
-        conflicting_file_names: &[String],
-    ) -> DeltaResult<DataFrame> {
-        target_df
-            .clone()
-            .filter(col(FILE_PATH_COLUMN).in_list(
-                conflicting_file_names.iter().map(|p| lit(p)).collect(),
-                false,
-            ))
-            .map_err(Into::into)
     }
 
     fn attach_conflict_file_path_to_source(&self, conflicts_df: &DataFrame) -> DeltaResult<DataFrame> {
@@ -232,85 +196,6 @@ impl UpsertBuilder {
         })
     }
 
-    /// For each partition column, extract the unique typed values present in the source DataFrame.
-    async fn extract_partition_filters(
-        &self,
-        columns: &[String],
-    ) -> DeltaResult<HashMap<String, HashSet<ScalarValue>>> {
-        if columns.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let select_exprs: Vec<Expr> = columns.iter().map(|c| col(c)).collect();
-        let batches = self.source.clone().select(select_exprs)?.collect().await?;
-
-        let mut seen: Vec<HashSet<ScalarValue>> =
-            (0..columns.len()).map(|_| HashSet::new()).collect();
-
-        for batch in &batches {
-            for (col_idx, seen_set) in seen.iter_mut().enumerate() {
-                let column = batch.column(col_idx);
-                for row_idx in 0..column.len() {
-                    if column.is_null(row_idx) {
-                        continue;
-                    }
-                    seen_set.insert(ScalarValue::try_from_array(column.as_ref(), row_idx)?);
-                }
-            }
-        }
-
-        Ok(columns
-            .iter()
-            .zip(seen)
-            .filter(|(_, set)| !set.is_empty())
-            .map(|(col_name, set)| (col_name.to_string(), set))
-            .collect())
-    }
-
-    /// Create a DataFrame for the target table with optional partition filtering.
-    fn create_target_dataframe(
-        &self,
-        state: &SessionState,
-        partition_filters: &HashMap<String, HashSet<ScalarValue>>,
-    ) -> DeltaResult<DataFrame> {
-        let scan_config = crate::delta_datafusion::DeltaScanConfigBuilder::default()
-            .with_file_column_name(&FILE_PATH_COLUMN.to_string())
-            .with_parquet_pushdown(true)
-            .with_schema(self.snapshot.arrow_schema())
-            .build(&self.snapshot)?;
-
-        let target_provider = Arc::new(crate::delta_datafusion::DeltaTableProvider::try_new(
-            self.snapshot.clone(),
-            self.log_store.clone(),
-            scan_config,
-        )?);
-
-        let mut filters = Vec::new();
-        for (column, values) in partition_filters {
-            if !values.is_empty() {
-                let filter_values: Vec<Expr> = values.iter().map(|sv| lit(sv.clone())).collect();
-                filters.push(Expr::InList(InList {
-                    expr: Box::new(col(column)),
-                    list: filter_values,
-                    negated: false,
-                }));
-            }
-        }
-
-        let target_df = DataFrame::new(
-            state.clone(),
-            datafusion::logical_expr::LogicalPlanBuilder::scan_with_filters(
-                datafusion::common::TableReference::bare("target"),
-                datafusion::datasource::provider_as_source(target_provider),
-                None,
-                filters,
-            )?
-            .build()?,
-        );
-
-        Ok(target_df)
-    }
-
     /// Select only the join-key columns from the source for use in the anti-join.
     fn find_conflicts_keys_only(&self) -> DeltaResult<DataFrame> {
         let source_keys: Vec<_> = self.join_keys.iter().map(|k| col(k)).collect();
@@ -329,26 +214,9 @@ impl UpsertBuilder {
             .filter(col(FILE_PATH_COLUMN).in_list(
                 conflicting_file_names.iter().map(|p| lit(p)).collect(),
                 false,
-            ))?
-            .drop_columns(&[FILE_PATH_COLUMN])
+            ))
+            //.drop_columns(&[FILE_PATH_COLUMN])
             .map_err(Into::into)
-    }
-
-    async fn files_to_remove(&self, conflicting_file_names: &[String]) -> DeltaResult<Vec<Action>> {
-        use futures::stream::StreamExt;
-
-        let mut remove_actions = Vec::new();
-        let mut file_stream = self.snapshot.file_views(&self.log_store, None);
-
-        while let Some(file_view) = file_stream.next().await {
-            let file_view = file_view?;
-            let path = file_view.path().to_string();
-            if conflicting_file_names.contains(&path) {
-                remove_actions.push(Action::Remove(file_view.remove_action(true)));
-            }
-        }
-
-        Ok(remove_actions)
     }
 
     /// Inner-join target × source on join keys to find conflicting rows.
@@ -470,13 +338,6 @@ impl UpsertBuilder {
         })
     }
 
-    fn table_from_current_snapshot(&self) -> DeltaTable {
-        DeltaTable::new_with_state(
-            self.log_store.clone(),
-            DeltaTableState::new(self.snapshot.clone()),
-        )
-    }
-
     fn build_predicate_expr(
         join_keys: &[String],
         partition_filters: &HashMap<String, HashSet<ScalarValue>>,
@@ -502,37 +363,5 @@ impl UpsertBuilder {
             .into_iter()
             .reduce(|acc, clause| acc.and(clause))
             .and_then(|expr| fmt_expr_to_sql(&expr).ok())
-    }
-
-    fn build_merge_operation(
-        &self,
-        partition_filters: &HashMap<String, HashSet<ScalarValue>>,
-    ) -> DeltaOperation {
-        const UPDATE_ACTION_TYPE: &str = "update";
-        const INSERT_ACTION_TYPE: &str = "insert";
-
-        let non_partition_join_keys: Vec<_> = self
-            .join_keys
-            .iter()
-            .filter(|k| !partition_filters.contains_key(*k))
-            .cloned()
-            .collect();
-
-        DeltaOperation::Merge {
-            predicate: Self::build_predicate_expr(
-                non_partition_join_keys.as_ref(),
-                partition_filters,
-            ),
-            merge_predicate: Self::build_predicate_expr(&self.join_keys, &HashMap::new()),
-            matched_predicates: vec![MergePredicate {
-                action_type: UPDATE_ACTION_TYPE.to_owned(),
-                predicate: None,
-            }],
-            not_matched_predicates: vec![MergePredicate {
-                action_type: INSERT_ACTION_TYPE.to_owned(),
-                predicate: None,
-            }],
-            not_matched_by_source_predicates: vec![],
-        }
     }
 }

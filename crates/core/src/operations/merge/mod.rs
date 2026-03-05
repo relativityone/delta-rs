@@ -102,62 +102,47 @@ mod upsert;
 
 use upsert::UpsertBuilder;
 
-/// Attempt to detect whether the merge configuration matches "upsert" semantics:
-///   - Exactly one `when_matched_update` clause with **no** predicate.
-///   - Exactly one `when_not_matched_insert` clause with **no** predicate.
-///   - **No** `when_not_matched_by_source_*` clauses.
-///   - No schema-evolution (`merge_schema == false`).
-///   - The join predicate is a pure AND-conjunction of `source.col = target.col`
-///     equalities — which lets us extract the join keys needed by `UpsertBuilder`.
-///   - The update operation maps **every** column in `schema_fields` to itself
-///     from the source side (full-row replacement), ensuring that routing through
-///     `UpsertBuilder` is semantically equivalent.
-///
-/// Returns the bare join-key column names (without any alias prefix) if the
-/// conditions are met, or `None` if the merge cannot be routed through the
-/// faster upsert path.
-fn try_detect_upsert_join_keys(
-    predicate: &Expr,
+fn is_fast_upsert_candidate(
     match_operations: &[MergeOperationConfig],
     not_match_operations: &[MergeOperationConfig],
     not_match_source_operations: &[MergeOperationConfig],
     merge_schema: bool,
     source_alias: &Option<String>,
-    target_alias: &Option<String>,
     schema_fields: &[String],
-) -> Option<Vec<String>> {
+) -> bool {
     // 1. No schema evolution.
     if merge_schema {
-        return None;
+        return false;
     }
+
 
     // 2. No "not-matched-by-source" operations (those require reading every target row).
     if !not_match_source_operations.is_empty() {
-        return None;
+        return false;
     }
 
     // 3. Exactly one unconditional match-update.
     if match_operations.len() != 1 {
-        return None;
+        return false;
     }
     let match_op = &match_operations[0];
     if match_op.predicate.is_some() {
-        return None;
+        return false;
     }
     if !matches!(match_op.r#type, OperationType::Update) {
-        return None;
+        return false;
     }
 
     // 4. Exactly one unconditional not-match-insert.
     if not_match_operations.len() != 1 {
-        return None;
+        return false;
     }
     let not_match_op = &not_match_operations[0];
     if not_match_op.predicate.is_some() {
-        return None;
+        return false;
     }
     if !matches!(not_match_op.r#type, OperationType::Insert) {
-        return None;
+        return false;
     }
 
     // 5. Both the update and the insert must be full-row replacements where every
@@ -166,15 +151,13 @@ fn try_detect_upsert_join_keys(
     //    cannot be safely routed through UpsertBuilder.
     let src_alias: Option<&str> = source_alias.as_deref();
     if !operations_are_full_identity_mappings(&match_op.operations, schema_fields, src_alias) {
-        return None;
+        return false;
     }
     if !operations_are_full_identity_mappings(&not_match_op.operations, schema_fields, src_alias) {
-        return None;
+        return false;
     }
 
-    // 6. The predicate must be a conjunction of `source.col = target.col` equalities.
-    let tgt_alias: Option<&str> = target_alias.as_deref();
-    extract_join_keys_from_expr(predicate, src_alias, tgt_alias)
+    true
 }
 
 /// Check that the `operations` HashMap is a **full identity mapping**: every
@@ -214,6 +197,41 @@ fn expression_is_source_column(
     col_name: &str,
     source_alias: Option<&str>,
 ) -> bool {
+    // Parse a string column reference in one of these forms:
+    //   col, alias.col, `alias`.`col`, "alias"."col"
+    fn parse_string_column_ref(input: &str) -> Option<(Option<String>, String)> {
+        fn normalize_ident(part: &str) -> Option<String> {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let unquoted = if (part.starts_with('`') && part.ends_with('`') && part.len() >= 2)
+                || (part.starts_with('"') && part.ends_with('"') && part.len() >= 2)
+            {
+                &part[1..part.len() - 1]
+            } else {
+                part
+            };
+            if unquoted.is_empty() {
+                None
+            } else {
+                Some(unquoted.to_string())
+            }
+        }
+
+        let input = input.trim();
+        if input.is_empty() {
+            return None;
+        }
+
+        let parts: Vec<&str> = input.split('.').collect();
+        match parts.as_slice() {
+            [col] => Some((None, normalize_ident(col)?)),
+            [alias, col] => Some((Some(normalize_ident(alias)?), normalize_ident(col)?)),
+            _ => None,
+        }
+    }
+
     match expr {
         Expression::DataFusion(df_expr) => {
             if let Expr::Column(col) = df_expr {
@@ -238,17 +256,21 @@ fn expression_is_source_column(
             }
         }
         Expression::String(s) => {
-            let s = s.trim();
-            match source_alias {
-                Some(alias) => {
-                    // Accept `alias.col_name` (case-insensitive to be lenient).
-                    let expected = format!("{}.{}", alias, col_name);
-                    s.eq_ignore_ascii_case(&expected)
-                }
-                None => {
-                    // No alias — the expression must be exactly the bare column name.
-                    s.eq_ignore_ascii_case(col_name)
-                }
+            let Some((relation, name)) = parse_string_column_ref(s) else {
+                return false;
+            };
+
+            if !name.eq_ignore_ascii_case(col_name) {
+                return false;
+            }
+
+            match (relation.as_deref(), source_alias) {
+                (Some(rel), Some(alias)) => rel.eq_ignore_ascii_case(alias),
+                (None, None) => true,
+                // Mirror DataFusion-path behavior: allow bare column references even when
+                // an alias is configured, since qualifiers can be omitted in valid input.
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
             }
         }
     }
@@ -1009,6 +1031,7 @@ async fn execute(
     not_match_source_operations: Vec<MergeOperationConfig>,
     operation_id: Uuid,
     handle: Option<&Arc<dyn CustomExecuteHandler>>,
+    is_fast_upsert: bool,
 ) -> DeltaResult<(EagerSnapshot, MergeMetrics)> {
     info!(
         operation = "merge",
@@ -1184,67 +1207,25 @@ async fn execute(
     let target = target.with_column(TARGET_COLUMN, lit(true))?;
 
 
-    let (projected, match_operations, not_match_target_operations, not_match_source_operations, schema_action) = if (false) {
+    let join_keys = is_fast_upsert.then(|| extract_join_keys_from_expr(
+        &predicate,
+        source_alias.as_deref(),
+        target_alias.as_deref(),
+    )).flatten();
+
+    //join_keys = None; // Disable fast upsert for now until we can verify correctness and performance benefits
+
+    let (projected, match_operations, not_match_target_operations, not_match_source_operations, schema_action) = if (join_keys.is_some()) {
         let source = source.with_column(TARGET_COLUMN, lit(ScalarValue::Boolean(None)))?;
         let target = target.with_column(SOURCE_COLUMN, lit(ScalarValue::Boolean(None)))?;
-
-        let source_alias_str = source_alias.as_deref();
-        let target_alias_str = target_alias.as_deref();
-        let join_keys = extract_join_keys_from_expr(&predicate, source_alias_str, target_alias_str)
-            .unwrap();
+        let join_keys = join_keys.unwrap();
 
         let upsert = UpsertBuilder::new(
-            log_store.clone(),
             snapshot.clone(),
             join_keys,
             source.clone(),
-        )
-        .with_commit_properties(commit_properties.clone());
-        let upsert_df = upsert.execute_m_upsert(target).await?;
-
-        let source_row_expr = col(SOURCE_COLUMN).is_true();
-
-        let write_projection: Vec<Expr> = snapshot
-            .schema()
-            .fields()
-            .map(|f| col(f.name()))
-            .collect();
-
-        // Build the same barrier input shape used by canonical merge so survivors are
-        // computed by MergeBarrierExec from __delta_rs_path.
-        let barrier_input = upsert_df
-            .with_column(
-                OPERATION_COLUMN,
-                when(col(file_column.as_str()).is_null(), lit(0i32))
-                    .when(source_row_expr, lit(1i32))
-                    .otherwise(lit(2i32))?,
-            )?
-            .with_column(DELETE_COLUMN, lit(false))?
-            .with_column(
-                TARGET_INSERT_COLUMN,
-                when(
-                    col(OPERATION_COLUMN).eq(lit(0i32)),
-                    lit(ScalarValue::Boolean(None)),
-                )
-                .otherwise(lit(false))?,
-            )?
-            .with_column(
-                TARGET_UPDATE_COLUMN,
-                when(
-                    col(OPERATION_COLUMN).eq(lit(1i32)),
-                    lit(ScalarValue::Boolean(None)),
-                )
-                .otherwise(lit(false))?,
-            )?
-            .with_column(TARGET_DELETE_COLUMN, lit(false))?
-            .with_column(
-                TARGET_COPY_COLUMN,
-                when(
-                    col(OPERATION_COLUMN).eq(lit(2i32)),
-                    lit(ScalarValue::Boolean(None)),
-                )
-                .otherwise(lit(false))?,
-            )?;
+        );
+        let barrier_input = upsert.execute_m_upsert(target).await?;
 
         let merge_barrier = LogicalPlan::Extension(Extension {
             node: Arc::new(MergeBarrier {
@@ -1262,8 +1243,12 @@ async fn execute(
             }),
         });
 
+        let write_projection: Vec<Expr> = snapshot
+            .schema()
+            .fields()
+            .map(|f| col(f.name()))
+            .collect();
         let projected = DataFrame::new(state.clone(), operation_count)
-            .filter(col(DELETE_COLUMN).is_false())?
             .select(write_projection)?;
 
         let match_operations = vec![MergePredicate {
@@ -1740,9 +1725,6 @@ async fn execute(
         (projected, match_operations, not_match_target_operations, not_match_source_operations, schema_action)
     };
 
-    //print schema
-    println!("Final projected schema: {:#?}", projected.schema());
-
     let merge_final = &projected.into_unoptimized_plan();
     let write = state.create_physical_plan(merge_final).await?;
 
@@ -1927,6 +1909,15 @@ impl std::future::IntoFuture for MergeBuilder {
                 .map(|f| f.name().to_string())
                 .collect();
 
+            let is_fast_upsert = is_fast_upsert_candidate(
+                &this.match_operations,
+                &this.not_match_operations,
+                &this.not_match_source_operations,
+                this.merge_schema,
+                &this.source_alias,
+                &schema_field_names,
+            );
+
             let (snapshot, metrics) = execute(
                 this.predicate,
                 this.source,
@@ -1945,6 +1936,7 @@ impl std::future::IntoFuture for MergeBuilder {
                 this.not_match_source_operations,
                 operation_id,
                 this.custom_execute_handler.as_ref(),
+                is_fast_upsert,
             )
             .await?;
 
@@ -4967,7 +4959,6 @@ mod tests {
         let source = upsert_source(vec![("B", 99, "2024-01-01"), ("X", 77, "2024-01-01")]);
         let (table, metrics) = do_upsert(table, source).await;
 
-        println!("Metrics: {metrics:#?}");
         assert!(
             metrics.num_target_files_removed >= 1,
             "conflicting file should be removed"
@@ -5005,7 +4996,6 @@ mod tests {
         ]);
         let (table, metrics) = do_upsert(table, source).await;
 
-        println!("Metrics: {metrics:#?}");
         assert!(metrics.num_target_files_removed >= 1);
         assert!(metrics.num_target_files_added >= 1);
         assert_eq!(metrics.num_target_rows_updated, 4);
