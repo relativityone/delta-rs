@@ -9,13 +9,15 @@ use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::{DeltaResult, DeltaTableError};
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow_array::Array;
-use datafusion::common::JoinType;
+use datafusion::common::{Column, JoinType};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{col, lit, when, Expr};
 use datafusion::prelude::{cast, DataFrame};
 use std::collections::{HashMap, HashSet};
+use std::iter::once;
 use std::ops::Not;
+use sqlparser::keywords::Keyword::FILE;
 
 const FILE_PATH_COLUMN: &str = "__delta_rs_path";
 
@@ -68,26 +70,83 @@ impl UpsertBuilder {
 
             // Anti-join: retain target rows whose join keys don't appear in the source
             let conflicts_keys = self.find_conflicts_keys_only()?;
-            let non_conflicting_target =
-                self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_keys)?;
-            let source_with_conflict_paths = self.attach_conflict_file_path_to_source(&conflicts_df)?;
-            self.union_source_with_target_with_file_path(&source_with_conflict_paths, &non_conflicting_target)?.clone()
-                .with_column(
-                    FILE_PATH_COLUMN,
-                    cast(
-                        lit(ScalarValue::Utf8(None)),
-                        ArrowDataType::Dictionary(
-                            Box::new(ArrowDataType::UInt16),
-                            Box::new(ArrowDataType::Utf8),
-                        ),
+            let non_conflicting_target = self.get_non_conflicting_target_rows(&filtered_target_df, &conflicts_keys)?;
+
+            //join source with conflict file paths so we can route to the correct metrics buckets in the presence of conflicts
+            // // priny barrier_input for debugging
+            // let batches = conflicts_df.clone().collect().await?;
+            // println!(
+            //     "\nProjected target:\n{}",
+            //     arrow_cast::pretty::pretty_format_batches(&batches)?
+            // );
+            //
+            // // priny barrier_input for debugging
+            // let batches = self.source.clone().collect().await?;
+            // println!(
+            //     "\nProjected source:\n{}",
+            //     arrow_cast::pretty::pretty_format_batches(&batches)?
+            // );
+
+            // let mut sc = self.source.schema().columns();
+            // sc.push(Column::from_name(FILE_PATH_COLUMN));
+            //
+            // let sourcer = &self.source.clone().join(
+            //     conflicts_df,
+            //     JoinType::Left,
+            //     &self.join_keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            //     &self.join_keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            //     None,
+            // )?
+            //     .select(
+            //         sc
+            //     )?;
+
+            let sourcer = self.source.clone().with_column(
+                FILE_PATH_COLUMN,
+                cast(
+                    lit(ScalarValue::Utf8(None)),
+                    ArrowDataType::Dictionary(
+                        Box::new(ArrowDataType::UInt16),
+                        Box::new(ArrowDataType::Utf8),
                     ),
+                ),
+            )?;
+
+            let source_row_expr = col(SOURCE_COLUMN).is_true();
+
+            self.union_source_with_target(&sourcer, &non_conflicting_target)?.clone()
+                .with_column(
+                    OPERATION_COLUMN,
+                    when(col(FILE_PATH_COLUMN).is_null(), lit(0i32))
+                        .when(source_row_expr, lit(1i32))
+                        .otherwise(lit(2i32))?,
                 )?
-                .with_column(OPERATION_COLUMN, lit(0i32))?
                 .with_column(DELETE_COLUMN, lit(false))?
-                .with_column(TARGET_INSERT_COLUMN, lit(ScalarValue::Boolean(None)))?
-                .with_column(TARGET_UPDATE_COLUMN, lit(false))?
+                .with_column(
+                    TARGET_INSERT_COLUMN,
+                    when(
+                        col(OPERATION_COLUMN).eq(lit(0i32)),
+                        lit(ScalarValue::Boolean(None)),
+                    )
+                        .otherwise(lit(false))?,
+                )?
+                .with_column(
+                    TARGET_UPDATE_COLUMN,
+                    when(
+                        col(OPERATION_COLUMN).eq(lit(1i32)),
+                        lit(ScalarValue::Boolean(None)),
+                    )
+                        .otherwise(lit(false))?,
+                )?
                 .with_column(TARGET_DELETE_COLUMN, lit(false))?
-                .with_column(TARGET_COPY_COLUMN, lit(false))
+                .with_column(
+                    TARGET_COPY_COLUMN,
+                    when(
+                        col(OPERATION_COLUMN).eq(lit(2i32)),
+                        lit(ScalarValue::Boolean(None)),
+                    )
+                        .otherwise(lit(false))?,
+                )
                 .map_err(Into::into)
         } else {
             // Pure inserts: no target files to remove.
@@ -315,7 +374,7 @@ impl UpsertBuilder {
     }
 
     /// Union source data with non-conflicting target rows, aligning column order first.
-    fn union_source_with_target(&self, target_no_conflict: &DataFrame) -> DeltaResult<DataFrame> {
+    fn union_source_with_target(&self, source: &DataFrame, target_no_conflict: &DataFrame) -> DeltaResult<DataFrame> {
         fn reorder_to_schema(
             df: DataFrame,
             reference: &arrow_schema::Schema,
@@ -328,8 +387,8 @@ impl UpsertBuilder {
             })
         }
 
-        let canonical_schema = self.snapshot.arrow_schema();
-        let source_aligned = reorder_to_schema(self.source.clone(), canonical_schema.as_ref())?;
+        let canonical_schema = target_no_conflict.schema();
+        let source_aligned = reorder_to_schema(source.clone(), canonical_schema.as_ref())?;
         let target_aligned =
             reorder_to_schema(target_no_conflict.clone(), canonical_schema.as_ref())?;
 

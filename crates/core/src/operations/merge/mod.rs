@@ -1227,6 +1227,13 @@ async fn execute(
         );
         let barrier_input = upsert.execute_m_upsert(target).await?;
 
+        // priny barrier_input for debugging
+        let batches = barrier_input.clone().collect().await?;
+        println!(
+            "\nProjected rows:\n{}",
+            arrow_cast::pretty::pretty_format_batches(&batches)?
+        );
+
         let merge_barrier = LogicalPlan::Extension(Extension {
             node: Arc::new(MergeBarrier {
                 input: barrier_input.into_unoptimized_plan(),
