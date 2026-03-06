@@ -51,22 +51,24 @@ def test_vacuum_zero_duration(
 
     write_deltalake(table_path, sample_table, mode="overwrite")
     dt = DeltaTable(table_path)
-    original_files = set(dt.files())
+    original_files = set(dt.file_uris())
     write_deltalake(table_path, sample_table, mode="overwrite")
     dt.update_incremental()
-    new_files = set(dt.files())
+    new_files = set(dt.file_uris())
     assert new_files.isdisjoint(original_files)
 
+    file_paths = {f.split(os.path.sep)[-1] for f in original_files}
+
     tombstones = set(dt.vacuum(retention_hours=0, enforce_retention_duration=False))
-    assert tombstones == original_files
+    assert tombstones == file_paths
 
     tombstones = set(
         dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
     )
-    assert tombstones == original_files
+    assert tombstones == file_paths
 
     parquet_files = {f for f in os.listdir(table_path) if f.endswith("parquet")}
-    assert parquet_files == new_files
+    assert parquet_files == {f.split(os.path.sep)[-1] for f in new_files}
 
 
 def test_vacuum_transaction_log(tmp_path: pathlib.Path, sample_table: Table):
@@ -146,6 +148,130 @@ def test_vacuum_keep_versions():
         "part-00003-53f42606-6cda-4f13-8d07-599a21197296-c000.snappy.parquet",
         "part-00006-46f2ff20-eb5d-4dda-8498-7bfb2940713b-c000.snappy.parquet",
     }
+
+
+def test_vacuum_lite_mode_no_list_operation(
+    tmp_path: pathlib.Path, sample_table: Table
+):
+    """Test that vacuum in lite mode (default) only removes files referenced as
+    expired tombstones in the transaction log and does NOT perform a storage list
+    operation.  A stray parquet file that exists on disk but is never referenced by
+    the delta log is used as a sentinel: Lite mode must not return it, while Full
+    mode must find it via the list operation."""
+
+    # Write initial data then overwrite so the first batch of files becomes
+    # expired tombstones in the transaction log.
+    write_deltalake(tmp_path, sample_table, mode="overwrite")
+    dt = DeltaTable(tmp_path)
+    original_files = set(dt.file_uris())
+
+    write_deltalake(tmp_path, sample_table, mode="overwrite")
+    dt.update_incremental()
+    new_files = set(dt.file_uris())
+    assert new_files.isdisjoint(original_files)
+
+    # Plant a stray file in the table directory that is NOT referenced anywhere
+    # in the transaction log.  Only a storage list operation would discover it.
+    stray_filename = "stray_file_not_in_log.parquet"
+    (tmp_path / stray_filename).write_bytes(b"not a real parquet file")
+
+    # Lite mode: Should return only the expired tombstones derived from the log.
+    lite_tombstones = set(
+        dt.vacuum(
+            retention_hours=0,
+            dry_run=True,
+            enforce_retention_duration=False,
+            full=False,
+        )
+    )
+
+    expected_tombstones = {f.split(os.path.sep)[-1] for f in original_files}
+    assert lite_tombstones == expected_tombstones, (
+        "Lite mode should return exactly the log-referenced expired tombstones"
+    )
+
+    # The stray file must NOT appear: if it did, a list operation was performed.
+    assert stray_filename not in lite_tombstones, (
+        "Lite mode must not discover files via a storage list operation"
+    )
+
+    # Full mode performs a list and must include the stray file.
+    full_tombstones = set(
+        dt.vacuum(
+            retention_hours=0,
+            dry_run=True,
+            enforce_retention_duration=False,
+            full=True,
+        )
+    )
+
+    assert stray_filename in full_tombstones, (
+        "Full mode should discover the stray file via a storage list operation"
+    )
+
+
+def test_vacuum_lite_mode_no_list_operation_partitioned(
+    tmp_path: pathlib.Path, sample_table: Table
+):
+    """Same as test_vacuum_lite_mode_no_list_operation but for a partitioned table.
+    Verifies that lite mode does not perform a storage list operation even when
+    the table is partitioned  a stray parquet file planted inside a partition
+    directory must not be returned by lite mode but must be found by full mode."""
+
+    # Write partitioned data, then overwrite to create expired tombstones.
+    write_deltalake(tmp_path, sample_table, partition_by=["deleted"], mode="overwrite")
+    dt = DeltaTable(tmp_path)
+    original_files = set(dt.file_uris())
+
+    write_deltalake(tmp_path, sample_table, partition_by=["deleted"], mode="overwrite")
+    dt.update_incremental()
+    new_files = set(dt.file_uris())
+    assert new_files.isdisjoint(original_files)
+
+    # Plant a stray parquet file inside one of the existing partition directories.
+    # Because it is never mentioned in the transaction log, only a storage list
+    # operation would discover it.
+    partition_dir = tmp_path / "deleted=false"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    stray_filename = "stray_file_not_in_log.parquet"
+    (partition_dir / stray_filename).write_bytes(b"not a real parquet file")
+    stray_relative = f"deleted=false/{stray_filename}"
+
+    # Lite mode: Should return only the expired tombstones derived from the log.
+    lite_tombstones = set(
+        dt.vacuum(
+            retention_hours=0,
+            dry_run=True,
+            enforce_retention_duration=False,
+            full=False,
+        )
+    )
+
+    expected_tombstones = {
+        os.path.join(*f.split(os.path.sep)[-2:]) for f in original_files
+    }
+    assert lite_tombstones == expected_tombstones, (
+        "Lite mode should return exactly the log-referenced expired tombstones"
+    )
+
+    # The stray file must NOT appear: if it did, a list operation was performed.
+    assert stray_relative not in lite_tombstones, (
+        "Lite mode must not discover files via a storage list operation"
+    )
+
+    # Full mode performs a list and must include the stray file.
+    full_tombstones = set(
+        dt.vacuum(
+            retention_hours=0,
+            dry_run=True,
+            enforce_retention_duration=False,
+            full=True,
+        )
+    )
+
+    assert stray_relative in full_tombstones, (
+        "Full mode should discover the stray file via a storage list operation"
+    )
 
 
 # https://github.com/delta-io/delta-rs/issues/3745
