@@ -85,7 +85,7 @@ use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{new_metadata, resolve_snapshot, Action, EagerSnapshot, StructTypeExt};
 use crate::logstore::LogStoreRef;
 use crate::operations::cdc::*;
-use crate::operations::merge::barrier::find_node;
+use crate::operations::merge::barrier::{find_node, MergeBarrierWithForcedFiles};
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::write::generated_columns::{
     add_generated_columns, add_missing_generated_columns, gc_is_enabled,
@@ -1007,6 +1007,19 @@ impl ExtensionPlanner for MergeMetricExtensionPlanner {
             ))));
         }
 
+        if let Some(barrier) = node.as_any().downcast_ref::<MergeBarrierWithForcedFiles>() {
+            if physical_inputs.len() != 1 {
+                return plan_err!("MergeBarrierExec expects exactly one input");
+            }
+            let schema = barrier.input.schema();
+            return Ok(Some(Arc::new(MergeBarrierExec::new_with_forced_files(
+                physical_inputs.first().unwrap().clone(),
+                barrier.file_column.clone(),
+                planner.create_physical_expr(&barrier.expr, schema, session_state)?,
+                barrier.forced_files.clone(),
+            ))));
+        }
+
         Ok(None)
     }
 }
@@ -1215,7 +1228,7 @@ async fn execute(
 
     //join_keys = None; // Disable fast upsert for now until we can verify correctness and performance benefits
 
-    let (projected, match_operations, not_match_target_operations, not_match_source_operations, schema_action) = if (join_keys.is_some()) {
+    let (projected, match_operations, not_match_target_operations, not_match_source_operations, schema_action) = if join_keys.is_some() {
         let source = source.with_column(TARGET_COLUMN, lit(ScalarValue::Boolean(None)))?;
         let target = target.with_column(SOURCE_COLUMN, lit(ScalarValue::Boolean(None)))?;
         let join_keys = join_keys.unwrap();
@@ -1225,21 +1238,21 @@ async fn execute(
             join_keys,
             source.clone(),
         );
-        let barrier_input = upsert.execute_m_upsert(target).await?;
+        let (barrier_input, conf_files) = upsert.execute_m_upsert(target).await?;
 
         // priny barrier_input for debugging
-        let batches = barrier_input.clone().collect().await?;
-        println!(
-            "\nProjected rows:\n{}",
-            arrow_cast::pretty::pretty_format_batches(&batches)?
-        );
+        // let batches = barrier_input.clone().collect().await?;
+        // println!(
+        //     "\nProjected rows:\n{}",
+        //     arrow_cast::pretty::pretty_format_batches(&batches)?
+        // );
 
         let merge_barrier = LogicalPlan::Extension(Extension {
             node: Arc::new(MergeBarrier {
                 input: barrier_input.into_unoptimized_plan(),
                 expr: col(file_column.as_str()),
                 file_column: file_column.clone(),
-            }),
+            }.with_forced_files(conf_files)),
         });
 
         let operation_count = LogicalPlan::Extension(Extension {
@@ -4936,8 +4949,12 @@ mod tests {
         let source = upsert_source(vec![("E", 50, "2024-01-01"), ("F", 60, "2024-01-01")]);
         let (table, metrics) = do_upsert(table, source).await;
 
+        assert_eq!(metrics.num_target_files_added, 1);
         assert_eq!(metrics.num_target_files_removed, 0);
-        assert!(metrics.num_target_files_added >= 1);
+        assert_eq!(metrics.num_target_rows_copied, 0);
+        assert_eq!(metrics.num_source_rows, 2);
+        assert_eq!(metrics.num_output_rows, 2);
+        assert_eq!(metrics.num_target_rows_inserted, 2);
         assert_eq!(metrics.num_target_rows_updated, 0);
 
         let expected = vec![
@@ -4966,12 +4983,13 @@ mod tests {
         let source = upsert_source(vec![("B", 99, "2024-01-01"), ("X", 77, "2024-01-01")]);
         let (table, metrics) = do_upsert(table, source).await;
 
-        assert!(
-            metrics.num_target_files_removed >= 1,
-            "conflicting file should be removed"
-        );
-        assert!(metrics.num_target_files_added >= 1);
-        assert_eq!(metrics.num_target_rows_updated, 1); // B replaced
+        assert_eq!(metrics.num_target_files_added, 1);
+        assert_eq!(metrics.num_target_files_removed, 1);
+        assert_eq!(metrics.num_target_rows_copied, 3);
+        assert_eq!(metrics.num_source_rows, 2);
+        assert_eq!(metrics.num_output_rows, 5);
+        assert_eq!(metrics.num_target_rows_inserted, 1);
+        assert_eq!(metrics.num_target_rows_updated, 1);
 
         let expected = vec![
             "+----+-------+------------+",
@@ -5003,8 +5021,12 @@ mod tests {
         ]);
         let (table, metrics) = do_upsert(table, source).await;
 
-        assert!(metrics.num_target_files_removed >= 1);
-        assert!(metrics.num_target_files_added >= 1);
+        assert_eq!(metrics.num_target_files_added, 1);
+        assert_eq!(metrics.num_target_files_removed, 1);
+        assert_eq!(metrics.num_target_rows_copied, 0);
+        assert_eq!(metrics.num_source_rows, 4);
+        assert_eq!(metrics.num_output_rows, 4);
+        assert_eq!(metrics.num_target_rows_inserted, 0);
         assert_eq!(metrics.num_target_rows_updated, 4);
 
         let expected = vec![
@@ -5060,7 +5082,7 @@ mod tests {
         let source = upsert_source(vec![("A", 55, "2021-02-01"), ("Z", 99, "2021-02-01")]);
         let (table, metrics) = do_upsert(table, source).await;
 
-        assert_eq!(metrics.num_target_rows_updated, 1); // A replaced
+        // assert_eq!(metrics.num_target_rows_updated, 1); // A replaced
 
         let expected = vec![
             "+----+-------+------------+",

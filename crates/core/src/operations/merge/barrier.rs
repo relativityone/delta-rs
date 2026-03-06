@@ -34,6 +34,7 @@ use crate::{
 };
 
 pub(crate) type BarrierSurvivorSet = Arc<DashSet<String>>;
+type ForcedFiles = Arc<DashSet<String>>;
 
 #[derive(Debug)]
 /// Physical Node for the MergeBarrier
@@ -44,6 +45,7 @@ pub struct MergeBarrierExec {
     file_column: Arc<String>,
     survivors: BarrierSurvivorSet,
     expr: Arc<dyn PhysicalExpr>,
+    forced_files: ForcedFiles,
 }
 
 impl MergeBarrierExec {
@@ -53,17 +55,34 @@ impl MergeBarrierExec {
         file_column: Arc<String>,
         expr: Arc<dyn PhysicalExpr>,
     ) -> Self {
+        Self::new_with_forced_files(input, file_column, expr, std::iter::empty::<String>())
+    }
+
+    /// Create a MergeBarrierExec that always treats provided files as modified.
+    pub fn new_with_forced_files(
+        input: Arc<dyn ExecutionPlan>,
+        file_column: Arc<String>,
+        expr: Arc<dyn PhysicalExpr>,
+        files: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let forced_files = Arc::new(files.into_iter().collect::<DashSet<_>>());
+        let survivors = Arc::new(DashSet::new());
+
         MergeBarrierExec {
             input,
             file_column,
-            survivors: Arc::new(DashSet::new()),
+            survivors,
             expr,
+            forced_files,
         }
     }
 
     /// Files that have modifications to them and need to removed from the delta log
     pub fn survivors(&self) -> BarrierSurvivorSet {
-        self.survivors.clone()
+        let mut survivors = DashSet::new();
+        survivors.extend(self.forced_files.iter().map(|file| file.clone()));
+        survivors.extend(self.survivors.iter().map(|file| file.clone()));
+        Arc::new(survivors)
     }
 }
 
@@ -101,10 +120,11 @@ impl ExecutionPlan for MergeBarrierExec {
                 "MergeBarrierExec wrong number of children".to_string(),
             ));
         }
-        Ok(Arc::new(MergeBarrierExec::new(
+        Ok(Arc::new(MergeBarrierExec::new_with_forced_files(
             children[0].clone(),
             self.file_column.clone(),
             self.expr.clone(),
+            self.forced_files.iter().map(|f|f.to_string()).collect::<Vec<_>>(),
         )))
     }
 
@@ -401,6 +421,42 @@ pub(crate) struct MergeBarrier {
     pub file_column: Arc<String>,
 }
 
+impl MergeBarrier {
+    /// Wrap this barrier with files that should be treated as modified.
+    pub fn with_forced_files(
+        self,
+        files: impl IntoIterator<Item = String>,
+    ) -> MergeBarrierWithForcedFiles {
+        MergeBarrierWithForcedFiles::new(self.input, self.expr, self.file_column, files)
+    }
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, PartialOrd)]
+pub(crate) struct MergeBarrierWithForcedFiles {
+    pub input: LogicalPlan,
+    pub expr: Expr,
+    pub file_column: Arc<String>,
+    pub forced_files: Vec<String>,
+}
+
+impl MergeBarrierWithForcedFiles {
+    pub fn new(
+        input: LogicalPlan,
+        expr: Expr,
+        file_column: Arc<String>,
+        files: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let forced_files: Vec<String> = files.into_iter().collect();
+
+        Self {
+            input,
+            expr,
+            file_column,
+            forced_files,
+        }
+    }
+}
+
 impl UserDefinedLogicalNodeCore for MergeBarrier {
     fn name(&self) -> &str {
         "MergeBarrier"
@@ -431,6 +487,41 @@ impl UserDefinedLogicalNodeCore for MergeBarrier {
             input: inputs[0].clone(),
             file_column: self.file_column.clone(),
             expr: exprs[0].clone(),
+        })
+    }
+}
+
+impl UserDefinedLogicalNodeCore for MergeBarrierWithForcedFiles {
+    fn name(&self) -> &str {
+        "MergeBarrier"
+    }
+
+    fn inputs(&self) -> Vec<&datafusion::logical_expr::LogicalPlan> {
+        vec![&self.input]
+    }
+
+    fn schema(&self) -> &datafusion::common::DFSchemaRef {
+        self.input.schema()
+    }
+
+    fn expressions(&self) -> Vec<datafusion::logical_expr::Expr> {
+        vec![self.expr.clone()]
+    }
+
+    fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "MergeBarrier")
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        exprs: Vec<datafusion::logical_expr::Expr>,
+        inputs: Vec<datafusion::logical_expr::LogicalPlan>,
+    ) -> DataFusionResult<Self> {
+        Ok(MergeBarrierWithForcedFiles {
+            input: inputs[0].clone(),
+            file_column: self.file_column.clone(),
+            expr: exprs[0].clone(),
+            forced_files: self.forced_files.clone(),
         })
     }
 }
@@ -516,7 +607,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
 
         let (actual, survivors) = execute(vec![batch]).await;
         let expected = vec![
@@ -570,7 +661,7 @@ mod tests {
                 ])),
             ],
         )
-        .unwrap();
+            .unwrap();
         batches.push(batch);
         // Batch 2
 
@@ -593,7 +684,7 @@ mod tests {
                 Arc::new(arrow::array::BooleanArray::from(vec![Some(false), None])),
             ],
         )
-        .unwrap();
+            .unwrap();
         batches.push(batch);
 
         let (actual, _survivors) = execute(batches).await;
@@ -634,7 +725,7 @@ mod tests {
                 Arc::new(arrow::array::BooleanArray::from(vec![false, false, false])),
             ],
         )
-        .unwrap();
+            .unwrap();
 
         let (actual, _) = execute(vec![batch]).await;
         let expected = vec![
@@ -648,19 +739,66 @@ mod tests {
         assert_batches_sorted_eq!(&expected, &actual);
     }
 
+    #[tokio::test]
+    async fn test_barrier_forced_files_passthrough() {
+        let schema = get_schema();
+        let keys = UInt16Array::from(vec![Some(0), Some(1)]);
+        let values = StringArray::from(vec![Some("file0"), Some("file1")]);
+        let dict = DictionaryArray::new(keys, Arc::new(values));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["0", "1"])),
+                Arc::new(dict),
+                Arc::new(arrow::array::BooleanArray::from(vec![Some(false), Some(false)])),
+                Arc::new(arrow::array::BooleanArray::from(vec![Some(false), Some(false)])),
+                Arc::new(arrow::array::BooleanArray::from(vec![Some(false), Some(false)])),
+            ],
+        )
+            .unwrap();
+
+        let (actual, survivors) = execute_with_forced_files(vec![batch], vec!["file0".to_string()]).await;
+        let expected = vec![
+            "+----+-----------------+--------------------------+--------------------------+--------------------------+",
+            "| id | __delta_rs_path | __delta_rs_target_insert | __delta_rs_target_update | __delta_rs_target_delete |",
+            "+----+-----------------+--------------------------+--------------------------+--------------------------+",
+            "| 0  | file0           | false                    | false                    | false                    |",
+            "+----+-----------------+--------------------------+--------------------------+--------------------------+",
+        ];
+        assert_batches_sorted_eq!(&expected, &actual);
+        assert!(survivors.contains("file0"));
+        assert_eq!(survivors.len(), 1);
+    }
+
     async fn execute(input: Vec<RecordBatch>) -> (Vec<RecordBatch>, BarrierSurvivorSet) {
+        execute_with_forced_files(input, Vec::new()).await
+    }
+
+    async fn execute_with_forced_files(
+        input: Vec<RecordBatch>,
+        forced_files: Vec<String>,
+    ) -> (Vec<RecordBatch>, BarrierSurvivorSet) {
         let schema = get_schema();
         let repartition = Arc::new(Column::new("__delta_rs_path", 2));
         let exec = MemorySourceConfig::try_new_exec(&[input], schema.clone(), None).unwrap();
 
         let task_ctx = Arc::new(TaskContext::default());
-        let merge =
-            MergeBarrierExec::new(exec, Arc::new("__delta_rs_path".to_string()), repartition);
+        let merge = MergeBarrierExec::new_with_forced_files(
+            exec,
+            Arc::new("__delta_rs_path".to_string()),
+            repartition,
+            forced_files,
+        );
 
         let survivors = merge.survivors();
         let coalescence = CoalesceBatchesExec::new(Arc::new(merge), 100);
         let mut stream = coalescence.execute(0, task_ctx).unwrap();
-        (vec![stream.next().await.unwrap().unwrap()], survivors)
+        let mut output = Vec::new();
+        while let Some(batch) = stream.next().await {
+            output.push(batch.unwrap());
+        }
+        (output, survivors)
     }
 
     fn get_schema() -> Arc<ArrowSchema> {

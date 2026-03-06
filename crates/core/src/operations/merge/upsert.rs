@@ -5,19 +5,15 @@
 use super::{DELETE_COLUMN, OPERATION_COLUMN, SOURCE_COLUMN, TARGET_COLUMN, TARGET_COPY_COLUMN, TARGET_DELETE_COLUMN, TARGET_INSERT_COLUMN, TARGET_UPDATE_COLUMN};
 use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::kernel::EagerSnapshot;
-use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::{DeltaResult, DeltaTableError};
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow_array::Array;
-use datafusion::common::{Column, JoinType};
 use datafusion::common::ScalarValue;
+use datafusion::common::JoinType;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{col, lit, when, Expr};
 use datafusion::prelude::{cast, DataFrame};
 use std::collections::{HashMap, HashSet};
-use std::iter::once;
-use std::ops::Not;
-use sqlparser::keywords::Keyword::FILE;
 
 const FILE_PATH_COLUMN: &str = "__delta_rs_path";
 
@@ -47,22 +43,27 @@ impl UpsertBuilder {
     pub(super) async fn execute_m_upsert(
         self,
         target: DataFrame,
-    ) -> DeltaResult<DataFrame> {
+    ) -> DeltaResult<(DataFrame, Vec<String>)> {
         let conflicts_df =
             Self::extract_conflicts_dataframe(&target, &self.source, &self.join_keys)
                 .await?
                 .cache()
                 .await?;
 
+        // let has_conflicts = conflicts_df
+        //     .clone()
+        //     .limit(0, Some(1))?
+        //     .collect()
+        //     .await?
+        //     .is_empty()
+        //     .not();
+
         let has_conflicts = conflicts_df
             .clone()
-            .limit(0, Some(1))?
-            .collect()
-            .await?
-            .is_empty()
-            .not();
+            .count()
+            .await?;
 
-        if has_conflicts {
+        if has_conflicts > 0 {
             let conflicting_file_names = Self::extract_file_paths_from_conflicts(&conflicts_df).await?;
             // Narrow the target scan to only the affected files, then drop the path column
             let filtered_target_df =
@@ -112,13 +113,20 @@ impl UpsertBuilder {
                 ),
             )?;
 
-            let source_row_expr = col(SOURCE_COLUMN).is_true();
-
-            self.union_source_with_target(&sourcer, &non_conflicting_target)?.clone()
+            let union = self.union_source_with_target(&sourcer, &non_conflicting_target)?.clone()
+                .with_column(
+                    FILE_PATH_COLUMN,
+                    cast(
+                        lit(ScalarValue::Utf8(None)),
+                        ArrowDataType::Dictionary(
+                            Box::new(ArrowDataType::UInt16),
+                            Box::new(ArrowDataType::Utf8),
+                        ),
+                    ),
+                )?
                 .with_column(
                     OPERATION_COLUMN,
-                    when(col(FILE_PATH_COLUMN).is_null(), lit(0i32))
-                        .when(source_row_expr, lit(1i32))
+                    when(col(SOURCE_COLUMN).is_true(), lit(0i32))
                         .otherwise(lit(2i32))?,
                 )?
                 .with_column(DELETE_COLUMN, lit(false))?
@@ -146,11 +154,11 @@ impl UpsertBuilder {
                         lit(ScalarValue::Boolean(None)),
                     )
                         .otherwise(lit(false))?,
-                )
-                .map_err(Into::into)
+                )?;
+            Ok((union, conflicting_file_names))
         } else {
             // Pure inserts: no target files to remove.
-            self.source
+            let append = self.source
                 .clone()
                 .with_column(
                     FILE_PATH_COLUMN,
@@ -167,59 +175,9 @@ impl UpsertBuilder {
                 .with_column(TARGET_INSERT_COLUMN, lit(ScalarValue::Boolean(None)))?
                 .with_column(TARGET_UPDATE_COLUMN, lit(false))?
                 .with_column(TARGET_DELETE_COLUMN, lit(false))?
-                .with_column(TARGET_COPY_COLUMN, lit(false))
-                .map_err(Into::into)
+                .with_column(TARGET_COPY_COLUMN, lit(false))?;
+            Ok((append, vec![]))
         }
-    }
-
-    fn attach_conflict_file_path_to_source(&self, conflicts_df: &DataFrame) -> DeltaResult<DataFrame> {
-        // Avoid duplicate unqualified key names after join by aliasing conflict keys.
-        let rhs_key_names: Vec<String> = self
-            .join_keys
-            .iter()
-            .map(|k| format!("__delta_rs_conflict_key_{k}"))
-            .collect();
-
-        let mut rhs_select_exprs: Vec<Expr> = self
-            .join_keys
-            .iter()
-            .zip(rhs_key_names.iter())
-            .map(|(src_key, rhs_key)| col(src_key).alias(rhs_key))
-            .collect();
-        rhs_select_exprs.push(col(FILE_PATH_COLUMN));
-
-        let conflict_key_to_path = conflicts_df
-            .clone()
-            .select(rhs_select_exprs)?
-            .distinct()?;
-
-        let left_on: Vec<&str> = self.join_keys.iter().map(|s| s.as_str()).collect();
-        let right_on: Vec<&str> = rhs_key_names.iter().map(|s| s.as_str()).collect();
-
-        let joined = self
-            .source
-            .clone()
-            .join(
-                conflict_key_to_path,
-                JoinType::Left,
-                &left_on,
-                &right_on,
-                None,
-            )?;
-
-        // Keep source columns + file path and lineage markers used by merge metrics routing.
-        let mut projected_cols: Vec<Expr> = self
-            .snapshot
-            .arrow_schema()
-            .fields()
-            .iter()
-            .map(|f| col(f.name()))
-            .collect();
-        projected_cols.push(col(FILE_PATH_COLUMN));
-        projected_cols.push(col(SOURCE_COLUMN));
-        projected_cols.push(col(TARGET_COLUMN));
-
-        joined.select(projected_cols).map_err(Into::into)
     }
 
     fn union_source_with_target_with_file_path(
