@@ -47,7 +47,7 @@ impl UpsertBuilder {
     pub(super) async fn execute_m_upsert(
         self,
         target: DataFrame,
-    ) -> DeltaResult<DataFrame> {
+    ) -> DeltaResult<(DataFrame, Vec<String>)> {
         let conflicts_df =
             Self::extract_conflicts_dataframe(&target, &self.source, &self.join_keys)
                 .await?
@@ -111,14 +111,12 @@ impl UpsertBuilder {
                     ),
                 ),
             )?;
-
-            let source_row_expr = col(SOURCE_COLUMN).is_true();
-
-            self.union_source_with_target(&sourcer, &non_conflicting_target)?.clone()
+            
+            let union = self.union_source_with_target(&sourcer, &non_conflicting_target)?.clone()
                 .with_column(
                     OPERATION_COLUMN,
                     when(col(FILE_PATH_COLUMN).is_null(), lit(0i32))
-                        .when(source_row_expr, lit(1i32))
+                        .when(col(SOURCE_COLUMN).is_true(), lit(1i32))
                         .otherwise(lit(2i32))?,
                 )?
                 .with_column(DELETE_COLUMN, lit(false))?
@@ -146,11 +144,11 @@ impl UpsertBuilder {
                         lit(ScalarValue::Boolean(None)),
                     )
                         .otherwise(lit(false))?,
-                )
-                .map_err(Into::into)
+                )?;
+            Ok((union, conflicting_file_names))
         } else {
             // Pure inserts: no target files to remove.
-            self.source
+            let appends = self.source
                 .clone()
                 .with_column(
                     FILE_PATH_COLUMN,
@@ -167,8 +165,8 @@ impl UpsertBuilder {
                 .with_column(TARGET_INSERT_COLUMN, lit(ScalarValue::Boolean(None)))?
                 .with_column(TARGET_UPDATE_COLUMN, lit(false))?
                 .with_column(TARGET_DELETE_COLUMN, lit(false))?
-                .with_column(TARGET_COPY_COLUMN, lit(false))
-                .map_err(Into::into)
+                .with_column(TARGET_COPY_COLUMN, lit(false))?;
+            Ok((appends, Vec::new()))
         }
     }
 
