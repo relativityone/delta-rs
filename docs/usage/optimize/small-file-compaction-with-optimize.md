@@ -14,7 +14,7 @@ Let’s start with an example to explain these key concepts.  All the code cover
 
 Let’s start by creating a Delta table with a lot of small files so we can demonstrate the usefulness of the `optimize` command.
 
-Start by writing a function that generates on thousand rows of random data given a timestamp.
+Start by writing a function that generates one thousand rows of random data given a timestamp.
 
 === "Python"
     ```python
@@ -178,7 +178,7 @@ This data was appended to the Delta table in 100 separate transactions, so the t
 
 === "Rust"
     ```rust
-    let table = open_table("observation_data").await?;
+    let table = open_table(observation_data_path_url).await?;
     let files = table.get_files_iter()?;
     println!("len: {}", files.count()); // len: 100
     ```
@@ -227,7 +227,7 @@ Let’s run the optimize command to compact the existing small files into larger
 
 === "Rust"
     ```rust
-    let table = open_table("observation_data").await?;
+    let table = open_table(observation_data_path_url).await?;
     let (table, metrics) = DeltaOps(table).optimize().with_type(OptimizeType::Compact).await?;
     println!("{:?}", metrics);
     ```
@@ -275,7 +275,7 @@ Let’s append another 24 hours of data to the Delta table:
     ```
 === "Rust"
     ```rust
-    let mut table = open_table("observation_data").await?;
+    let mut table = open_table(observation_data_path_url).await?;
     let hours_iter = (0..).map(|i| {
         "2021-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap() + chrono::Duration::hours(i)
     });
@@ -309,7 +309,7 @@ has all 24 hours of data, so it's ready to be optimized.
 
 === "Rust"
     ```rust
-    let table = open_table("observation_data").await?;
+    let table = open_table(observation_data_path_url).await?;
     let batch = table.snapshot()?.add_actions_table(true)?;
     let ctx = SessionContext::new();
     ctx.register_batch("observations", batch.clone())?;
@@ -342,7 +342,7 @@ To optimize a single partition, you can pass in a `partition_filters` argument s
 
 === "Rust"
     ```rust
-      let table = open_table("observation_data").await?;
+      let table = open_table(observation_data_path_url).await?;
       let (table, metrics) = DeltaOps(table)
           .optimize()
           .with_type(OptimizeType::Compact)
@@ -442,7 +442,7 @@ Let’s run the vacuum command:
       ```
 === "Rust"
     ```rust
-    let table = open_table("observation_data").await?;
+    let table = open_table(observation_data_path_url).await?;
     let (table, metrics) = DeltaOps(table)
         .vacuum()
         .with_retention_period(chrono::Duration::days(0))
