@@ -53,7 +53,7 @@ use std::sync::{Arc, LazyLock};
 use bytes::Bytes;
 #[cfg(feature = "datafusion")]
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine::default::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -62,7 +62,7 @@ use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::{AsAny, Engine};
 use futures::StreamExt;
 use object_store::ObjectStoreScheme;
-use object_store::{Error as ObjectStoreError, ObjectStore, path::Path};
+use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt as _, path::Path};
 use regex::Regex;
 use serde::de::{Error, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
@@ -74,7 +74,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::kernel::transaction::TransactionError;
-use crate::kernel::{Action, spawn_blocking_with_span};
+use crate::kernel::{Action, Version, spawn_blocking_with_span};
 use crate::table::normalize_table_url;
 use crate::{DeltaResult, DeltaTableError};
 
@@ -86,7 +86,7 @@ pub use self::factories::{
 pub use self::storage::utils::commit_uri_from_version;
 pub use self::storage::{
     DefaultObjectStoreRegistry, DeltaIOStorageBackend, IORuntime, ObjectStoreRef,
-    ObjectStoreRegistry, ObjectStoreRetryExt,
+    ObjectStoreRegistry, ObjectStoreRetryExt, client_options_from_certificate,
 };
 /// Convenience re-export of the object store crate
 pub use ::object_store;
@@ -274,7 +274,7 @@ pub trait LogStore: Send + Sync + AsAny {
     }
 
     /// Read data for commit entry with the given version.
-    async fn read_commit_entry(&self, version: i64) -> DeltaResult<Option<Bytes>>;
+    async fn read_commit_entry(&self, version: Version) -> DeltaResult<Option<Bytes>>;
 
     /// Write list of actions as delta commit entry for given version.
     ///
@@ -282,7 +282,7 @@ pub trait LogStore: Send + Sync + AsAny {
     /// fails with [`TransactionError::VersionAlreadyExists`].
     async fn write_commit_entry(
         &self,
-        version: i64,
+        version: Version,
         commit_or_bytes: CommitOrBytes,
         operation_id: Uuid,
     ) -> Result<(), TransactionError>;
@@ -290,13 +290,13 @@ pub trait LogStore: Send + Sync + AsAny {
     /// Abort the commit entry for the given version.
     async fn abort_commit_entry(
         &self,
-        version: i64,
+        version: Version,
         commit_or_bytes: CommitOrBytes,
         operation_id: Uuid,
     ) -> Result<(), TransactionError>;
 
     /// Find latest version currently stored in the delta log.
-    async fn get_latest_version(&self, start_version: i64) -> DeltaResult<i64>;
+    async fn get_latest_version(&self, start_version: Version) -> DeltaResult<Version>;
 
     /// Get object store, can pass operation_id for object stores linked to an operation
     fn object_store(&self, operation_id: Option<Uuid>) -> Arc<dyn ObjectStore>;
@@ -418,13 +418,13 @@ impl<T: LogStore + ?Sized> LogStore for Arc<T> {
         T::refresh(self).await
     }
 
-    async fn read_commit_entry(&self, version: i64) -> DeltaResult<Option<Bytes>> {
+    async fn read_commit_entry(&self, version: Version) -> DeltaResult<Option<Bytes>> {
         T::read_commit_entry(self, version).await
     }
 
     async fn write_commit_entry(
         &self,
-        version: i64,
+        version: Version,
         commit_or_bytes: CommitOrBytes,
         operation_id: Uuid,
     ) -> Result<(), TransactionError> {
@@ -433,14 +433,14 @@ impl<T: LogStore + ?Sized> LogStore for Arc<T> {
 
     async fn abort_commit_entry(
         &self,
-        version: i64,
+        version: Version,
         commit_or_bytes: CommitOrBytes,
         operation_id: Uuid,
     ) -> Result<(), TransactionError> {
         T::abort_commit_entry(self, version, commit_or_bytes, operation_id).await
     }
 
-    async fn get_latest_version(&self, start_version: i64) -> DeltaResult<i64> {
+    async fn get_latest_version(&self, start_version: Version) -> DeltaResult<Version> {
         T::get_latest_version(self, start_version).await
     }
 
@@ -485,14 +485,16 @@ impl<T: LogStore + ?Sized> LogStore for Arc<T> {
 pub(crate) fn get_engine(store: Arc<dyn ObjectStore>) -> Arc<dyn Engine> {
     let handle = tokio::runtime::Handle::current();
     match handle.runtime_flavor() {
-        RuntimeFlavor::MultiThread => Arc::new(DefaultEngine::new_with_executor(
-            store,
-            Arc::new(TokioMultiThreadExecutor::new(handle)),
-        )),
-        RuntimeFlavor::CurrentThread => Arc::new(DefaultEngine::new_with_executor(
-            store,
-            Arc::new(TokioBackgroundExecutor::new()),
-        )),
+        RuntimeFlavor::MultiThread => Arc::new(
+            DefaultEngineBuilder::new(store)
+                .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(handle)))
+                .build(),
+        ),
+        RuntimeFlavor::CurrentThread => Arc::new(
+            DefaultEngineBuilder::new(store)
+                .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
+                .build(),
+        ),
         _ => panic!("unsupported runtime flavor"),
     }
 }
@@ -562,7 +564,7 @@ pub fn to_uri(root: &Url, location: &Path) -> String {
 
 /// Reads a commit and gets list of actions
 pub fn get_actions(
-    version: i64,
+    version: Version,
     commit_log_bytes: &bytes::Bytes,
 ) -> Result<Vec<Action>, DeltaTableError> {
     debug!("parsing commit with version {version}...");
@@ -636,7 +638,7 @@ impl<'de> Deserialize<'de> for LogStoreConfig {
 }
 
 /// Extract version from a file name in the delta log
-pub fn extract_version_from_filename(name: &str) -> Option<i64> {
+pub fn extract_version_from_filename(name: &str) -> Option<Version> {
     DELTA_LOG_REGEX
         .captures(name)
         .map(|captures| captures.get(1).unwrap().as_str().parse().unwrap())
@@ -645,19 +647,13 @@ pub fn extract_version_from_filename(name: &str) -> Option<i64> {
 /// Default implementation for retrieving the latest version
 pub async fn get_latest_version(
     log_store: &dyn LogStore,
-    current_version: i64,
-) -> DeltaResult<i64> {
-    let current_version = if current_version < 0 {
-        0
-    } else {
-        current_version
-    };
-
+    current_version: Version,
+) -> DeltaResult<Version> {
     let storage = log_store.engine(None).storage_handler();
     let log_root = log_store.log_root_url();
 
     let segment = spawn_blocking_with_span(move || {
-        LogSegment::for_table_changes(storage.as_ref(), log_root, current_version as u64, None)
+        LogSegment::for_table_changes(storage.as_ref(), log_root, current_version, None)
     })
     .await
     .map_err(|e| DeltaTableError::Generic(e.to_string()))?
@@ -671,16 +667,16 @@ pub async fn get_latest_version(
         }
     })?;
 
-    Ok(segment.end_version as i64)
+    Ok(segment.end_version)
 }
 
 /// Read delta log for a specific version
-#[instrument(skip(storage), fields(version = version, path = %commit_uri_from_version(version)))]
+#[instrument(skip(storage), fields(version = version, path = %commit_uri_from_version(Some(version))))]
 pub async fn read_commit_entry(
     storage: &dyn ObjectStore,
-    version: i64,
+    version: Version,
 ) -> DeltaResult<Option<Bytes>> {
-    let commit_uri = commit_uri_from_version(version);
+    let commit_uri = commit_uri_from_version(Some(version));
     match storage.get(&commit_uri).await {
         Ok(res) => {
             let bytes = res.bytes().await?;
@@ -699,16 +695,16 @@ pub async fn read_commit_entry(
 }
 
 /// Default implementation for writing a commit entry
-#[instrument(skip(storage), fields(version = version, tmp_path = %tmp_commit, commit_path = %commit_uri_from_version(version)))]
+#[instrument(skip(storage), fields(version = version, tmp_path = %tmp_commit, commit_path = %commit_uri_from_version(Some(version))))]
 pub async fn write_commit_entry(
     storage: &dyn ObjectStore,
-    version: i64,
+    version: Version,
     tmp_commit: &Path,
 ) -> Result<(), TransactionError> {
     // move temporary commit file to delta log directory
     // rely on storage to fail if the file already exists -
     storage
-        .rename_if_not_exists(tmp_commit, &commit_uri_from_version(version))
+        .rename_if_not_exists(tmp_commit, &commit_uri_from_version(Some(version)))
         .await
         .map_err(|err| -> TransactionError {
             match err {
@@ -730,7 +726,7 @@ pub async fn write_commit_entry(
 #[instrument(skip(storage), fields(version = _version, tmp_path = %tmp_commit))]
 pub async fn abort_commit_entry(
     storage: &dyn ObjectStore,
-    _version: i64,
+    _version: Version,
     tmp_commit: &Path,
 ) -> Result<(), TransactionError> {
     storage.delete_with_retries(tmp_commit, 15).await?;

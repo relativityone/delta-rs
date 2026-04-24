@@ -12,6 +12,8 @@ use futures::future::ready;
 use futures::stream::once;
 use url::Url;
 
+#[cfg(feature = "datafusion")]
+use super::MaterializedFiles;
 use crate::DeltaResult;
 use crate::kernel::{ReceiverStreamBuilder, scan_row_in_eval};
 
@@ -60,6 +62,17 @@ impl ScanBuilder {
     /// have been filtered out but were kept).
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.inner = self.inner.with_predicate(predicate);
+        self
+    }
+
+    /// Skip parsing file-level statistics during kernel log replay.
+    ///
+    /// When `true`, per-file min/max/null stats are not parsed; `stats_parsed` in scan
+    /// output may be null. Partition-based filtering still applies. When combined with a
+    /// non-empty predicate, the kernel cannot use stats for data skipping; prefer `false`
+    /// when you need predicate-based file pruning from statistics.
+    pub fn with_skip_stats(mut self, skip_stats: bool) -> Self {
+        self.inner = self.inner.with_skip_stats(skip_stats);
         self
     }
 
@@ -149,6 +162,28 @@ impl Scan {
 
         builder.spawn_blocking(blocking_iter);
         builder.build()
+    }
+
+    #[cfg(feature = "datafusion")]
+    pub(crate) fn scan_metadata_seeded(
+        &self,
+        engine: Arc<dyn Engine>,
+        materialized_files: Option<&Arc<MaterializedFiles>>,
+    ) -> SendableScanMetadataStream {
+        match materialized_files.and_then(|materialized_files| materialized_files.full_table_seed())
+        {
+            Some(materialized_seed) => {
+                let (existing_version, existing_data, existing_predicate) =
+                    materialized_seed.into_parts();
+                self.scan_metadata_from(
+                    engine,
+                    existing_version,
+                    Box::new(existing_data),
+                    existing_predicate,
+                )
+            }
+            None => self.scan_metadata(engine),
+        }
     }
 
     pub fn scan_metadata_from<T: Iterator<Item = RecordBatch> + Send + 'static>(

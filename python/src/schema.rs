@@ -76,7 +76,7 @@ fn python_type_to_schema(ob: &Bound<'_, PyAny>) -> PyResult<DataType> {
     Err(PyValueError::new_err("Invalid data type"))
 }
 
-#[pyclass(module = "deltalake._internal")]
+#[pyclass(module = "deltalake._internal", from_py_object)]
 #[derive(Clone)]
 pub struct PrimitiveType {
     inner_type: DeltaPrimitive,
@@ -177,7 +177,7 @@ impl PrimitiveType {
     }
 }
 
-#[pyclass(module = "deltalake._internal")]
+#[pyclass(module = "deltalake._internal", from_py_object)]
 #[derive(Clone)]
 pub struct ArrayType {
     inner_type: DeltaArrayType,
@@ -303,7 +303,7 @@ impl ArrayType {
     }
 }
 
-#[pyclass(module = "deltalake._internal")]
+#[pyclass(module = "deltalake._internal", from_py_object)]
 #[derive(Clone)]
 pub struct MapType {
     inner_type: DeltaMapType,
@@ -445,7 +445,7 @@ impl MapType {
     }
 }
 
-#[pyclass(module = "deltalake._internal")]
+#[pyclass(module = "deltalake._internal", from_py_object)]
 #[derive(Clone)]
 pub struct Field {
     pub inner: StructField,
@@ -600,7 +600,7 @@ impl Field {
     }
 }
 
-#[pyclass(subclass, module = "deltalake._internal")]
+#[pyclass(subclass, module = "deltalake._internal", from_py_object)]
 #[derive(Clone)]
 pub struct StructType {
     pub(crate) inner_type: DeltaStructType,
@@ -740,16 +740,20 @@ pub fn schema_to_pyobject(
 
 /// A Delta Lake schema
 ///
-/// Create using a list of :class:`Field`:
+/// Create using a list of [deltalake.Field][deltalake.Field]:
 ///
-/// >>> Schema([Field("x", "integer"), Field("y", "string")])
+/// ```python
+/// Schema([Field("x", "integer"), Field("y", "string")])
 /// Schema([Field(x, PrimitiveType("integer"), nullable=True), Field(y, PrimitiveType("string"), nullable=True)])
+/// ```
 ///
-/// Or create from a PyArrow schema:
+/// Or create from a [pyarrow.Schema][pyarrow.Schema]:
 ///
-/// >>> from arro3.core import DateType, Schema as ArrowSchema
-/// >>> Schema.from_pyarrow(ArrowSchema({"x": DateType.int32(), "y": DateType.string()}))
+/// ```py
+/// from arro3.core import DateType, Schema as ArrowSchema
+/// Schema.from_pyarrow(ArrowSchema({"x": DateType.int32(), "y": DateType.string()}))
 /// Schema([Field(x, PrimitiveType("integer"), nullable=True), Field(y, PrimitiveType("string"), nullable=True)])
+/// ```
 #[pyclass(extends = StructType, name = "Schema", module = "deltalake._internal")]
 pub struct PySchema;
 

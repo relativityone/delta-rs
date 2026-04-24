@@ -2,15 +2,15 @@ use arrow_schema::Schema;
 use datafusion::catalog::Session;
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::{ExprSchemable, LogicalPlan, LogicalPlanBuilder, col, when};
-use datafusion::prelude::lit;
-use datafusion::{execution::SessionState, prelude::DataFrame};
+use datafusion::prelude::DataFrame;
+use datafusion::prelude::{cast, lit};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::table_features::TableFeature;
 use tracing::debug;
 
 use crate::{
     DeltaResult,
-    delta_datafusion::expr::parse_predicate_expression,
+    delta_datafusion::expr::parse_generated_column_expression,
     kernel::{DataCheck, EagerSnapshot},
     table::GeneratedColumn,
 };
@@ -23,6 +23,18 @@ pub fn gc_is_enabled(snapshot: &EagerSnapshot) -> bool {
         .is_feature_enabled(&TableFeature::GeneratedColumns)
 }
 
+/// Returns `true` when the error indicates that a referenced column is
+/// missing from the current plan schema.
+/// This occurs during `SchemaMode::Merge` when the input batch omits
+/// nullable columns added later by schema evolution. Other errors, such as
+/// SQL syntax errors or type mismatches, are still returned.
+fn is_column_resolution_error(err: &crate::DeltaTableError) -> bool {
+    let msg = err.to_string();
+    // DataFusion emits "No field named ..." for unresolved column references
+    // and "Schema error: ..." for broader schema resolution failures.
+    msg.contains("No field named") || msg.contains("Schema error")
+}
+
 pub fn with_generated_columns(
     session: &dyn Session,
     plan: LogicalPlan,
@@ -33,8 +45,8 @@ pub fn with_generated_columns(
         return Ok(plan);
     }
 
-    // Preserve the full input projection: missing non-generated columns are handled later by
-    // schema evolution logic when `SchemaMode::Merge` is used.
+    // Preserve the full input projection.
+    // Missing base columns are handled later by schema evolution in `SchemaMode::Merge`.
     let mut projection: Vec<_> = plan
         .schema()
         .fields()
@@ -49,16 +61,35 @@ pub fn with_generated_columns(
         }
 
         debug!("Adding missing generated column {}.", name);
-        let mut expr =
-            parse_predicate_expression(plan.schema(), &generated_col.generation_expr, session)?
-                .alias(name);
-        if let Ok(field) = table_schema.field_with_name(name) {
-            expr = expr.cast_to(field.data_type(), plan.schema())?;
-        }
+        // Try to resolve the generation expression against the current plan schema.
+        // In `SchemaMode::Merge`, the input batch may omit nullable columns
+        // referenced by the expression. In that case,
+        // parse_generated_column_expression fails because the column is not present yet.
+        // A typed NULL placeholder keeps the pipeline moving. Schema evolution adds
+        // the missing base columns as NULL later, and DataValidationExec evaluates
+        // NULL IS NOT DISTINCT FROM NULL as true.
+        let expr = match parse_generated_column_expression(plan.schema(), generated_col, session) {
+            Ok(resolved) => resolved.alias(name),
+            Err(ref err) if is_column_resolution_error(err) => {
+                debug!(
+                    "Could not resolve generation expression for column {} ({}), \
+                     inserting NULL placeholder; schema evolution resolves it later.",
+                    name, err
+                );
+                // Use the target data type from the table schema if available,
+                // otherwise fall back to a bare NULL.
+                if let Ok(field) = table_schema.field_with_name(name) {
+                    cast(lit(ScalarValue::Null), field.data_type().clone()).alias(name)
+                } else {
+                    lit(ScalarValue::Null).alias(name)
+                }
+            }
+            Err(err) => return Err(err.into()),
+        };
         projection.push(expr);
     }
 
-    Ok(LogicalPlanBuilder::new(plan).project(projection)?.build()?)
+    LogicalPlanBuilder::new(plan).project(projection)?.build()
 }
 
 /// Add generated column expressions to a dataframe
@@ -93,7 +124,7 @@ pub fn add_generated_columns(
     mut df: DataFrame,
     generated_cols: &Vec<GeneratedColumn>,
     generated_cols_missing_in_source: &[String],
-    state: &SessionState,
+    session: &dyn Session,
 ) -> DeltaResult<DataFrame> {
     debug!("Generating columns in dataframe");
     for generated_col in generated_cols {
@@ -103,10 +134,8 @@ pub fn add_generated_columns(
             continue;
         }
 
-        let generation_expr = state.create_logical_expr(
-            generated_col.get_generation_expression(),
-            df.clone().schema(),
-        )?;
+        let generation_expr =
+            parse_generated_column_expression(df.schema(), generated_col, session)?;
         let col_name = generated_col.get_name();
 
         df = df.clone().with_column(
@@ -122,9 +151,10 @@ pub fn add_generated_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int32Array;
+    use arrow::array::{Date32Array, Int32Array};
     use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
     use arrow_array::RecordBatch;
+    use datafusion::assert_batches_eq;
     use datafusion::catalog::MemTable;
     use datafusion::datasource::provider_as_source;
     use datafusion::execution::SessionState;
@@ -147,6 +177,30 @@ mod tests {
 
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(value_array)]).unwrap();
+
+        let source = provider_as_source(Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap(),
+        ));
+        LogicalPlanBuilder::scan("test", source, None)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn create_date_test_plan() -> LogicalPlan {
+        let schema = Arc::new(Schema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("event_date", ArrowDataType::Date32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Date32Array::from(vec![18428, 18859])),
+            ],
+        )
+        .unwrap();
 
         let source = provider_as_source(Arc::new(
             MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap(),
@@ -208,6 +262,54 @@ mod tests {
                 .schema()
                 .field_with_unqualified_name("computed")
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_missing_generated_date_column_with_spark_trunc() {
+        let session = create_test_session();
+        let plan = create_date_test_plan();
+        let ctx = SessionContext::new();
+
+        let table_schema = Schema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("event_date", ArrowDataType::Date32, false),
+            ArrowField::new("event_year", ArrowDataType::Date32, false),
+        ]);
+
+        let generated_cols = vec![GeneratedColumn::new(
+            "event_year",
+            "TRUNC(event_date, 'YEAR')",
+            &KernelDataType::DATE,
+        )];
+
+        let result = with_generated_columns(&session, plan, &table_schema, &generated_cols);
+        assert!(result.is_ok(), "unexpected planning error: {result:?}");
+        let result_plan = result.unwrap();
+        assert!(
+            result_plan
+                .schema()
+                .field_with_unqualified_name("event_year")
+                .is_ok()
+        );
+
+        let actual = ctx
+            .execute_logical_plan(result_plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_eq!(
+            &[
+                "+----+------------+------------+",
+                "| id | event_date | event_year |",
+                "+----+------------+------------+",
+                "| 1  | 2020-06-15 | 2020-01-01 |",
+                "| 2  | 2021-08-20 | 2021-01-01 |",
+                "+----+------------+------------+",
+            ],
+            &actual
         );
     }
 
@@ -275,6 +377,55 @@ mod tests {
                 .schema()
                 .field_with_unqualified_name("product")
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generated_column_is_cast_back_to_target_type() {
+        let session = create_test_session();
+        let plan = create_test_plan();
+        let ctx = SessionContext::new();
+
+        let table_schema = Schema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+            ArrowField::new("computed", ArrowDataType::Int64, false),
+        ]);
+
+        let generated_cols = vec![GeneratedColumn::new(
+            "computed",
+            "id + value",
+            &KernelDataType::LONG,
+        )];
+
+        let result = with_generated_columns(&session, plan, &table_schema, &generated_cols);
+        assert!(result.is_ok());
+
+        let result_plan = result.unwrap();
+        let computed = result_plan
+            .schema()
+            .field_with_unqualified_name("computed")
+            .unwrap();
+        assert_eq!(computed.data_type(), &ArrowDataType::Int64);
+
+        let actual = ctx
+            .execute_logical_plan(result_plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_eq!(
+            &[
+                "+----+-------+----------+",
+                "| id | value | computed |",
+                "+----+-------+----------+",
+                "| 1  | 10    | 11       |",
+                "| 2  | 20    | 22       |",
+                "| 3  | 30    | 33       |",
+                "+----+-------+----------+",
+            ],
+            &actual
         );
     }
 
@@ -356,6 +507,60 @@ mod tests {
                 .schema()
                 .field_with_unqualified_name("user")
                 .is_err()
+        );
+    }
+
+    /// Test that a generated column referencing a column not in the input batch
+    /// does not fail, but instead produces a NULL placeholder.
+    /// This is the core fix for #4169.
+    #[test]
+    fn test_generated_column_referencing_missing_column_uses_null_placeholder() {
+        let session = create_test_session();
+        // Plan only has "id" — missing "user" column
+        let schema = Arc::new(Schema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+        let source = provider_as_source(Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap(),
+        ));
+        let plan = LogicalPlanBuilder::scan("test", source, None)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Table schema has id, user (nullable), and computed = user
+        let table_schema = Schema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("user", ArrowDataType::Utf8, true),
+            ArrowField::new("computed", ArrowDataType::Utf8, true),
+        ]);
+
+        // "computed" references "user", which is NOT in the input plan
+        let generated_cols = vec![GeneratedColumn::new(
+            "computed",
+            "\"user\"",
+            &KernelDataType::STRING,
+        )];
+
+        // Previously this would fail with "column user not found"
+        let result = with_generated_columns(&session, plan, &table_schema, &generated_cols);
+        assert!(
+            result.is_ok(),
+            "should not fail when generated column references a missing column: {:?}",
+            result.err()
+        );
+
+        let result_plan = result.unwrap();
+        assert_eq!(result_plan.schema().fields().len(), 2); // id + computed
+        assert!(
+            result_plan
+                .schema()
+                .field_with_unqualified_name("computed")
+                .is_ok()
         );
     }
 }

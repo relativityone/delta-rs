@@ -303,11 +303,12 @@ async fn execute(
         .try_collect()?;
 
     let current_metadata = snapshot.metadata();
-    let table_partition_cols = current_metadata.partition_columns().clone();
+    let table_partition_cols = current_metadata.partition_columns().to_vec();
 
     let scan_start = Instant::now();
 
-    let maybe_scan_plan = scan_files_where_matches(session, snapshot, predicate).await?;
+    let maybe_scan_plan =
+        scan_files_where_matches(session, snapshot, log_store.clone(), predicate).await?;
     metrics.scan_time_ms = Instant::now().duration_since(scan_start).as_millis() as u64;
 
     let Some(files_scan) = maybe_scan_plan else {
@@ -365,9 +366,9 @@ async fn execute(
         Some(snapshot),
         session,
         physical_plan.clone(),
-        table_partition_cols.clone(),
+        table_partition_cols.to_vec(),
         log_store.object_store(Some(operation_id)).clone(),
-        Some(snapshot.table_properties().target_file_size().get() as usize),
+        Some(snapshot.table_properties().target_file_size()),
         None,
         writer_properties.clone(),
         writer_stats_config.clone(),
@@ -415,9 +416,9 @@ async fn execute(
                     Some(snapshot),
                     session,
                     cdc_exec,
-                    table_partition_cols,
+                    table_partition_cols.to_vec(),
                     log_store.object_store(Some(operation_id)),
-                    Some(snapshot.table_properties().target_file_size().get() as usize),
+                    Some(snapshot.table_properties().target_file_size()),
                     None,
                     writer_properties,
                     writer_stats_config,
