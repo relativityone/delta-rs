@@ -3,10 +3,9 @@
 //! All non-conflicting records are appended.
 
 use crate::delta_datafusion::DeltaSessionConfig;
-use crate::delta_datafusion::{register_store};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{Action, EagerSnapshot, Remove};
-use crate::logstore::LogStoreRef;
+use crate::logstore::{LogStore, LogStoreRef};
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::write::WriterStatsConfig;
 use crate::protocol::{DeltaOperation, SaveMode};
@@ -158,7 +157,8 @@ impl UpsertBuilder {
                 let config: datafusion::execution::context::SessionConfig =
                     DeltaSessionConfig::default().into();
                 let session = SessionContext::new_with_config(config);
-                register_store(self.log_store.clone(), &session.runtime_env());
+                let url = self.log_store.object_store_url();
+                session.register_object_store(url.as_ref(), self.log_store.object_store(None));
                 Arc::new(session.state())
             }
         }
@@ -360,12 +360,13 @@ impl UpsertBuilder {
             physical_plan,
             partition_columns,
             self.log_store.object_store(None),
-            Some(self.snapshot.table_properties().target_file_size().get() as usize),
+            Some(self.snapshot.table_properties().target_file_size()),
             None,
             self.writer_properties.clone(),
             WriterStatsConfig::new(self.snapshot.table_properties().num_indexed_cols(), None),
             None,
             false,
+            None
         )
             .await?;
 
@@ -419,12 +420,13 @@ impl UpsertBuilder {
             physical_plan,
             partition_columns,
             self.log_store.object_store(None),
-            Some(self.snapshot.table_properties().target_file_size().get() as usize),
+            Some(self.snapshot.table_properties().target_file_size()),
             None,
             self.writer_properties.clone(),
             WriterStatsConfig::new(self.snapshot.table_properties().num_indexed_cols(), None),
             None,
             false,
+            None
         )
             .await?;
 
