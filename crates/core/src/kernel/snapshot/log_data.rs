@@ -379,7 +379,10 @@ mod datafusion {
         fn pick_stats(&self, column: &Column, stats_field: &'static str) -> Option<ArrayRef> {
             let schema = self.config.schema();
             let field = schema.field(&column.name)?;
-            // See issue #1214. Binary type does not support natural order which is required for Datafusion to prune
+            // Binary stats are collected (min/max as \uXXXX-escaped strings) but DataFusion's
+            // PruningPredicate requires a total order on values, which raw byte sequences don't
+            // provide in a query-semantics-safe way. See issue #1214.
+            // To enable binary pruning, remove this guard.
             if field.data_type() == &DataType::Primitive(PrimitiveType::Binary) {
                 return None;
             }

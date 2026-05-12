@@ -381,6 +381,7 @@ fn is_skipping_eligeble_datatype(data_type: &PrimitiveType) -> bool {
             | &PrimitiveType::Timestamp
             | &PrimitiveType::TimestampNtz
             | &PrimitiveType::String
+            | &PrimitiveType::Binary
             // | &PrimitiveType::Boolean
             | PrimitiveType::Decimal(_)
     )
@@ -671,7 +672,7 @@ mod tests {
         // Create a schema with fields that have different eligibility for min/max vs null count
         // - "id" (LONG) - eligible for both null count and min/max
         // - "is_active" (BOOLEAN) - eligible for null count but NOT for min/max
-        // - "metadata" (BINARY) - eligible for null count but NOT for min/max
+        // - "metadata" (BINARY) - eligible for BOTH null count and min/max
         let file_schema = StructType::try_new([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("is_active", DataType::BOOLEAN),
@@ -689,9 +690,12 @@ mod tests {
         ])
         .unwrap();
 
-        // Expected minValues/maxValues schema: only eligible fields (no boolean, no binary)
-        let expected_min_max =
-            StructType::try_new([StructField::nullable("id", DataType::LONG)]).unwrap();
+        // Expected minValues/maxValues schema: eligible fields only (no boolean; binary IS eligible)
+        let expected_min_max = StructType::try_new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("metadata", DataType::BINARY),
+        ])
+        .unwrap();
 
         let expected = StructType::try_new([
             StructField::nullable("numRecords", DataType::LONG),
@@ -713,7 +717,7 @@ mod tests {
             StructField::nullable("name", DataType::STRING), // eligible for min/max
             StructField::nullable("is_admin", DataType::BOOLEAN), // NOT eligible for min/max
             StructField::nullable("age", DataType::INTEGER), // eligible for min/max
-            StructField::nullable("profile_pic", DataType::BINARY), // NOT eligible for min/max
+            StructField::nullable("profile_pic", DataType::BINARY), // eligible for min/max
         ])
         .unwrap();
 
@@ -741,10 +745,11 @@ mod tests {
         ])
         .unwrap();
 
-        // Expected minValues/maxValues schema: only eligible fields
+        // Expected minValues/maxValues schema: only eligible fields (boolean excluded; binary included)
         let expected_minmax_user = StructType::try_new([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("age", DataType::INTEGER),
+            StructField::nullable("profile_pic", DataType::BINARY),
         ])
         .unwrap();
         let expected_min_max = StructType::try_new([
@@ -768,10 +773,10 @@ mod tests {
     fn test_stats_schema_only_non_eligible_fields() {
         let properties: TableProperties = [("key", "value")].into();
 
-        // Create a schema with only fields that are NOT eligible for min/max skipping
+        // Create a schema mixing non-eligible fields (boolean, array) with an eligible binary field.
+        // Boolean and array types are never eligible for min/max; binary IS eligible.
         let file_schema = StructType::try_new([
             StructField::nullable("is_active", DataType::BOOLEAN),
-            StructField::nullable("metadata", DataType::BINARY),
             StructField::nullable(
                 "tags",
                 DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
@@ -784,17 +789,16 @@ mod tests {
         // Expected nullCount schema: all fields converted to LONG
         let expected_null_count = StructType::try_new([
             StructField::nullable("is_active", DataType::LONG),
-            StructField::nullable("metadata", DataType::LONG),
             StructField::nullable("tags", DataType::LONG),
         ])
         .unwrap();
 
-        // Expected minValues/maxValues schema: empty since no fields are eligible
-        // Since there are no eligible fields, minValues and maxValues should not be present
+        // With only boolean and array fields, no fields are eligible for min/max.
+        // minValues and maxValues should therefore not be present in the schema.
         let expected = StructType::try_new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null_count),
-            // No minValues or maxValues fields since no primitive fields are eligible
+            // No minValues or maxValues — no min/max-eligible primitive fields
         ])
         .unwrap();
 

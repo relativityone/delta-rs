@@ -222,7 +222,8 @@ fn get_stats(batch: &RecordBatch) -> TestResult<FileStats> {
                 Some((null_count, min, max))
             }
             Struct(_) => None,
-            _ => todo!(),
+            Binary | LargeBinary | FixedSizeBinary(_) => None,
+            _ => None, // other unsupported types: skip stats silently
         };
         if let Some((null_count, min, max)) = stats {
             file_stats

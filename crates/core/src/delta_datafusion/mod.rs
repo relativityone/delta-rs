@@ -461,6 +461,52 @@ fn parse_timestamp(
     ScalarValue::try_from_array(&cast_arr, 0)
 }
 
+/// Decodes a binary statistics value from the `\uXXXX` format produced by delta-rs.
+///
+/// The Delta protocol encodes binary partition/statistic values as a string of
+/// `\uXXXX` escapes (one per byte, uppercase hex, zero-padded to 4 digits):
+///   `[0x01, 0xAB, 0xFF]` → `"\\u0001\\u00AB\\u00FF"`
+///
+/// This decoder reverses that transformation so that binary stats can be used
+/// when file pruning for binary columns is eventually enabled.
+/// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization>
+pub(crate) fn parse_binary_stat(s: &str) -> DataFusionResult<Vec<u8>> {
+    let mut result = Vec::with_capacity(s.len() / 6);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        // Every token must be exactly `\uXXXX` (6 bytes).
+        if i + 5 >= b.len() || b[i] != b'\\' || b[i + 1] != b'u' {
+            return Err(DataFusionError::External(Box::new(
+                crate::DeltaTableError::generic(format!(
+                    "binary stat is not in \\uXXXX format at byte {i}: {s:?}"
+                )),
+            )));
+        }
+        let hex = &b[i + 2..i + 6];
+        let hex_str = std::str::from_utf8(hex).map_err(|_| {
+            DataFusionError::External(Box::new(crate::DeltaTableError::generic(format!(
+                "non-UTF-8 bytes in binary stat escape at byte {i}: {s:?}"
+            ))))
+        })?;
+        let codepoint = u16::from_str_radix(hex_str, 16).map_err(|_| {
+            DataFusionError::External(Box::new(crate::DeltaTableError::generic(format!(
+                "invalid hex digits in binary stat \\u{hex_str} at byte {i}: {s:?}"
+            ))))
+        })?;
+        if codepoint > 0xFF {
+            return Err(DataFusionError::External(Box::new(
+                crate::DeltaTableError::generic(format!(
+                    "binary stat escape \\u{hex_str} exceeds one byte at index {i}: {s:?}"
+                )),
+            )));
+        }
+        result.push(codepoint as u8);
+        i += 6;
+    }
+    Ok(result)
+}
+
 pub(crate) fn to_correct_scalar_value(
     stat_val: &serde_json::Value,
     field_dt: &ArrowDataType,
@@ -472,6 +518,15 @@ pub(crate) fn to_correct_scalar_value(
         serde_json::Value::String(string_val) => match field_dt {
             ArrowDataType::Timestamp(_, _) => Ok(Some(parse_timestamp(stat_val, field_dt)?)),
             ArrowDataType::Date32 => Ok(Some(parse_date(stat_val, field_dt)?)),
+            // Binary stats are encoded as \uXXXX-escaped strings by the writer.
+            // Decode them back to raw bytes so that comparisons are correct if
+            // binary pruning is ever enabled (see issue #1214).
+            ArrowDataType::Binary => Ok(Some(ScalarValue::Binary(Some(parse_binary_stat(
+                string_val,
+            )?)))),
+            ArrowDataType::LargeBinary => Ok(Some(ScalarValue::LargeBinary(Some(
+                parse_binary_stat(string_val)?,
+            )))),
             _ => Ok(Some(ScalarValue::try_from_string(
                 string_val.to_owned(),
                 field_dt,
@@ -944,6 +999,65 @@ mod tests {
             let scalar = to_correct_scalar_value(raw, data_type).unwrap().unwrap();
             assert_eq!(*ref_scalar, scalar)
         }
+    }
+
+    // ── parse_binary_stat ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_binary_stat_roundtrip() {
+        // All bytes 0x00-0xFF must round-trip through the writer's
+        // create_escaped_binary_string → parse_binary_stat path.
+        let cases: &[(&[u8], &str)] = &[
+            (b"", ""),
+            (&[0x00], "\\u0000"),
+            (&[0x01, 0x02, 0x03], "\\u0001\\u0002\\u0003"),
+            (&[0x41, 0x42], "\\u0041\\u0042"), // 'A', 'B'
+            (&[0xAB, 0xFF], "\\u00AB\\u00FF"),
+            (&[0x00, 0x5C], "\\u0000\\u005C"), // null + backslash
+        ];
+        for (expected_bytes, encoded) in cases {
+            let decoded = parse_binary_stat(encoded).unwrap();
+            assert_eq!(&decoded, expected_bytes, "failed for {encoded:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_binary_stat_errors() {
+        // Truncated escape
+        assert!(parse_binary_stat("\\u001").is_err());
+        // Non-hex digit
+        assert!(parse_binary_stat("\\u00GG").is_err());
+        // Codepoint > 0xFF
+        assert!(parse_binary_stat("\\u0100").is_err());
+        // Bare character (no \u prefix)
+        assert!(parse_binary_stat("A").is_err());
+    }
+
+    #[test]
+    fn test_to_correct_scalar_value_binary() {
+        // to_correct_scalar_value must decode binary stat strings.
+        let encoded = json!("\\u0001\\u00AB\\u00FF");
+        let scalar = to_correct_scalar_value(&encoded, &ArrowDataType::Binary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scalar, ScalarValue::Binary(Some(vec![0x01, 0xAB, 0xFF])));
+
+        let scalar = to_correct_scalar_value(&encoded, &ArrowDataType::LargeBinary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scalar,
+            ScalarValue::LargeBinary(Some(vec![0x01, 0xAB, 0xFF]))
+        );
+
+        // Empty binary stat is the empty byte slice, not an error.
+        let empty = json!("");
+        assert_eq!(
+            to_correct_scalar_value(&empty, &ArrowDataType::Binary)
+                .unwrap()
+                .unwrap(),
+            ScalarValue::Binary(Some(vec![]))
+        );
     }
 
     #[tokio::test]

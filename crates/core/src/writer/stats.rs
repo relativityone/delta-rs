@@ -1,26 +1,22 @@
 use std::cmp::min;
-use std::ops::Not;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, ops::AddAssign};
 
+use super::*;
+use crate::kernel::{scalars::ScalarExt, Add};
+use crate::protocol::{ColumnValueStat, Stats};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::table_properties::DataSkippingNumIndexedCols;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use parquet::basic::LogicalType;
-use parquet::basic::Type;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
 use parquet::{
     basic::TimeUnit,
     file::{metadata::RowGroupMetaData, statistics::Statistics},
 };
-use tracing::warn;
-
-use super::*;
-use crate::kernel::{scalars::ScalarExt, Add};
-use crate::protocol::{ColumnValueStat, Stats};
 
 /// Creates an [`Add`] log action struct.
 pub fn create_add(
@@ -186,19 +182,10 @@ fn stats_from_metadata(
         let maybe_stats: Option<AggregatedStats> = row_group_metadata
             .iter()
             .flat_map(|g| {
-                g.column(idx).statistics().into_iter().filter_map(|s| {
-                    let is_binary = matches!(&column_descr.physical_type(), Type::BYTE_ARRAY)
-                        && matches!(column_descr.logical_type(), Some(LogicalType::String)).not();
-                    if is_binary {
-                        warn!(
-                            "Skipping column {} because it's a binary field.",
-                            &column_descr.name().to_string()
-                        );
-                        None
-                    } else {
-                        Some(AggregatedStats::from((s, &column_descr.logical_type())))
-                    }
-                })
+                g.column(idx)
+                    .statistics()
+                    .into_iter()
+                    .map(|s| AggregatedStats::from((s, &column_descr.logical_type())))
             })
             .reduce(|mut left, right| {
                 left += right;
@@ -390,6 +377,16 @@ impl StatsScalar {
                 let val = uuid::Uuid::from_bytes(bytes);
                 Ok(Self::Uuid(val))
             }
+            // FixedSizeBinary columns with no logical type map to Delta's `binary` type
+            (Statistics::FixedLenByteArray(v), None) => {
+                let val = if use_min {
+                    v.min_bytes_opt()
+                } else {
+                    v.max_bytes_opt()
+                }
+                .unwrap_or_default();
+                Ok(Self::Bytes(val.to_vec()))
+            }
             (stats, _) => Err(DeltaWriterError::StatsParsingFailed {
                 debug_value: format!("{stats:?}"),
                 logical_type: logical_type.clone(),
@@ -434,11 +431,11 @@ impl From<StatsScalar> for serde_json::Value {
             }
             StatsScalar::String(v) => serde_json::Value::from(v),
             StatsScalar::Bytes(v) => {
-                let escaped_bytes = v
-                    .into_iter()
-                    .flat_map(std::ascii::escape_default)
-                    .collect::<Vec<u8>>();
-                let escaped_string = String::from_utf8(escaped_bytes).unwrap();
+                // Encode each byte as \uXXXX per the Delta protocol's binary
+                // partition-value-serialization spec:
+                // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+                let escaped_string: String =
+                    v.iter().map(|&byte| format!("\\u{byte:04X}")).collect();
                 serde_json::Value::from(escaped_string)
             }
             StatsScalar::Uuid(v) => serde_json::Value::from(v.hyphenated().to_string()),
@@ -763,9 +760,30 @@ mod tests {
                 Value::from("hello"),
             ),
             (
+                // Binary column (ByteArray with no logical type) — encoded per the Delta protocol
+                // binary partition-value-serialization spec: each byte as \uXXXX
                 simple_parquet_stat!(Statistics::ByteArray, ByteArray::from(b"\x00\\".to_vec())),
                 None,
-                Value::from("\\x00\\\\"),
+                Value::from("\\u0000\\u005C"),
+            ),
+            (
+                // Binary column with high bytes (> 0x7F)
+                simple_parquet_stat!(
+                    Statistics::ByteArray,
+                    ByteArray::from(vec![0x01, 0xAB, 0xFF])
+                ),
+                None,
+                Value::from("\\u0001\\u00AB\\u00FF"),
+            ),
+            (
+                // FixedSizeBinary column (FixedLenByteArray with no logical type) — treated as
+                // Delta `binary` type and encoded the same as ByteArray binary
+                simple_parquet_stat!(
+                    Statistics::FixedLenByteArray,
+                    FixedLenByteArray::from(vec![0xDE, 0xAD, 0xBE, 0xEF])
+                ),
+                None,
+                Value::from("\\u00DE\\u00AD\\u00BE\\u00EF"),
             ),
             (
                 simple_parquet_stat!(
@@ -847,6 +865,97 @@ mod tests {
             let actual = serde_json::Value::from(scalar);
             assert_eq!(&actual, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn test_binary_column_stats() {
+        use arrow_array::{BinaryArray, Int32Array, RecordBatch as ArrowRecordBatch};
+        use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        // Build a temp Delta table with an `id` (int) and a `data` (binary) column.
+        let delta_schema = serde_json::json!({
+            "type": "struct",
+            "fields": [
+                {"name": "id",   "type": "integer", "nullable": true, "metadata": {}},
+                {"name": "data", "type": "binary",  "nullable": true, "metadata": {}},
+            ]
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path();
+        let log_path = table_path.join("_delta_log");
+        std::fs::create_dir(&log_path).unwrap();
+
+        let schema_string = serde_json::to_string(&delta_schema).unwrap();
+        let commit = [
+            serde_json::to_string(
+                &serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            )
+            .unwrap(),
+            serde_json::to_string(&serde_json::json!({"metaData": {
+                "id": "test-binary-stats-table",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema_string,
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1000000000000i64
+            }}))
+            .unwrap(),
+        ]
+        .join("\n");
+        std::fs::write(log_path.join("00000000000000000000.json"), &commit).unwrap();
+
+        let table_uri = Url::from_directory_path(table_path).unwrap();
+        let table = load_table(&table_uri, HashMap::new()).await.unwrap();
+
+        let mut writer = RecordBatchWriter::for_table(&table).unwrap();
+
+        // Build an Arrow RecordBatch with three binary values.
+        // Lexicographic order: \x01\x02 < \x03\x04 < \x05\x06
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowDataType::Int32, true),
+            Field::new("data", ArrowDataType::Binary, true),
+        ]));
+        let ids = Int32Array::from(vec![1, 2, 3]);
+        let binary_data = BinaryArray::from(vec![
+            Some(b"\x05\x06" as &[u8]), // largest
+            Some(b"\x01\x02" as &[u8]), // smallest
+            Some(b"\x03\x04" as &[u8]), // middle
+        ]);
+        let batch =
+            ArrowRecordBatch::try_new(arrow_schema, vec![Arc::new(ids), Arc::new(binary_data)])
+                .unwrap();
+
+        writer.write(batch).await.unwrap();
+        let add = writer.flush().await.unwrap();
+        assert_eq!(add.len(), 1);
+
+        let stats = add[0].get_stats().unwrap().unwrap();
+
+        // Binary column must appear in all three stat maps.
+        assert!(
+            stats.min_values.contains_key("data"),
+            "binary column missing from min_values"
+        );
+        assert!(
+            stats.max_values.contains_key("data"),
+            "binary column missing from max_values"
+        );
+        assert!(
+            stats.null_count.contains_key("data"),
+            "binary column missing from null_count"
+        );
+
+        // Min should be \x01\x02, max should be \x05\x06.
+        // Each byte is encoded as \uXXXX per the Delta protocol spec.
+        let min = stats.min_values["data"].as_value().unwrap();
+        let max = stats.max_values["data"].as_value().unwrap();
+        assert_eq!(min.as_str().unwrap(), "\\u0001\\u0002");
+        assert_eq!(max.as_str().unwrap(), "\\u0005\\u0006");
+
+        // No null values were written.
+        assert_eq!(stats.null_count["data"].as_value().unwrap(), 0);
     }
 
     #[tokio::test]
