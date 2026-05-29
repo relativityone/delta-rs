@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use arrow_array::{ArrayRef, BooleanArray};
-use arrow_schema::{DataType as ArrowDataType, SchemaRef as ArrowSchemaRef};
+use arrow_schema::SchemaRef as ArrowSchemaRef;
 use datafusion::common::scalar::ScalarValue;
 use datafusion::common::{Column, ToDFSchema};
 use datafusion::execution::context::SessionContext;
@@ -35,15 +35,6 @@ impl<'a> AddContainer<'a> {
 
     pub fn get_prune_stats(&self, column: &Column, get_max: bool) -> Option<ArrayRef> {
         let (_, field) = self.schema.column_with_name(&column.name)?;
-
-        // Binary stats are collected (min/max as \uXXXX-escaped strings) but DataFusion's
-        // PruningPredicate requires a total order on values, which raw byte sequences don't
-        // provide in a query-semantics-safe way. See issue #1214.
-        // To enable binary pruning, remove this guard and ensure `to_correct_scalar_value`
-        // decodes binary stats via `parse_binary_stat` (which it now does).
-        if field.data_type() == &ArrowDataType::Binary {
-            return None;
-        }
 
         let data_type = field.data_type();
 
