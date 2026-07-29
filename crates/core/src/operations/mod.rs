@@ -75,9 +75,9 @@ pub mod set_tbl_properties;
 #[cfg(feature = "datafusion")]
 pub mod update;
 #[cfg(feature = "datafusion")]
-pub mod write;
-#[cfg(feature = "datafusion")]
 pub mod upsert;
+#[cfg(feature = "datafusion")]
+pub mod write;
 
 #[cfg(all(test, feature = "datafusion"))]
 mod session_fallback_policy_tests;
