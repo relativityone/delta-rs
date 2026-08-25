@@ -1209,7 +1209,9 @@ mod tests {
             .unwrap();
 
         // Verify the commit contains our custom properties
-        let history: Vec<_> = updated_table.history(None).await.unwrap().collect();
+        let history: Vec<_> = futures::TryStreamExt::try_collect(updated_table.history(None))
+            .await
+            .unwrap();
         assert!(history[0].operation_parameters.is_some());
     }
 
