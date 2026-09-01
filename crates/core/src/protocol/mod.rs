@@ -15,7 +15,7 @@ use object_store::{path::Path, Error as ObjectStoreError, ObjectStore};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::{Add, CommitInfo, Metadata, Protocol, Remove, StructField, TableFeatures};
@@ -260,10 +260,15 @@ impl Add {
     /// Returns the serde_json representation of stats contained in the action if present.
     /// Since stats are defined as optional in the protocol, this may be None.
     pub fn get_json_stats(&self) -> Result<Option<Stats>, serde_json::error::Error> {
-        self.stats
-            .as_ref()
-            .map(|stats| serde_json::from_str(stats).map(|mut ps: PartialStats| ps.as_stats()))
-            .transpose()
+        Ok(self.stats.as_ref().and_then(|stats| {
+            match serde_json::from_str(stats).map(|mut ps: PartialStats| ps.as_stats()) {
+                Ok(stats) => Some(stats),
+                Err(e) => {
+                    warn!("Ignoring unparseable stats for {}: {e}", self.path);
+                    None
+                }
+            }
+        }))
     }
 }
 
