@@ -146,7 +146,7 @@ pub(crate) fn merge_arrow_field(
             Ok(ArrowField::new(
                 right.name(),
                 Dictionary(key_type.clone(), Box::new(batch_type.clone())),
-                left.is_nullable() || right.is_nullable(),
+                left.is_nullable(),
             ))
         }
         (Dictionary(key_type, value_type), _)
@@ -161,12 +161,12 @@ pub(crate) fn merge_arrow_field(
             Ok(ArrowField::new(
                 right.name(),
                 Dictionary(key_type.clone(), Box::new(batch_type.clone())),
-                left.is_nullable() || right.is_nullable(),
+                left.is_nullable(),
             ))
         }
-        (Dictionary(_, value_type), _) if value_type.equals_datatype(batch_type) => Ok(left
-            .clone()
-            .with_nullable(left.is_nullable() || right.is_nullable())),
+        (Dictionary(_, value_type), _) if value_type.equals_datatype(batch_type) => {
+            Ok(left.clone().with_nullable(left.is_nullable()))
+        }
 
         (_, Dictionary(_, value_type))
             if matches!(
@@ -177,9 +177,7 @@ pub(crate) fn merge_arrow_field(
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
             ) =>
         {
-            Ok(right
-                .clone()
-                .with_nullable(left.is_nullable() || right.is_nullable()))
+            Ok(right.clone().with_nullable(left.is_nullable()))
         }
         (_, Dictionary(_, value_type))
             if matches!(
@@ -190,13 +188,11 @@ pub(crate) fn merge_arrow_field(
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView
             ) =>
         {
-            Ok(right
-                .clone()
-                .with_nullable(left.is_nullable() || right.is_nullable()))
+            Ok(right.clone().with_nullable(left.is_nullable()))
         }
-        (_, Dictionary(_, value_type)) if value_type.equals_datatype(table_type) => Ok(right
-            .clone()
-            .with_nullable(left.is_nullable() || right.is_nullable())),
+        (_, Dictionary(_, value_type)) if value_type.equals_datatype(table_type) => {
+            Ok(right.clone().with_nullable(left.is_nullable()))
+        }
         // With Utf8/binary we always take  the right type since that is coming from the incoming data
         // by doing that we allow passthrough of any string flavor
         (
@@ -209,7 +205,7 @@ pub(crate) fn merge_arrow_field(
         ) => Ok(ArrowField::new(
             left.name(),
             batch_type.clone(),
-            right.is_nullable() || left.is_nullable(),
+            left.is_nullable(),
         )),
         (
             DataType::List(left_child_fields) | DataType::LargeList(left_child_fields),
@@ -220,7 +216,7 @@ pub(crate) fn merge_arrow_field(
             Ok(ArrowField::new(
                 left.name(),
                 DataType::LargeList(merged.into()),
-                right.is_nullable() || left.is_nullable(),
+                left.is_nullable(),
             ))
         }
         (
@@ -232,7 +228,7 @@ pub(crate) fn merge_arrow_field(
             Ok(ArrowField::new(
                 left.name(),
                 DataType::List(merged.into()),
-                right.is_nullable() || left.is_nullable(),
+                left.is_nullable(),
             ))
         }
         (DataType::Struct(left_child_fields), DataType::Struct(right_child_fields)) => {
@@ -241,7 +237,7 @@ pub(crate) fn merge_arrow_field(
             Ok(ArrowField::new(
                 left.name(),
                 DataType::Struct(merged.into()),
-                right.is_nullable() || left.is_nullable(),
+                left.is_nullable(),
             ))
         }
         (DataType::Map(left_field, left_sorted), DataType::Map(right_field, right_sorted))
@@ -251,7 +247,7 @@ pub(crate) fn merge_arrow_field(
             Ok(ArrowField::new(
                 left.name(),
                 DataType::Map(merged.into(), *right_sorted),
-                right.is_nullable() || left.is_nullable(),
+                left.is_nullable(),
             ))
         }
         _ => {
@@ -269,15 +265,14 @@ pub(crate) fn merge_arrow_field(
                         | DataType::Decimal256(left_precision, left_scale),
                         DataType::Decimal128(right_precision, right_scale),
                     ) = (right.data_type(), new_field.data_type())
+                        && !(left_precision <= right_precision && left_scale <= right_scale)
                     {
-                        if !(left_precision <= right_precision && left_scale <= right_scale) {
-                            return Err(ArrowError::SchemaError(format!(
-                                "Cannot merge field {} from {} to {}",
-                                right.name(),
-                                right.data_type(),
-                                new_field.data_type()
-                            )));
-                        }
+                        return Err(ArrowError::SchemaError(format!(
+                            "Cannot merge field {} from {} to {}",
+                            right.name(),
+                            right.data_type(),
+                            new_field.data_type()
+                        )));
                     };
                     // If it's not Decimal datatype, the new_field remains the left table field.
                 }
@@ -288,12 +283,12 @@ pub(crate) fn merge_arrow_field(
 }
 
 /// Merges Arrow Table schema and Arrow Batch Schema, by allowing Large/View Types to passthrough.
-// Sometimes fields can't be merged because they are not the same types. So table has int32,
-// but batch int64. We want the preserve the table type. At later stage we will call cast_record_batch
-// which will cast the batch int64->int32. This is desired behavior so we can have flexibility
-// in the batch data types. But preserve the correct table and parquet types.
-//
-// Preserve_new_fields can also be disabled if you just want to only use the passthrough functionality
+/// Sometimes fields can't be merged because they are not the same types. So table has int32,
+/// but batch int64. We want the preserve the table type. At later stage we will call cast_record_batch
+/// which will cast the batch int64->int32. This is desired behavior so we can have flexibility
+/// in the batch data types. But preserve the correct table and parquet types.
+///
+/// Preserve_new_fields can also be disabled if you just want to only use the passthrough functionality
 pub(crate) fn merge_arrow_schema(
     table_schema: ArrowSchemaRef,
     batch_schema: ArrowSchemaRef,
@@ -330,12 +325,21 @@ fn merge_arrow_vec_fields(
                         Err(e)
                     }
                     Ok(mut f) => {
-                        // UNDO the implicit schema merging of batch fields into table fields that is done by
-                        // field.try_merge
-                        f.set_metadata(right_field.metadata().clone());
+                        // Preserve existing (table) column metadata (e.g. generated column
+                        // expressions) as the base, then merge in compatible metadata from the
+                        // batch. This prevents batch-side schemas (which often lack table-defined
+                        // metadata) from overwriting table metadata that `Field::try_merge` may
+                        // have merged in.
+                        f.set_metadata(field.metadata().clone());
 
                         let mut field_metadata = f.metadata().clone();
-                        try_merge_metadata(&mut field_metadata, right_field.metadata())?;
+                        // Column generation expressions are table-defined metadata and should not
+                        // be inferred or overridden by incoming batch schemas. Ignore them when
+                        // merging Arrow field metadata to avoid spurious schema errors when the
+                        // input includes conflicting `delta.generationExpression` metadata.
+                        let mut right_metadata = right_field.metadata().clone();
+                        right_metadata.remove(ColumnMetadataKey::GenerationExpression.as_ref());
+                        try_merge_metadata(&mut field_metadata, &right_metadata)?;
                         f.set_metadata(field_metadata);
                         Ok(f)
                     }
@@ -368,5 +372,164 @@ fn merge_arrow_vec_fields(
             errors.push(e.to_string());
             Err(ArrowError::SchemaError(errors.join("\n")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType::Dictionary;
+    use arrow_schema::DataType;
+    use arrow_schema::Field as ArrowField;
+    use std::sync::Arc;
+
+    use crate::merge_arrow_field;
+
+    #[test]
+    fn merge_arrow_field_dict_utf8() {
+        let left = ArrowField::new(
+            "left",
+            Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Utf8)),
+            false,
+        );
+        let right = ArrowField::new("right", DataType::Utf8, true);
+        let merge_result = merge_arrow_field(&left, &right, true).unwrap();
+        let expected = ArrowField::new(
+            "right",
+            Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Utf8)),
+            false,
+        );
+        assert_eq!(merge_result, expected);
+    }
+
+    #[test]
+    fn merge_arrow_field_dict_binary() {
+        let left = ArrowField::new(
+            "left",
+            Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Binary)),
+            true,
+        );
+        let right = ArrowField::new("right", DataType::Utf8, true);
+        let merge_result = merge_arrow_field(&left, &right, true).unwrap();
+        let expected = ArrowField::new(
+            "left",
+            Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Binary)),
+            true,
+        );
+        assert_eq!(merge_result, expected);
+    }
+
+    #[test]
+    fn merge_arrow_field_dict_int8() {
+        let left = ArrowField::new(
+            "left",
+            Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Int8)),
+            false,
+        );
+        let right = ArrowField::new("right", DataType::Int8, true);
+        let merge_result = merge_arrow_field(&left, &right, true).unwrap();
+        let expected = ArrowField::new(
+            "left",
+            Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Int8)),
+            false,
+        );
+        assert_eq!(merge_result, expected);
+    }
+
+    #[test]
+    fn merge_arrow_field_dict_float16() {
+        let right = ArrowField::new(
+            "right",
+            Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Float16)),
+            true,
+        );
+        let left = ArrowField::new("left", DataType::Float16, false);
+        let merge_result = merge_arrow_field(&left, &right, true).unwrap();
+        let expected = ArrowField::new(
+            "right",
+            Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Float16)),
+            false,
+        );
+        assert_eq!(merge_result, expected);
+    }
+
+    #[test]
+    fn merge_arrow_field_list() {
+        let right = ArrowField::new(
+            "right",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+            true,
+        );
+        let left = ArrowField::new(
+            "left",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+            false,
+        );
+        let merge_result = merge_arrow_field(&left, &right, true).unwrap();
+        let expected = ArrowField::new(
+            "left",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+            false,
+        );
+        assert_eq!(merge_result, expected);
+    }
+
+    #[test]
+    fn merge_arrow_field_map() {
+        let right = ArrowField::new(
+            "right",
+            DataType::Map(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            ArrowField::new("key", DataType::Utf8, false),
+                            ArrowField::new("value", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let left = ArrowField::new(
+            "left",
+            DataType::Map(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            ArrowField::new("key", DataType::Utf8, false),
+                            ArrowField::new("value", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        );
+        let merge_result = merge_arrow_field(&left, &right, true).unwrap();
+        let expected = ArrowField::new(
+            "left",
+            DataType::Map(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            ArrowField::new("key", DataType::Utf8, false),
+                            ArrowField::new("value", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        );
+        assert_eq!(merge_result, expected);
     }
 }

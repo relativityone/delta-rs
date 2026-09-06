@@ -16,21 +16,24 @@ use std::{
     task::{Context, Poll},
 };
 
-use arrow::array::{builder::UInt64Builder, Array, ArrayRef, RecordBatch};
+use arrow::array::{Array, ArrayRef, RecordBatch, builder::UInt64Builder};
 use arrow::datatypes::SchemaRef;
 use dashmap::DashSet;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion::physical_expr::{Distribution, PhysicalExpr};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
+    InputDistributionRequirements, RecordBatchStream, ReplaceChildrenOptions,
+    SendableRecordBatchStream, apply_expression_roots,
 };
 use futures::{Stream, StreamExt};
 
 use crate::{
+    DeltaTableError,
     delta_datafusion::get_path_column,
     operations::merge::{TARGET_DELETE_COLUMN, TARGET_INSERT_COLUMN, TARGET_UPDATE_COLUMN},
-    DeltaTableError,
 };
 
 pub(crate) type BarrierSurvivorSet = Arc<DashSet<String>>;
@@ -72,29 +75,32 @@ impl ExecutionPlan for MergeBarrierExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.input.schema()
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         self.input.properties()
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::HashPartitioned(vec![self.expr.clone()]); 1]
+        self.input_distribution_requirements().into_per_child()
+    }
+
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![Distribution::KeyPartitioned(vec![Arc::clone(
+            &self.expr,
+        )])])
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Plan(
@@ -106,6 +112,16 @@ impl ExecutionPlan for MergeBarrierExec {
             self.file_column.clone(),
             self.expr.clone(),
         )))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -120,6 +136,15 @@ impl ExecutionPlan for MergeBarrierExec {
             self.survivors.clone(),
             self.file_column.clone(),
         )))
+    }
+
+    fn apply_expressions(
+        &self,
+        expr_rewriter: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<TreeNodeRecursion, DataFusionError>,
+    ) -> Result<TreeNodeRecursion, DataFusionError> {
+        apply_expression_roots([&self.expr], expr_rewriter)
     }
 }
 
@@ -435,11 +460,11 @@ impl UserDefinedLogicalNodeCore for MergeBarrier {
     }
 }
 
-pub(crate) fn find_node<T: 'static>(
+pub(crate) fn find_node<T: ExecutionPlan>(
     parent: &Arc<dyn ExecutionPlan>,
 ) -> Option<Arc<dyn ExecutionPlan>> {
     //! Used to locate a Node::<T> after the planner converts the logical node
-    if parent.as_any().downcast_ref::<T>().is_some() {
+    if parent.downcast_ref::<T>().is_some() {
         return Some(parent.to_owned());
     }
 
@@ -470,8 +495,9 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::expressions::Column;
-    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
     use datafusion::physical_plan::ExecutionPlan;
+    #[allow(deprecated)]
+    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
     use futures::StreamExt;
     use std::sync::Arc;
 
@@ -597,17 +623,16 @@ mod tests {
         batches.push(batch);
 
         let (actual, _survivors) = execute(batches).await;
-        let expected = vec!
-            [
-                "+----+-----------------+--------------------------+--------------------------+--------------------------+",
-                "| id | __delta_rs_path | __delta_rs_target_insert | __delta_rs_target_update | __delta_rs_target_delete |",
-                "+----+-----------------+--------------------------+--------------------------+--------------------------+",
-                "| 0  | file0           | false                    | false                    | false                    |",
-                "| 1  | file1           | false                    | false                    | false                    |",
-                "| 2  | file1           | false                    |                          | false                    |",
-                "| 3  | file0           | false                    | false                    |                          |",
-                "+----+-----------------+--------------------------+--------------------------+--------------------------+",
-            ];
+        let expected = vec![
+            "+----+-----------------+--------------------------+--------------------------+--------------------------+",
+            "| id | __delta_rs_path | __delta_rs_target_insert | __delta_rs_target_update | __delta_rs_target_delete |",
+            "+----+-----------------+--------------------------+--------------------------+--------------------------+",
+            "| 0  | file0           | false                    | false                    | false                    |",
+            "| 1  | file1           | false                    | false                    | false                    |",
+            "| 2  | file1           | false                    |                          | false                    |",
+            "| 3  | file0           | false                    | false                    |                          |",
+            "+----+-----------------+--------------------------+--------------------------+--------------------------+",
+        ];
         assert_batches_sorted_eq!(&expected, &actual);
     }
 
@@ -659,6 +684,7 @@ mod tests {
             MergeBarrierExec::new(exec, Arc::new("__delta_rs_path".to_string()), repartition);
 
         let survivors = merge.survivors();
+        #[allow(deprecated)]
         let coalescence = CoalesceBatchesExec::new(Arc::new(merge), 100);
         let mut stream = coalescence.execute(0, task_ctx).unwrap();
         (vec![stream.next().await.unwrap().unwrap()], survivors)

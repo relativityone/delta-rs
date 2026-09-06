@@ -4,10 +4,10 @@ use std::{
 };
 
 use dashmap::DashMap;
-use object_store::{path::Path, DynObjectStore};
+use object_store::{DynObjectStore, path::Path};
 use url::Url;
 
-use super::{default_logstore, DeltaIOStorageBackend, LogStore, ObjectStoreRef, StorageConfig};
+use super::{DeltaIOStorageBackend, LogStore, ObjectStoreRef, StorageConfig, default_logstore};
 use crate::{DeltaResult, DeltaTableError};
 
 /// Factory registry to manage [`ObjectStoreFactory`] instances
@@ -151,6 +151,11 @@ pub fn logstore_factories() -> LogStoreFactoryRegistry {
             );
             registry.insert(
                 Url::parse("file://").unwrap(),
+                Arc::new(DefaultLogStoreFactory::default()),
+            );
+            #[cfg(target_os = "windows")]
+            registry.insert(
+                Url::parse(&format!("{}://", super::DELTA_UNC_SCHEME)).unwrap(),
                 Arc::new(DefaultLogStoreFactory::default()),
             );
             registry

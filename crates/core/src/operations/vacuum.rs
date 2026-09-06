@@ -17,30 +17,118 @@
 //!
 //! # Example
 //! ```rust ignore
-//! let mut table = open_table("../path/to/table")?;
+//! let mut table = open_table(Url::from_directory_path("/abs/path/to/table").unwrap())?;
 //! let (table, metrics) = VacuumBuilder::new(table.object_store(). table.state).await?;
 //! ````
 
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use chrono::{Duration, Utc};
-use futures::future::{ready, BoxFuture};
-use futures::{StreamExt, TryStreamExt};
-use object_store::{path::Path, Error, ObjectStore};
+use futures::channel::mpsc;
+use futures::future::{BoxFuture, ready};
+use futures::{SinkExt, Stream, StreamExt, TryStreamExt, stream};
+use object_store::{Error, ObjectStore, path::Path};
 use serde::Serialize;
 use tracing::*;
 
 use super::{CustomExecuteHandler, Operation};
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::{resolve_snapshot, EagerSnapshot};
+use crate::kernel::{
+    ActiveAddOptions, AddStatsPolicy, EagerSnapshot, Snapshot, TombstoneView, Version,
+    resolve_snapshot,
+};
 use crate::logstore::{LogStore, LogStoreRef};
 use crate::protocol::DeltaOperation;
 use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaTable, DeltaTableConfig};
+
+const DEFAULT_VACUUM_LIST_CONCURRENCY: usize = 10;
+
+/// Default scan concurrency from env (`DELTARS_VACUUM_LIST_CONCURRENCY`) or built-in default.
+///
+/// Cached process-wide. Prefer [`VacuumBuilder::with_scan_concurrency`] for per-operation control.
+fn default_vacuum_list_concurrency() -> usize {
+    static LIST_CONCURRENCY: OnceLock<usize> = OnceLock::new();
+    *LIST_CONCURRENCY.get_or_init(|| {
+        std::env::var("DELTARS_VACUUM_LIST_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(DEFAULT_VACUUM_LIST_CONCURRENCY)
+    })
+}
+
+fn resolve_scan_concurrency(override_value: Option<usize>) -> usize {
+    override_value
+        .filter(|&value| value > 0)
+        .unwrap_or_else(default_vacuum_list_concurrency)
+}
+
+async fn collect_active_paths(
+    snapshot: &Snapshot,
+    log_store: &dyn LogStore,
+) -> DeltaResult<HashSet<Path>> {
+    snapshot
+        .active_adds(
+            log_store,
+            ActiveAddOptions {
+                predicate: None,
+                stats: AddStatsPolicy::None,
+            },
+        )
+        .map_ok(|file| file.object_store_path())
+        .try_collect()
+        .await
+}
+
+fn tombstone_object_store_path(tombstone: &TombstoneView) -> Path {
+    let path = tombstone.path();
+    // Use `Path::parse` to preserve percent encoding. `Path::from` converts percent signs to `%25`.
+    Path::parse(path.as_ref()).unwrap_or_else(|_| Path::from(path.as_ref()))
+}
+
+async fn collect_keep_version_paths(
+    log_store: &dyn LogStore,
+    versions: &[Version],
+) -> DeltaResult<HashSet<Path>> {
+    let mut sorted_versions = versions.to_vec();
+    sorted_versions.sort();
+    sorted_versions.dedup();
+    let Some((initial_version, remaining_versions)) = sorted_versions.split_first() else {
+        return Ok(HashSet::new());
+    };
+
+    log_store.refresh().await?;
+    let mut snapshot = Arc::new(
+        Snapshot::try_new(
+            log_store,
+            DeltaTableConfig {
+                require_files: false,
+                ..Default::default()
+            },
+            Some(*initial_version),
+        )
+        .await?,
+    );
+    let engine = log_store.engine(None);
+    let mut keep_files = collect_active_paths(snapshot.as_ref(), log_store).await?;
+    debug!(version = %initial_version, num_files = keep_files.len(), "collected keep-version paths");
+
+    for version in remaining_versions {
+        log_store.refresh().await?;
+        snapshot = snapshot.update(engine.clone(), Some(*version)).await?;
+        let version_files = collect_active_paths(snapshot.as_ref(), log_store).await?;
+        debug!(version = %version, num_files = version_files.len(), "collected keep-version paths");
+        keep_files.extend(version_files);
+    }
+
+    Ok(keep_files)
+}
 
 /// Errors that can occur during vacuum
 #[derive(thiserror::Error, Debug)]
@@ -59,6 +147,10 @@ enum VacuumError {
     /// Error returned
     #[error(transparent)]
     DeltaTable(#[from] DeltaTableError),
+
+    /// Failed while collecting orphaned files during the full-mode scan.
+    #[error("Failed to scan for orphaned files: {0}")]
+    OrphanScanError(String),
 }
 
 impl From<VacuumError> for DeltaTableError {
@@ -101,11 +193,19 @@ pub struct VacuumBuilder {
     /// Validate the retention period is not below the retention period configured in the table
     enforce_retention_duration: bool,
     /// Keep files associated with particular versions
-    keep_versions: Option<Vec<i64>>,
+    keep_versions: Option<Vec<Version>>,
     /// Don't delete the files. Just determine which files can be deleted
     dry_run: bool,
     /// Mode of vacuum that should be run
     mode: VacuumMode,
+    /// Max concurrent object-store LIST operations during full-mode scan.
+    ///
+    /// `None` uses [`default_vacuum_list_concurrency`] (env or built-in default).
+    scan_concurrency: Option<usize>,
+    /// By default, true. If true, it will scan the files parallelizing
+    /// through prefix-expansion path, otherwise, if false it will use
+    /// flat `list(None)` full-mode scan.
+    parallel_scan: bool,
     /// Override the source of time
     clock: Option<Arc<dyn Clock>>,
     /// Additional information to add to the commit
@@ -163,6 +263,8 @@ impl VacuumBuilder {
             keep_versions: None,
             dry_run: false,
             mode: VacuumMode::Lite,
+            scan_concurrency: None,
+            parallel_scan: true,
             clock: None,
             commit_properties: CommitProperties::default(),
             custom_execute_handler: None,
@@ -175,9 +277,36 @@ impl VacuumBuilder {
         self
     }
 
+    /// Set the maximum number of concurrent object-store LIST operations used
+    /// during full-mode vacuum scanning (partition prefix expansion and leaf
+    /// orphan listing).
+    ///
+    /// Higher values can speed up scans on high-latency object stores but may
+    /// trigger throttling (e.g. HTTP 429/503). LIST retries/backoff are handled
+    /// by the underlying object store's [`object_store::RetryConfig`], not by
+    /// vacuum itself—if a LIST ultimately fails, the vacuum operation fails.
+    ///
+    /// When unset, concurrency is taken from the `DELTARS_VACUUM_LIST_CONCURRENCY`
+    /// environment variable if set to a positive integer, otherwise defaults to 10.
+    /// Values of `0` are ignored and fall back to that default resolution.
+    pub fn with_scan_concurrency(mut self, concurrency: usize) -> Self {
+        self.scan_concurrency = Some(concurrency);
+        self
+    }
+
+    /// Flag to enable/disable the parallel multi-level partition scan used by full-mode vacuum.
+    ///
+    /// By default, tables with more than one partition column use hierarchical
+    /// prefix expansion and concurrent leaf LIST calls. Calling this with `false` forces the
+    /// flat `list(None)` scan path instead.
+    pub fn parallel_scan(mut self, parallel_scan: bool) -> Self {
+        self.parallel_scan = parallel_scan;
+        self
+    }
+
     /// Specify table versions that we want to keep for time travel.
     /// This will prevent deletion of files required by these versions.
-    pub fn with_keep_versions(mut self, versions: &[i64]) -> Self {
+    pub fn with_keep_versions(mut self, versions: &[Version]) -> Self {
         warn!("Using experimental API VacuumBuilder::with_keep_versions");
         self.keep_versions = Some(versions.to_vec());
         self
@@ -221,12 +350,11 @@ impl VacuumBuilder {
     }
 
     /// Determine which files can be deleted. Does not actually perform the deletion
-    async fn create_vacuum_plan(
-        &self,
-        snapshot: &EagerSnapshot,
-    ) -> Result<VacuumPlan, VacuumError> {
+    async fn create_vacuum_plan(&self, snapshot: &Snapshot) -> Result<VacuumPlan, VacuumError> {
         if self.mode == VacuumMode::Full {
-            info!("Vacuum configured to run with 'VacuumMode::Full'. It will scan for orphaned parquet files in the Delta table directory and remove those as well!");
+            info!(
+                "Vacuum configured to run with 'VacuumMode::Full'. It will scan for orphaned parquet files in the Delta table directory and remove those as well!"
+            );
         }
 
         let min_retention = Duration::milliseconds(
@@ -251,95 +379,164 @@ impl VacuumBuilder {
         };
 
         let keep_files = match &self.keep_versions {
-            Some(versions) if !versions.is_empty() => {
-                let mut sorted_versions = versions.clone();
-                sorted_versions.sort();
-                let mut keep_files: HashSet<String> = HashSet::new();
-                let mut state = DeltaTableState::try_new(
-                    &self.log_store,
-                    DeltaTableConfig::default(),
-                    Some(versions[0]),
-                )
-                .await?;
-                for version in sorted_versions {
-                    state.update(&self.log_store, Some(version)).await?;
-                    let files: Vec<String> = state
-                        .log_data()
-                        .into_iter()
-                        .map(|add| add.object_store_path())
-                        .map(|path| path.to_string())
-                        .collect();
-                    debug!("keep version:{version}\n, {files:#?}");
-                    keep_files.extend(files);
-                }
-
-                keep_files
-            }
+            Some(versions) => collect_keep_version_paths(self.log_store.as_ref(), versions).await?,
             _ => HashSet::new(),
         };
 
-        let expired_tombstones =
-            get_stale_files(snapshot, retention_period, now_millis, &self.log_store).await?;
-        let valid_files: HashSet<_> = snapshot
-            .file_views(self.log_store.as_ref(), None)
-            .map_ok(|f| f.object_store_path())
-            .try_collect()
-            .await?;
+        let mut file_count = 0;
+
+        let tombstone_retention_timestamp = now_millis - retention_period.num_milliseconds();
+        let (expired_tombstones, tombstone_path_sets) = if self.mode == VacuumMode::Full {
+            collect_full_mode_tombstones(snapshot, tombstone_retention_timestamp, &self.log_store)
+                .await?
+        } else {
+            (
+                get_stale_files(snapshot, retention_period, now_millis, &self.log_store).await?,
+                TombstonePathSets::default(),
+            )
+        };
+        let valid_files = collect_active_paths(snapshot, self.log_store.as_ref()).await?;
+
+        let partition_columns = snapshot.metadata().partition_columns();
 
         let mut files_to_delete = vec![];
         let mut file_sizes = vec![];
-        let object_store = self.log_store.object_store(None);
 
-        let list_span = info_span!("list_files", operation = "vacuum");
-        let mut all_files = list_span.in_scope(|| object_store.list(None));
-        let partition_columns = snapshot.metadata().partition_columns();
-
-        let mut file_count = 0;
-        while let Some(obj_meta) = all_files.next().await {
-            // TODO should we allow NotFound here in case we have a temporary commit file in the list
-            let obj_meta = obj_meta.map_err(DeltaTableError::from)?;
-            file_count += 1;
-            // file is still being tracked in table
-            if valid_files.contains(&obj_meta.location) {
-                continue;
+        // VacuumMode::Lite file set
+        // Expired tombstones are *always deleted (*unless in keep list)
+        for tombs in expired_tombstones.iter() {
+            let path = tombstone_object_store_path(tombs);
+            if ok_to_delete(&path, &valid_files, &keep_files, partition_columns)? {
+                files_to_delete.push(path);
+                file_sizes.push(tombs.size().unwrap_or(0));
             }
-            // file is associated with a version that we are keeping
-            if keep_files.contains(&obj_meta.location.to_string()) {
-                debug!(
-                    "The file {:?} is in a version specified to be kept by the user, skipping",
-                    &obj_meta.location
+        }
+
+        if self.mode == VacuumMode::Full {
+            let object_store = self.log_store.object_store(None);
+
+            if self.parallel_scan && should_try_parallel_vacuum(partition_columns) {
+                let valid_files = Arc::new(valid_files);
+                let keep_files = Arc::new(keep_files);
+                let tombstone_path_sets = Arc::new(tombstone_path_sets);
+                let partition_columns: Arc<Vec<String>> = Arc::new(partition_columns.to_vec());
+                let retention_millis = retention_period.num_milliseconds();
+                let scan_concurrency = resolve_scan_concurrency(self.scan_concurrency);
+                // Stop before the last partition column so leaf LIST targets are
+                // prefix paths of depth n-1 (e.g. date=…/), not the final fan-out
+                // (e.g. date=…/part=…/).
+                let partition_depth = partition_columns.len() - 1;
+
+                let parallel_span = info_span!(
+                    "list_files_parallel",
+                    operation = "vacuum",
+                    partition_depth,
+                    scan_concurrency,
                 );
-                continue;
-            }
-            if is_hidden_directory(partition_columns, &obj_meta.location)? {
-                continue;
-            }
-            // file is not an expired tombstone _and_ this is a "Lite" vacuum
-            // If the file is not an expired tombstone and we have gotten to here with a
-            // VacuumMode::Full then it should be added to the deletion plan
-            if !expired_tombstones.contains(obj_meta.location.as_ref()) {
-                // For files without tombstones (uncommitted or orphaned files),
-                // check their physical age to protect recently written files from deletion.
-                // This prevents race conditions where a concurrent writer's uncommitted files
-                // could be deleted before the transaction is committed.
-                let file_age_millis = now_millis - obj_meta.last_modified.timestamp_millis();
-                if file_age_millis < retention_period.num_milliseconds() {
-                    debug!(
-                        "The file {:?} is not in the log but too recent , protecting from vacuum",
-                        &obj_meta.location,
-                    );
-                    continue;
-                }
-                if self.mode == VacuumMode::Lite {
-                    debug!("The file {:?} was not referenced in a log file, but VacuumMode::Lite means it will not be vacuumed", &obj_meta.location);
-                    continue;
-                } else {
-                    debug!("The file {:?} was not referenced in a log file, but VacuumMode::Full means it *will be vacuumed*", &obj_meta.location);
-                }
-            }
+                async {
+                    // Walk n-1 delimiter levels, streaming leaf prefixes as they
+                    // are discovered so leaf LIST can start before the full
+                    // prefix set is materialised. Intermediate-level objects are
+                    // reported via callback.
+                    let expand_scanned = Arc::new(AtomicUsize::new(0));
+                    let leaf_scanned = Arc::new(AtomicUsize::new(0));
 
-            files_to_delete.push(obj_meta.location);
-            file_sizes.push(obj_meta.size as i64);
+                    // Expand runs in a spawned task; buffer intermediate orphans
+                    // until the leaf pipeline finishes (usually few/none).
+                    let intermediate_orphans =
+                        Arc::new(std::sync::Mutex::new(Vec::<(Path, i64)>::new()));
+                    let intermediate_orphans_cb = Arc::clone(&intermediate_orphans);
+
+                    expand_partition_prefixes(
+                        object_store.clone(),
+                        partition_depth,
+                        Arc::clone(&valid_files),
+                        Arc::clone(&keep_files),
+                        Arc::clone(&partition_columns),
+                        Arc::clone(&tombstone_path_sets),
+                        now_millis,
+                        retention_millis,
+                        Arc::clone(&expand_scanned),
+                        scan_concurrency,
+                        move |path, size| {
+                            intermediate_orphans_cb
+                                .lock()
+                                .map_err(|_| {
+                                    VacuumError::OrphanScanError("Failed to lock mutex".to_string())
+                                })?
+                                .push((path, size));
+                            Ok(())
+                        },
+                    )
+                    .map(|prefix_res| {
+                        let store = object_store.clone();
+                        let valid_files = Arc::clone(&valid_files);
+                        let keep_files = Arc::clone(&keep_files);
+                        let tombstone_path_sets = Arc::clone(&tombstone_path_sets);
+                        let partition_columns = Arc::clone(&partition_columns);
+                        let scanned = Arc::clone(&leaf_scanned);
+                        // Lazy leaf-list stream per prefix. LIST runs on poll;
+                        // concurrency comes from try_flatten_unordered below.
+                        prefix_res.map(|prefix| {
+                            list_orphans_under_prefix(
+                                store,
+                                prefix,
+                                valid_files,
+                                keep_files,
+                                partition_columns,
+                                tombstone_path_sets,
+                                now_millis,
+                                retention_millis,
+                                scanned,
+                            )
+                        })
+                    })
+                    .try_flatten_unordered(scan_concurrency)
+                    .try_for_each(|(path, size)| {
+                        files_to_delete.push(path);
+                        file_sizes.push(size);
+                        ready(Ok::<_, DeltaTableError>(()))
+                    })
+                    .await?;
+
+                    let mut intermediate = intermediate_orphans.lock().map_err(|_| {
+                        VacuumError::OrphanScanError("Failed to lock mutex".to_string())
+                    })?;
+
+                    for (path, size) in intermediate.drain(..) {
+                        files_to_delete.push(path);
+                        file_sizes.push(size);
+                    }
+
+                    file_count += expand_scanned.load(Ordering::Relaxed);
+                    file_count += leaf_scanned.load(Ordering::Relaxed);
+
+                    Ok::<_, VacuumError>(())
+                }
+                .instrument(parallel_span)
+                .await?;
+            } else {
+                let list_span = info_span!("list_files", operation = "vacuum");
+                let mut all_files = list_span.in_scope(|| object_store.list(None));
+
+                while let Some(obj_meta) = all_files.next().await {
+                    // TODO should we allow NotFound here in case we have a temporary commit file in the list
+                    let obj_meta = obj_meta.map_err(DeltaTableError::from)?;
+                    if let Some((path, size)) = consider_orphan_for_deletion(
+                        &obj_meta,
+                        &valid_files,
+                        &keep_files,
+                        partition_columns,
+                        &tombstone_path_sets,
+                        now_millis,
+                        retention_period.num_milliseconds(),
+                    )? {
+                        files_to_delete.push(path);
+                        file_sizes.push(size);
+                        file_count += 1;
+                    }
+                }
+            }
         }
         info!(
             files_scanned = file_count,
@@ -364,8 +561,9 @@ impl std::future::IntoFuture for VacuumBuilder {
     fn into_future(self) -> Self::IntoFuture {
         let this = self;
         Box::pin(async move {
-            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), true).await?;
-            let plan = this.create_vacuum_plan(&snapshot).await?;
+            let snapshot =
+                resolve_snapshot(&this.log_store, this.snapshot.clone(), true, None).await?;
+            let plan = this.create_vacuum_plan(snapshot.snapshot()).await?;
 
             if this.dry_run {
                 return Ok((
@@ -507,12 +705,27 @@ impl VacuumPlan {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TombstonePathSets {
+    expired_tombstone_paths: HashSet<Path>,
+    all_tombstone_paths: HashSet<Path>,
+}
+
+impl TombstonePathSets {
+    fn record(&mut self, path: Path, is_expired: bool) {
+        if is_expired {
+            self.expired_tombstone_paths.insert(path.clone());
+        }
+        self.all_tombstone_paths.insert(path);
+    }
+}
+
 /// Whether a path should be hidden for delta-related file operations, such as Vacuum.
 /// Names of the form partitionCol=[value] are partition directories, and should be
 /// deleted even if they'd normally be hidden. The _db_index directory contains (bloom filter)
 /// indexes and these must be deleted when the data they are tied to is deleted.
 fn is_hidden_directory(partition_columns: &[String], path: &Path) -> Result<bool, DeltaTableError> {
-    let path_name = path.to_string();
+    let path_name = path.as_ref();
     Ok((path_name.starts_with('.') || path_name.starts_with('_'))
         && !path_name.starts_with("_delta_index")
         && !path_name.starts_with("_change_data")
@@ -521,36 +734,732 @@ fn is_hidden_directory(partition_columns: &[String], path: &Path) -> Result<bool
             .any(|partition_column| path_name.starts_with(partition_column)))
 }
 
+/// Returns true if the file at `location` is a candidate for deletion.
+/// A file should NOT be deleted if it is still tracked in the table,
+/// associated with a kept version, or is a hidden directory.
+fn ok_to_delete(
+    location: &Path,
+    valid_files: &HashSet<Path>,
+    keep_files: &HashSet<Path>,
+    partition_columns: &[String],
+) -> Result<bool, DeltaTableError> {
+    Ok(
+        !(valid_files.contains(location) // file is still being tracked in table
+        || keep_files.contains(location)
+        || is_hidden_directory(partition_columns, location)?),
+    )
+}
+
+/// Decide whether a listed object is an orphan eligible for full-mode vacuum.
+///
+/// Returns `Some((path, size))` when the object should be deleted, or `None`
+/// when it is still referenced, kept, hidden, recently tombstoned, or too new.
+fn consider_orphan_for_deletion(
+    obj_meta: &object_store::ObjectMeta,
+    valid_files: &HashSet<Path>,
+    keep_files: &HashSet<Path>,
+    partition_columns: &[String],
+    tombstone_path_sets: &TombstonePathSets,
+    now_millis: i64,
+    retention_millis: i64,
+) -> Result<Option<(Path, i64)>, DeltaTableError> {
+    if tombstone_path_sets
+        .expired_tombstone_paths
+        .contains(&obj_meta.location)
+    {
+        debug!(
+            "The file {:?} is already queued as an expired tombstone",
+            &obj_meta.location,
+        );
+        return Ok(None);
+    }
+
+    if !ok_to_delete(
+        &obj_meta.location,
+        valid_files,
+        keep_files,
+        partition_columns,
+    )? {
+        return Ok(None);
+    }
+
+    if tombstone_path_sets
+        .all_tombstone_paths
+        .contains(&obj_meta.location)
+    {
+        debug!(
+            "The file {:?} has a recent tombstone, keeping it until tombstone retention expires",
+            &obj_meta.location,
+        );
+        return Ok(None);
+    }
+
+    // At this point the path is untracked by the Delta log, so full mode falls back
+    // to physical object age to protect recent concurrent-writer output.
+    let file_age_millis = now_millis - obj_meta.last_modified.timestamp_millis();
+    if file_age_millis < retention_millis {
+        debug!(
+            "The file {:?} is an untracked recent file, protecting it from vacuum",
+            &obj_meta.location,
+        );
+        return Ok(None);
+    }
+
+    debug!(
+        "The file {:?} is an untracked stale orphan and will be vacuumed in full mode",
+        &obj_meta.location
+    );
+    Ok(Some((obj_meta.location.clone(), obj_meta.size as i64)))
+}
+
+/// Root prefixes that should not be expanded during full-mode partition walks.
+fn is_skippable_root_prefix(path: &Path) -> bool {
+    let path_name = path.as_ref();
+    path_name == "_delta_log" || path_name.starts_with("_delta_log/") || path_name.starts_with('.')
+}
+
+/// Walk `partition_depth` delimiter levels and stream leaf partition prefixes.
+///
+/// Non-final levels still keep an in-memory prefix frontier (required for BFS).
+/// Delimiter results are folded as they complete (no per-level `Vec<ListResult>`).
+/// At the final level each child prefix is yielded immediately.
+/// Intermediate-level orphans are reported via `on_intermediate_orphan`.
+/// Every listed object increments `scanned`.
+fn expand_partition_prefixes(
+    store: Arc<dyn ObjectStore>,
+    partition_depth: usize,
+    valid_files: Arc<HashSet<Path>>,
+    keep_files: Arc<HashSet<Path>>,
+    partition_columns: Arc<Vec<String>>,
+    tombstone_path_sets: Arc<TombstonePathSets>,
+    now_millis: i64,
+    retention_millis: i64,
+    scanned: Arc<AtomicUsize>,
+    scan_concurrency: usize,
+    mut on_intermediate_orphan: impl FnMut(Path, i64) -> Result<(), DeltaTableError> + Send + 'static,
+) -> impl Stream<Item = Result<Path, DeltaTableError>> {
+    let (mut tx, rx) = mpsc::channel(scan_concurrency.saturating_mul(4).max(16));
+
+    tokio::spawn(async move {
+        let mut frontier: Vec<Option<Path>> = vec![None];
+
+        for level in 0..partition_depth {
+            let is_final_level = level + 1 == partition_depth;
+            let current = std::mem::take(&mut frontier);
+            let mut next_frontier = Vec::new();
+
+            let mut listings = stream::iter(current)
+                .map(|prefix| {
+                    let store = store.clone();
+                    let prefix_label = prefix
+                        .as_ref()
+                        .map(|p| p.as_ref())
+                        .unwrap_or("")
+                        .to_string();
+                    async move {
+                        store
+                            .list_with_delimiter(prefix.as_ref())
+                            .instrument(info_span!(
+                                "list_with_delimiter",
+                                operation = "vacuum",
+                                level,
+                                prefix = prefix_label,
+                            ))
+                            .await
+                            .map_err(DeltaTableError::from)
+                    }
+                })
+                .buffer_unordered(scan_concurrency);
+
+            loop {
+                match listings.try_next().await {
+                    Ok(Some(listing)) => {
+                        for obj_meta in listing.objects {
+                            scanned.fetch_add(1, Ordering::Relaxed);
+                            match consider_orphan_for_deletion(
+                                &obj_meta,
+                                valid_files.as_ref(),
+                                keep_files.as_ref(),
+                                partition_columns.as_ref(),
+                                tombstone_path_sets.as_ref(),
+                                now_millis,
+                                retention_millis,
+                            ) {
+                                Ok(Some((path, size))) => {
+                                    if let Err(e) = on_intermediate_orphan(path, size) {
+                                        let _ = tx.send(Err(e)).await;
+                                        return;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    return;
+                                }
+                            }
+                        }
+
+                        for child in listing.common_prefixes {
+                            if level == 0 && is_skippable_root_prefix(&child) {
+                                continue;
+                            }
+                            if is_final_level {
+                                if tx.send(Ok(child)).await.is_err() {
+                                    return; // consumer dropped
+                                }
+                            } else {
+                                next_frontier.push(Some(child));
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+
+            frontier = next_frontier;
+        }
+    });
+
+    rx
+}
+
+/// List `prefix` and yield orphans eligible for full-mode vacuum.
+///
+/// Each successfully listed object increments `scanned` (objects observed,
+/// not just orphans). Only objects that pass `consider_orphan_for_deletion`
+/// are yielded. Inputs are owned/`Arc` so the stream is `'static` and can be
+/// driven from concurrent `buffer_unordered` tasks.
+fn list_orphans_under_prefix(
+    store: Arc<dyn ObjectStore>,
+    prefix: Path,
+    valid_files: Arc<HashSet<Path>>,
+    keep_files: Arc<HashSet<Path>>,
+    partition_columns: Arc<Vec<String>>,
+    tombstone_path_sets: Arc<TombstonePathSets>,
+    now_millis: i64,
+    retention_millis: i64,
+    scanned: Arc<AtomicUsize>,
+) -> impl Stream<Item = Result<(Path, i64), DeltaTableError>> {
+    let span = info_span!(
+        "list_files",
+        operation = "vacuum",
+        mode = "parallel",
+        prefix = prefix.to_string(),
+    );
+    store
+        .list(Some(&prefix))
+        .map_err(DeltaTableError::from)
+        .try_filter_map(move |obj_meta| {
+            let _guard = span.enter();
+            // Count every listed object for progress diagnostics.
+            scanned.fetch_add(1, Ordering::Relaxed);
+            // TODO should we allow NotFound here in case we have a temporary commit file in the list
+            let result = consider_orphan_for_deletion(
+                &obj_meta,
+                valid_files.as_ref(),
+                keep_files.as_ref(),
+                partition_columns.as_ref(),
+                tombstone_path_sets.as_ref(),
+                now_millis,
+                retention_millis,
+            );
+            ready(result)
+        })
+}
+
+async fn collect_full_mode_tombstones(
+    snapshot: &Snapshot,
+    tombstone_retention_timestamp: i64,
+    store: &dyn LogStore,
+) -> DeltaResult<(Vec<TombstoneView>, TombstonePathSets)> {
+    snapshot
+        .active_tombstones(store)
+        .try_fold(
+            (Vec::new(), TombstonePathSets::default()),
+            |(mut expired_tombstones, mut tombstone_path_sets), tombstone| {
+                let is_expired = is_tombstone_expired(&tombstone, tombstone_retention_timestamp);
+                let path = tombstone_object_store_path(&tombstone);
+                tombstone_path_sets.record(path, is_expired);
+                if is_expired {
+                    expired_tombstones.push(tombstone);
+                }
+                ready(Ok((expired_tombstones, tombstone_path_sets)))
+            },
+        )
+        .await
+}
+
 /// List files no longer referenced by a Delta table and are older than the retention threshold.
 async fn get_stale_files(
-    snapshot: &EagerSnapshot,
+    snapshot: &Snapshot,
     retention_period: Duration,
     now_timestamp_millis: i64,
     store: &dyn LogStore,
-) -> DeltaResult<HashSet<String>> {
+) -> DeltaResult<Vec<TombstoneView>> {
     let tombstone_retention_timestamp = now_timestamp_millis - retention_period.num_milliseconds();
     snapshot
-        .snapshot()
-        .tombstones(store)
+        .active_tombstones(store)
         .try_filter(|tombstone| {
-            // if the file has a creation time before the `tombstone_retention_timestamp`
-            // then it's considered as a stale file
-            ready(tombstone.deletion_timestamp().unwrap_or(0) < tombstone_retention_timestamp)
+            ready(is_tombstone_expired(
+                tombstone,
+                tombstone_retention_timestamp,
+            ))
         })
-        .map_ok(|tombstone| tombstone.path().to_string())
-        .try_collect::<HashSet<_>>()
+        .try_collect::<Vec<_>>()
         .await
+}
+
+fn is_tombstone_expired(tombstone: &TombstoneView, tombstone_retention_timestamp: i64) -> bool {
+    tombstone.deletion_timestamp().unwrap_or(0) < tombstone_retention_timestamp
+}
+
+fn should_try_parallel_vacuum(partition_columns: &[String]) -> bool {
+    // Single-level partitions: flat list(None) is cheaper than expand-to-leaves
+    // when cardinality is high and leaves are tiny. Multi-level: expand to n-1.
+    partition_columns.len() > 1
 }
 
 #[cfg(test)]
 mod tests {
-    use object_store::{local::LocalFileSystem, memory::InMemory, PutPayload};
+    use bytes::Bytes;
+    use object_store::{ObjectStoreExt as _, PutPayload, local::LocalFileSystem, memory::InMemory};
+    use serde_json::json;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::kernel::transaction::{CommitBuilder, TransactionError};
+    use crate::kernel::{Action, DataType, PrimitiveType, Remove, Snapshot, StructField};
+    use crate::logstore::{CommitOrBytes, LogStoreConfig};
+    use crate::protocol::SaveMode;
+    use crate::writer::test_utils::create_initialized_table;
+    use crate::writer::{DeltaWriter, JsonWriter};
     use crate::{ensure_table_uri, open_table};
     use std::path::Path;
-    use std::{io::Read, time::SystemTime};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        fs::{FileTimes, OpenOptions},
+        io::Read,
+        time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+    };
     use url::Url;
+
+    async fn commit_test_actions(table: &DeltaTable, actions: Vec<Action>) -> DeltaResult<()> {
+        CommitBuilder::default()
+            .with_actions(actions)
+            .build(
+                Some(table.snapshot()?),
+                table.log_store(),
+                DeltaOperation::Write {
+                    mode: SaveMode::Append,
+                    partition_by: None,
+                    predicate: None,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn lazy_snapshot_config() -> DeltaTableConfig {
+        DeltaTableConfig {
+            require_files: false,
+            ..Default::default()
+        }
+    }
+
+    fn normalize_vacuum_plan(plan: VacuumPlan) -> (Vec<(String, i64)>, bool, i64, Option<i64>) {
+        let mut files = plan
+            .files_to_delete
+            .into_iter()
+            .zip(plan.file_sizes)
+            .map(|(path, size)| (path.to_string(), size))
+            .collect::<Vec<_>>();
+        files.sort();
+        (
+            files,
+            plan.retention_check_enabled,
+            plan.default_retention_millis,
+            plan.specified_retention_millis,
+        )
+    }
+
+    fn tombstone_paths(mut tombstones: Vec<TombstoneView>) -> Vec<String> {
+        let mut paths = tombstones
+            .drain(..)
+            .map(|tombstone| tombstone.path().to_string())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    #[derive(Debug)]
+    struct RefreshTrackingLogStore {
+        inner: LogStoreRef,
+        refresh_count: Arc<AtomicUsize>,
+        engine_count: AtomicUsize,
+        update_engine_refresh_epochs: Arc<Mutex<Vec<usize>>>,
+    }
+
+    struct RefreshTrackingEngine {
+        inner: Arc<dyn delta_kernel::Engine>,
+        refresh_count: Arc<AtomicUsize>,
+        update_engine_refresh_epochs: Arc<Mutex<Vec<usize>>>,
+        track_refresh_epochs: bool,
+    }
+
+    impl RefreshTrackingEngine {
+        fn record_refresh_epoch(&self) {
+            if !self.track_refresh_epochs {
+                return;
+            }
+            let refresh_epoch = self.refresh_count.load(Ordering::SeqCst);
+            let mut observed = self.update_engine_refresh_epochs.lock().unwrap();
+            if observed.last() != Some(&refresh_epoch) {
+                observed.push(refresh_epoch);
+            }
+        }
+    }
+
+    impl delta_kernel::Engine for RefreshTrackingEngine {
+        fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+            self.record_refresh_epoch();
+            self.inner.evaluation_handler()
+        }
+
+        fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
+            self.record_refresh_epoch();
+            self.inner.storage_handler()
+        }
+
+        fn json_handler(&self) -> Arc<dyn delta_kernel::JsonHandler> {
+            self.record_refresh_epoch();
+            self.inner.json_handler()
+        }
+
+        fn parquet_handler(&self) -> Arc<dyn delta_kernel::ParquetHandler> {
+            self.record_refresh_epoch();
+            self.inner.parquet_handler()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LogStore for RefreshTrackingLogStore {
+        fn name(&self) -> String {
+            self.inner.name()
+        }
+
+        async fn refresh(&self) -> DeltaResult<()> {
+            self.refresh_count.fetch_add(1, Ordering::SeqCst);
+            self.inner.refresh().await
+        }
+
+        async fn read_commit_entry(&self, version: Version) -> DeltaResult<Option<Bytes>> {
+            self.inner.read_commit_entry(version).await
+        }
+
+        async fn write_commit_entry(
+            &self,
+            version: Version,
+            commit_or_bytes: CommitOrBytes,
+            operation_id: Uuid,
+        ) -> Result<(), TransactionError> {
+            self.inner
+                .write_commit_entry(version, commit_or_bytes, operation_id)
+                .await
+        }
+
+        async fn abort_commit_entry(
+            &self,
+            version: Version,
+            commit_or_bytes: CommitOrBytes,
+            operation_id: Uuid,
+        ) -> Result<(), TransactionError> {
+            self.inner
+                .abort_commit_entry(version, commit_or_bytes, operation_id)
+                .await
+        }
+
+        async fn get_latest_version(&self, start_version: Version) -> DeltaResult<Version> {
+            self.inner.get_latest_version(start_version).await
+        }
+
+        fn object_store(&self, operation_id: Option<Uuid>) -> Arc<dyn ObjectStore> {
+            self.inner.object_store(operation_id)
+        }
+
+        fn root_object_store(&self, operation_id: Option<Uuid>) -> Arc<dyn ObjectStore> {
+            self.inner.root_object_store(operation_id)
+        }
+
+        fn engine(&self, operation_id: Option<Uuid>) -> Arc<dyn delta_kernel::Engine> {
+            // The first engine creates the snapshot. The second applies updates.
+            let track_refresh_epochs = self.engine_count.fetch_add(1, Ordering::SeqCst) == 1;
+            Arc::new(RefreshTrackingEngine {
+                inner: self.inner.engine(operation_id),
+                refresh_count: Arc::clone(&self.refresh_count),
+                update_engine_refresh_epochs: Arc::clone(&self.update_engine_refresh_epochs),
+                track_refresh_epochs,
+            })
+        }
+
+        fn config(&self) -> &LogStoreConfig {
+            self.inner.config()
+        }
+    }
+
+    async fn refresh_tracking_log_store() -> DeltaResult<(
+        RefreshTrackingLogStore,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<usize>>>,
+    )> {
+        let table =
+            open_table(ensure_table_uri("../test/tests/data/simple_table").unwrap()).await?;
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let update_engine_refresh_epochs = Arc::new(Mutex::new(Vec::new()));
+        Ok((
+            RefreshTrackingLogStore {
+                inner: table.log_store(),
+                refresh_count: Arc::clone(&refresh_count),
+                engine_count: AtomicUsize::new(0),
+                update_engine_refresh_epochs: Arc::clone(&update_engine_refresh_epochs),
+            },
+            refresh_count,
+            update_engine_refresh_epochs,
+        ))
+    }
+
+    #[tokio::test]
+    async fn empty_keep_versions_do_not_refresh_log_store() -> DeltaResult<()> {
+        let (log_store, refresh_count, update_engine_refresh_epochs) =
+            refresh_tracking_log_store().await?;
+
+        let paths = collect_keep_version_paths(&log_store, &[]).await?;
+
+        assert!(paths.is_empty());
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 0);
+        assert!(update_engine_refresh_epochs.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_keep_versions_scan_each_version_once() -> DeltaResult<()> {
+        let (log_store, refresh_count, update_engine_refresh_epochs) =
+            refresh_tracking_log_store().await?;
+
+        let paths = collect_keep_version_paths(&log_store, &[3, 2, 3, 2]).await?;
+
+        assert!(!paths.is_empty());
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            update_engine_refresh_epochs.lock().unwrap().as_slice(),
+            &[2]
+        );
+        Ok(())
+    }
+
+    async fn encoded_tombstone_table() -> DeltaResult<(DeltaTable, object_store::path::Path)> {
+        let encoded_path = "partition=a/file%20name.parquet";
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns([StructField::new(
+                "id".to_string(),
+                DataType::Primitive(PrimitiveType::Integer),
+                false,
+            )])
+            .with_actions([Action::Add(crate::test_utils::make_test_add(
+                encoded_path,
+                &[],
+                0,
+            ))])
+            .await?;
+        let physical_path = object_store::path::Path::parse(encoded_path)?;
+        table
+            .object_store()
+            .put(&physical_path, PutPayload::from_static(b"encoded"))
+            .await?;
+        commit_test_actions(
+            &table,
+            vec![Action::Remove(Remove {
+                path: encoded_path.to_string(),
+                data_change: true,
+                deletion_timestamp: Some(0),
+                size: Some(7),
+                ..Default::default()
+            })],
+        )
+        .await?;
+
+        Ok((table, physical_path))
+    }
+
+    async fn encoded_tombstone_plan(
+        mode: VacuumMode,
+    ) -> DeltaResult<(VacuumPlan, object_store::path::Path)> {
+        let (table, expected_path) = encoded_tombstone_table().await?;
+        let log_store = table.log_store();
+        let snapshot = Snapshot::try_new(log_store.as_ref(), lazy_snapshot_config(), None).await?;
+        let plan = VacuumBuilder::new(log_store, None)
+            .with_retention_period(Duration::milliseconds(1))
+            .with_mode(mode)
+            .with_enforce_retention_duration(false)
+            .with_clock(Arc::new(MockClock::new(2_000_000_000_000)))
+            .create_vacuum_plan(&snapshot)
+            .await
+            .map_err(DeltaTableError::from)?;
+        Ok((plan, expected_path))
+    }
+
+    #[tokio::test]
+    async fn lite_vacuum_preserves_encoded_tombstone_identity() -> DeltaResult<()> {
+        let (plan, expected_path) = encoded_tombstone_plan(VacuumMode::Lite).await?;
+
+        assert_eq!(plan.files_to_delete, vec![expected_path]);
+        assert_eq!(plan.file_sizes, vec![7]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_vacuum_preserves_encoded_tombstone_identity_without_duplicate_orphan()
+    -> DeltaResult<()> {
+        let (plan, expected_path) = encoded_tombstone_plan(VacuumMode::Full).await?;
+
+        assert_eq!(plan.files_to_delete, vec![expected_path]);
+        assert_eq!(plan.file_sizes, vec![7]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vacuum_plan_lazy_eager_parity_stays_unmaterialized() -> DeltaResult<()> {
+        let table =
+            open_table(ensure_table_uri("../test/tests/data/simple_table").unwrap()).await?;
+        let log_store = table.log_store();
+        let eager = table.snapshot()?.snapshot();
+        let lazy = Snapshot::try_new(log_store.as_ref(), lazy_snapshot_config(), None).await?;
+        let builder = VacuumBuilder::new(log_store, None)
+            .with_retention_period(Duration::hours(0))
+            .with_mode(VacuumMode::Lite)
+            .with_enforce_retention_duration(false)
+            .with_clock(Arc::new(MockClock::new(2_000_000_000_000)));
+
+        assert!(!lazy.has_materialized_files_for_test());
+        let eager_plan = builder.create_vacuum_plan(eager.snapshot()).await?;
+        let lazy_plan = builder.create_vacuum_plan(&lazy).await?;
+
+        assert_eq!(
+            normalize_vacuum_plan(eager_plan),
+            normalize_vacuum_plan(lazy_plan)
+        );
+        assert!(!lazy.has_materialized_files_for_test());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn encoded_active_and_kept_paths_share_canonical_identity() -> DeltaResult<()> {
+        let encoded = "partition=a/file%20name.parquet";
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns([StructField::new(
+                "id".to_string(),
+                DataType::Primitive(PrimitiveType::Integer),
+                false,
+            )])
+            .with_actions([Action::Add(crate::test_utils::make_test_add(
+                encoded,
+                &[],
+                0,
+            ))])
+            .await?;
+        let log_store = table.log_store();
+        let lazy = Snapshot::try_new(log_store.as_ref(), lazy_snapshot_config(), None).await?;
+
+        assert!(!lazy.has_materialized_files_for_test());
+        let active_paths = collect_active_paths(&lazy, log_store.as_ref()).await?;
+        let keep_paths = collect_keep_version_paths(log_store.as_ref(), &[0]).await?;
+        let path = object_store::path::Path::parse(encoded)?;
+
+        assert_eq!(active_paths, keep_paths);
+        assert!(active_paths.contains(&path));
+        assert!(!lazy.has_materialized_files_for_test());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_native_tombstone_helpers_match_eager_and_lazy() -> DeltaResult<()> {
+        let expired_path = "expired.parquet";
+        let recent_path = "recent.parquet";
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns([StructField::new(
+                "id".to_string(),
+                DataType::Primitive(PrimitiveType::Integer),
+                false,
+            )])
+            .with_actions([
+                Action::Add(crate::test_utils::make_test_add(expired_path, &[], 0)),
+                Action::Add(crate::test_utils::make_test_add(recent_path, &[], 0)),
+            ])
+            .await?;
+        commit_test_actions(
+            &table,
+            vec![
+                Action::Remove(Remove {
+                    path: expired_path.to_string(),
+                    data_change: true,
+                    deletion_timestamp: Some(98_000),
+                    ..Default::default()
+                }),
+                Action::Remove(Remove {
+                    path: recent_path.to_string(),
+                    data_change: true,
+                    deletion_timestamp: Some(99_500),
+                    ..Default::default()
+                }),
+            ],
+        )
+        .await?;
+        let log_store = table.log_store();
+        let eager = EagerSnapshot::try_new(log_store.as_ref(), Default::default(), None).await?;
+        let lazy = Snapshot::try_new(log_store.as_ref(), lazy_snapshot_config(), None).await?;
+        let now_millis = 100_000;
+        let retention = Duration::milliseconds(1_000);
+
+        assert!(!lazy.has_materialized_files_for_test());
+        let eager_stale =
+            get_stale_files(eager.snapshot(), retention, now_millis, log_store.as_ref()).await?;
+        let lazy_stale = get_stale_files(&lazy, retention, now_millis, log_store.as_ref()).await?;
+        assert_eq!(tombstone_paths(eager_stale), vec![expired_path]);
+        assert_eq!(tombstone_paths(lazy_stale), vec![expired_path]);
+
+        let cutoff = now_millis - retention.num_milliseconds();
+        let (eager_expired, eager_sets) =
+            collect_full_mode_tombstones(eager.snapshot(), cutoff, log_store.as_ref()).await?;
+        let (lazy_expired, lazy_sets) =
+            collect_full_mode_tombstones(&lazy, cutoff, log_store.as_ref()).await?;
+        assert_eq!(
+            tombstone_paths(eager_expired),
+            tombstone_paths(lazy_expired)
+        );
+        assert_eq!(eager_sets, lazy_sets);
+        assert!(
+            lazy_sets
+                .expired_tombstone_paths
+                .contains(&object_store::path::Path::from(expired_path))
+        );
+        assert!(
+            lazy_sets
+                .all_tombstone_paths
+                .contains(&object_store::path::Path::from(recent_path))
+        );
+        assert!(!lazy.has_materialized_files_for_test());
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_vacuum_full() -> DeltaResult<()> {
@@ -688,10 +1597,43 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_vacuum_keep_versions_descending_order() -> DeltaResult<()> {
+        let table_loc = "../test/tests/data/simple_table";
+        let table_uri = ensure_table_uri(table_loc).unwrap();
+        let table = open_table(table_uri).await?;
+
+        let (_table, ascending_result) =
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
+                .with_retention_period(Duration::hours(0))
+                .with_keep_versions(&[0, 1, 2, 3])
+                .with_dry_run(true)
+                .with_mode(VacuumMode::Full)
+                .with_enforce_retention_duration(false)
+                .await?;
+
+        let (_table, descending_result) =
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
+                .with_retention_period(Duration::hours(0))
+                .with_keep_versions(&[3, 2, 1, 0])
+                .with_dry_run(true)
+                .with_mode(VacuumMode::Full)
+                .with_enforce_retention_duration(false)
+                .await?;
+
+        let mut ascending_files = ascending_result.files_deleted;
+        ascending_files.sort();
+        let mut descending_files = descending_result.files_deleted;
+        descending_files.sort();
+
+        assert_eq!(descending_files, ascending_files);
+        Ok(())
+    }
+
     // This test will do some table operations after executing a vacuum with versions to ensure
     // that the table is still functional, can be read, checkpointed, etc.
     #[cfg(feature = "datafusion")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_vacuum_keep_version_validity() {
         use datafusion::prelude::SessionContext;
         use object_store::GetResultPayload;
@@ -715,7 +1657,7 @@ mod tests {
         }
 
         let table_url = url::Url::parse("memory:///").unwrap();
-        let mut table = crate::DeltaTableBuilder::from_uri(table_url.clone())
+        let mut table = crate::DeltaTableBuilder::from_url(table_url.clone())
             .unwrap()
             .with_storage_backend(Arc::new(store), table_url)
             .build()
@@ -743,7 +1685,9 @@ mod tests {
         assert_eq!(Some(6), table.version());
 
         let ctx = SessionContext::new();
-        ctx.register_table("test", Arc::new(table)).unwrap();
+        table.update_datafusion_session(&ctx.state()).unwrap();
+        ctx.register_table("test", table.table_provider().await.unwrap())
+            .unwrap();
         let _batches = ctx
             .sql("SELECT * FROM test")
             .await
@@ -838,6 +1782,120 @@ mod tests {
         }
     }
 
+    fn set_last_modified(path: &Path, last_modified: SystemTime) {
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        let times = FileTimes::new()
+            .set_accessed(last_modified)
+            .set_modified(last_modified);
+        file.set_times(times).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_vacuum_full_recent_tombstones_are_not_treated_as_orphans() -> DeltaResult<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+        let mut table = create_initialized_table(table_path, &[]).await;
+        let current_time = SystemTime::now();
+        let current_time_millis =
+            current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let stale_time = current_time - StdDuration::from_secs(10);
+        let recent_time = current_time - StdDuration::from_secs(1);
+        let original_data = json!({
+            "id": "A",
+            "value": 1,
+            "modified": "2021-02-01"
+        });
+        let replacement_data = json!({
+            "id": "B",
+            "value": 2,
+            "modified": "2021-02-02"
+        });
+
+        let mut writer = JsonWriter::for_table(&table)?;
+        writer.write(vec![original_data]).await?;
+        writer.flush_and_commit(&mut table).await?;
+
+        let tombstoned_paths: Vec<_> = table
+            .snapshot()?
+            .log_data()
+            .into_iter()
+            .map(|add| add.object_store_path().to_string())
+            .collect();
+        assert_eq!(tombstoned_paths.len(), 1);
+        let recent_tombstone_path = tombstoned_paths[0].clone();
+        set_last_modified(&temp_dir.path().join(&recent_tombstone_path), stale_time);
+
+        let stale_orphan_path = "orphan-old.parquet";
+        std::fs::write(temp_dir.path().join(stale_orphan_path), b"stale orphan").unwrap();
+        set_last_modified(&temp_dir.path().join(stale_orphan_path), stale_time);
+
+        let remove_actions = table
+            .snapshot()?
+            .snapshot()
+            .file_views(&table.log_store(), None)
+            .map_ok(|file| {
+                let mut remove = file.remove_action(true);
+                remove.deletion_timestamp = Some(current_time_millis);
+                Action::Remove(remove)
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut overwrite_writer = JsonWriter::for_table(&table)?;
+        overwrite_writer.write(vec![replacement_data]).await?;
+        let add_actions = overwrite_writer.flush().await?.into_iter().map(Action::Add);
+        let mut actions = remove_actions;
+        actions.extend(add_actions);
+        let operation = DeltaOperation::Write {
+            mode: SaveMode::Overwrite,
+            partition_by: None,
+            predicate: None,
+        };
+        CommitBuilder::default()
+            .with_actions(actions)
+            .build(
+                Some(table.snapshot()?),
+                table.log_store().clone(),
+                operation,
+            )
+            .await?;
+        table.update_state().await?;
+
+        let recent_orphan_path = "orphan-recent.parquet";
+        std::fs::write(temp_dir.path().join(recent_orphan_path), b"recent orphan").unwrap();
+        set_last_modified(&temp_dir.path().join(recent_orphan_path), recent_time);
+
+        let (_table, result) =
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
+                .with_retention_period(Duration::seconds(5))
+                .with_dry_run(true)
+                .with_mode(VacuumMode::Full)
+                .with_enforce_retention_duration(false)
+                .with_clock(Arc::new(MockClock::new(current_time_millis)))
+                .await?;
+
+        assert!(
+            !result.files_deleted.contains(&recent_tombstone_path),
+            "recent tombstone was treated like an orphan: {:?}",
+            result.files_deleted
+        );
+        assert!(
+            result
+                .files_deleted
+                .contains(&stale_orphan_path.to_string()),
+            "stale orphan should still be vacuum eligible: {:?}",
+            result.files_deleted
+        );
+        assert!(
+            !result
+                .files_deleted
+                .contains(&recent_orphan_path.to_string()),
+            "recent orphan should still be protected: {:?}",
+            result.files_deleted
+        );
+
+        Ok(())
+    }
+
     /// Test that recently written uncommitted files are protected from deletion in Full mode
     /// This tests the fix for the race condition where concurrent writer's files could be deleted
     #[tokio::test]
@@ -875,7 +1933,7 @@ mod tests {
             .unwrap();
 
         let table_url = url::Url::parse("memory:///").unwrap();
-        let mut table = crate::DeltaTableBuilder::from_uri(table_url.clone())
+        let mut table = crate::DeltaTableBuilder::from_url(table_url.clone())
             .unwrap()
             .with_storage_backend(Arc::new(store), table_url)
             .build()
@@ -909,6 +1967,804 @@ mod tests {
             result.files_deleted
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_try_parallel_vacuum() {
+        assert!(!should_try_parallel_vacuum(&[]));
+        assert!(!should_try_parallel_vacuum(&["modified".to_string()]));
+        assert!(should_try_parallel_vacuum(&[
+            "modified".to_string(),
+            "id".to_string()
+        ]));
+        assert!(should_try_parallel_vacuum(&[
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string()
+        ]));
+    }
+
+    #[test]
+    fn test_is_skippable_root_prefix() {
+        assert!(is_skippable_root_prefix(&object_store::path::Path::from(
+            "_delta_log"
+        )));
+        assert!(is_skippable_root_prefix(&object_store::path::Path::from(
+            "_delta_log/00000000000000000000.json"
+        )));
+        assert!(is_skippable_root_prefix(&object_store::path::Path::from(
+            ".hidden"
+        )));
+        assert!(!is_skippable_root_prefix(&object_store::path::Path::from(
+            "modified=2021-02-01"
+        )));
+        assert!(!is_skippable_root_prefix(&object_store::path::Path::from(
+            "regular_folder"
+        )));
+    }
+
+    #[test]
+    fn test_tombstone_path_sets_record() {
+        let mut sets = TombstonePathSets::default();
+        let expired_path = object_store::path::Path::from("expired.parquet");
+        let recent_path = object_store::path::Path::from("recent.parquet");
+
+        sets.record(expired_path.clone(), true);
+        sets.record(recent_path.clone(), false);
+
+        assert!(sets.expired_tombstone_paths.contains(&expired_path));
+        assert!(!sets.expired_tombstone_paths.contains(&recent_path));
+        assert!(sets.all_tombstone_paths.contains(&expired_path));
+        assert!(sets.all_tombstone_paths.contains(&recent_path));
+    }
+
+    /// The `DELTARS_VACUUM_LIST_CONCURRENCY` env var is only read once, on the
+    /// first call, because the value is cached in a process-wide `OnceLock`.
+    /// Since no other test sets this env var, every call in this test binary
+    /// (regardless of ordering) is guaranteed to resolve to the built-in
+    /// default, which is what this test asserts.
+    #[test]
+    fn test_default_vacuum_list_concurrency() {
+        assert!(std::env::var("DELTARS_VACUUM_LIST_CONCURRENCY").is_err());
+        assert_eq!(
+            default_vacuum_list_concurrency(),
+            DEFAULT_VACUUM_LIST_CONCURRENCY
+        );
+        // Calling it again must return the same cached value.
+        assert_eq!(
+            default_vacuum_list_concurrency(),
+            default_vacuum_list_concurrency()
+        );
+    }
+
+    #[test]
+    fn test_resolve_scan_concurrency() {
+        // Explicit positive overrides win.
+        assert_eq!(resolve_scan_concurrency(Some(1)), 1);
+        assert_eq!(resolve_scan_concurrency(Some(7)), 7);
+        assert_eq!(resolve_scan_concurrency(Some(1000)), 1000);
+
+        // None and zero fall back to the process default.
+        assert_eq!(
+            resolve_scan_concurrency(None),
+            default_vacuum_list_concurrency()
+        );
+        assert_eq!(
+            resolve_scan_concurrency(Some(0)),
+            default_vacuum_list_concurrency()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_scan_concurrency_builder() -> DeltaResult<()> {
+        let table_path = std::path::Path::new("../test/tests/data/simple_commit");
+        let table_uri =
+            Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
+        let table = open_table(table_uri).await?;
+
+        let builder =
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()));
+        assert_eq!(builder.scan_concurrency, None);
+        assert_eq!(
+            resolve_scan_concurrency(builder.scan_concurrency),
+            default_vacuum_list_concurrency()
+        );
+
+        let builder = builder.with_scan_concurrency(25);
+        assert_eq!(builder.scan_concurrency, Some(25));
+        assert_eq!(resolve_scan_concurrency(builder.scan_concurrency), 25);
+
+        // Zero is stored but ignored at resolve time.
+        let builder = builder.with_scan_concurrency(0);
+        assert_eq!(builder.scan_concurrency, Some(0));
+        assert_eq!(
+            resolve_scan_concurrency(builder.scan_concurrency),
+            default_vacuum_list_concurrency()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parallel_scan_builder() -> DeltaResult<()> {
+        let table_path = std::path::Path::new("../test/tests/data/simple_commit");
+        let table_uri =
+            Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
+        let table = open_table(table_uri).await?;
+
+        let multi_level = ["date".to_string(), "group".to_string()];
+        assert!(should_try_parallel_vacuum(&multi_level));
+
+        let builder =
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()));
+        // Parallel scan is enabled by default for multi-level tables.
+        assert!(builder.parallel_scan);
+        let use_parallel = builder.parallel_scan && should_try_parallel_vacuum(&multi_level);
+        assert!(use_parallel);
+
+        let builder = builder.parallel_scan(false);
+        assert!(!builder.parallel_scan);
+        let use_parallel = builder.parallel_scan && should_try_parallel_vacuum(&multi_level);
+        assert!(!use_parallel);
+
+        Ok(())
+    }
+
+    fn make_object_meta(
+        path: &str,
+        last_modified_millis: i64,
+        size: u64,
+    ) -> object_store::ObjectMeta {
+        object_store::ObjectMeta {
+            location: object_store::path::Path::from(path),
+            last_modified: chrono::DateTime::from_timestamp_millis(last_modified_millis).unwrap(),
+            size,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    /// Directly exercises every branch of `consider_orphan_for_deletion` with
+    /// hand-crafted inputs, independent of any full vacuum run.
+    #[test]
+    fn test_consider_orphan_for_deletion_branches() {
+        let partition_columns = vec!["modified".to_string()];
+        let now_millis: i64 = 1_000_000;
+        let retention_millis: i64 = 1_000;
+
+        let valid_files: HashSet<object_store::path::Path> =
+            [object_store::path::Path::from("valid.parquet")]
+                .into_iter()
+                .collect();
+        let keep_files: HashSet<object_store::path::Path> =
+            [object_store::path::Path::from("kept.parquet")]
+                .into_iter()
+                .collect();
+
+        let mut tombstone_path_sets = TombstonePathSets::default();
+        tombstone_path_sets.record(
+            object_store::path::Path::from("expired-tombstone.parquet"),
+            true,
+        );
+        tombstone_path_sets.record(
+            object_store::path::Path::from("recent-tombstone.parquet"),
+            false,
+        );
+
+        // 1. Already queued as an expired tombstone -> None, regardless of age.
+        let meta = make_object_meta("expired-tombstone.parquet", now_millis, 10);
+        assert_eq!(
+            consider_orphan_for_deletion(
+                &meta,
+                &valid_files,
+                &keep_files,
+                &partition_columns,
+                &tombstone_path_sets,
+                now_millis,
+                retention_millis,
+            )
+            .unwrap(),
+            None
+        );
+
+        // 2. Still tracked as a valid file -> not ok to delete -> None.
+        let meta = make_object_meta("valid.parquet", 0, 10);
+        assert_eq!(
+            consider_orphan_for_deletion(
+                &meta,
+                &valid_files,
+                &keep_files,
+                &partition_columns,
+                &tombstone_path_sets,
+                now_millis,
+                retention_millis,
+            )
+            .unwrap(),
+            None
+        );
+
+        // 3. Associated with a version being kept -> not ok to delete -> None.
+        let meta = make_object_meta("kept.parquet", 0, 10);
+        assert_eq!(
+            consider_orphan_for_deletion(
+                &meta,
+                &valid_files,
+                &keep_files,
+                &partition_columns,
+                &tombstone_path_sets,
+                now_millis,
+                retention_millis,
+            )
+            .unwrap(),
+            None
+        );
+
+        // 4. Hidden directory entry (not a partition column, not _delta_index /
+        //    _change_data) -> not ok to delete -> None.
+        let meta = make_object_meta("_staging/file.parquet", 0, 10);
+        assert_eq!(
+            consider_orphan_for_deletion(
+                &meta,
+                &valid_files,
+                &keep_files,
+                &partition_columns,
+                &tombstone_path_sets,
+                now_millis,
+                retention_millis,
+            )
+            .unwrap(),
+            None
+        );
+
+        // 5. Has a recent (non-expired) tombstone -> keep until it expires -> None.
+        let meta = make_object_meta("recent-tombstone.parquet", 0, 10);
+        assert_eq!(
+            consider_orphan_for_deletion(
+                &meta,
+                &valid_files,
+                &keep_files,
+                &partition_columns,
+                &tombstone_path_sets,
+                now_millis,
+                retention_millis,
+            )
+            .unwrap(),
+            None
+        );
+
+        // 6. Untracked but too recent (age < retention) -> protected -> None.
+        let meta = make_object_meta(
+            "recent-orphan.parquet",
+            now_millis - retention_millis + 1,
+            10,
+        );
+        assert_eq!(
+            consider_orphan_for_deletion(
+                &meta,
+                &valid_files,
+                &keep_files,
+                &partition_columns,
+                &tombstone_path_sets,
+                now_millis,
+                retention_millis,
+            )
+            .unwrap(),
+            None
+        );
+
+        // 7. Untracked and stale -> eligible for deletion -> Some((path, size)).
+        let meta = make_object_meta(
+            "stale-orphan.parquet",
+            now_millis - retention_millis - 1,
+            42,
+        );
+        assert_eq!(
+            consider_orphan_for_deletion(
+                &meta,
+                &valid_files,
+                &keep_files,
+                &partition_columns,
+                &tombstone_path_sets,
+                now_millis,
+                retention_millis,
+            )
+            .unwrap(),
+            Some((object_store::path::Path::from("stale-orphan.parquet"), 42))
+        );
+    }
+
+    /// Directly exercises `expand_partition_prefixes` at depth 1: root-level
+    /// orphans are collected immediately, `_delta_log` is skipped, and the
+    /// remaining top-level partition directories are returned as leaf prefixes.
+    #[tokio::test]
+    async fn test_expand_partition_prefixes_root_orphans_and_skips() -> DeltaResult<()> {
+        let store = InMemory::new();
+        store
+            .put(
+                &object_store::path::Path::from("orphan-root.parquet"),
+                PutPayload::from_static(b"root orphan"),
+            )
+            .await?;
+        store
+            .put(
+                &object_store::path::Path::from("_delta_log/00000000000000000000.json"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await?;
+        store
+            .put(
+                &object_store::path::Path::from("a=1/file.parquet"),
+                PutPayload::from_static(b"a1"),
+            )
+            .await?;
+        store
+            .put(
+                &object_store::path::Path::from("a=2/file.parquet"),
+                PutPayload::from_static(b"a2"),
+            )
+            .await?;
+
+        let valid_files = HashSet::new();
+        let keep_files = HashSet::new();
+        let partition_columns = vec!["a".to_string(), "b".to_string()];
+        let tombstone_path_sets = TombstonePathSets::default();
+
+        let scanned = Arc::new(AtomicUsize::new(0));
+        let orphans = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let orphans_cb = Arc::clone(&orphans);
+
+        let mut leaf_prefixes = expand_partition_prefixes(
+            Arc::new(store),
+            1,
+            Arc::new(valid_files),
+            Arc::new(keep_files),
+            Arc::new(partition_columns),
+            Arc::new(tombstone_path_sets),
+            i64::MAX / 2,
+            0,
+            Arc::clone(&scanned),
+            DEFAULT_VACUUM_LIST_CONCURRENCY,
+            move |path, size| {
+                orphans_cb.lock().unwrap().push((path, size));
+                Ok(())
+            },
+        )
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        leaf_prefixes.sort();
+        assert_eq!(
+            leaf_prefixes,
+            vec![
+                object_store::path::Path::from("a=1"),
+                object_store::path::Path::from("a=2"),
+            ]
+        );
+        assert_eq!(
+            orphans.lock().unwrap().clone(),
+            vec![(object_store::path::Path::from("orphan-root.parquet"), 11)]
+        );
+        // Only the root-level object is scanned by this function; nested
+        // objects under "a=1/" and "a=2/" are left for the leaf listing step.
+        assert_eq!(scanned.load(Ordering::Relaxed), 1);
+
+        Ok(())
+    }
+
+    /// Directly exercises `expand_partition_prefixes` recursing across two
+    /// delimiter levels (depth 2), including an orphan found at the
+    /// intermediate ("a=1/") level.
+    #[tokio::test]
+    async fn test_expand_partition_prefixes_recurses_multiple_levels() -> DeltaResult<()> {
+        let store = InMemory::new();
+        store
+            .put(
+                &object_store::path::Path::from("a=1/orphan-mid.parquet"),
+                PutPayload::from_static(b"mid orphan"),
+            )
+            .await?;
+        store
+            .put(
+                &object_store::path::Path::from("a=1/b=1/file.parquet"),
+                PutPayload::from_static(b"leaf"),
+            )
+            .await?;
+        store
+            .put(
+                &object_store::path::Path::from("a=2/b=1/file.parquet"),
+                PutPayload::from_static(b"leaf"),
+            )
+            .await?;
+
+        let valid_files = HashSet::new();
+        let keep_files = HashSet::new();
+        let partition_columns = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let tombstone_path_sets = TombstonePathSets::default();
+
+        let scanned = Arc::new(AtomicUsize::new(0));
+        let orphans = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let orphans_cb = Arc::clone(&orphans);
+
+        let mut leaf_prefixes = expand_partition_prefixes(
+            Arc::new(store),
+            2,
+            Arc::new(valid_files),
+            Arc::new(keep_files),
+            Arc::new(partition_columns),
+            Arc::new(tombstone_path_sets),
+            i64::MAX / 2,
+            0,
+            Arc::clone(&scanned),
+            DEFAULT_VACUUM_LIST_CONCURRENCY,
+            move |path, size| {
+                orphans_cb.lock().unwrap().push((path, size));
+                Ok(())
+            },
+        )
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        leaf_prefixes.sort();
+        assert_eq!(
+            leaf_prefixes,
+            vec![
+                object_store::path::Path::from("a=1/b=1"),
+                object_store::path::Path::from("a=2/b=1"),
+            ]
+        );
+        assert_eq!(
+            orphans.lock().unwrap().clone(),
+            vec![(object_store::path::Path::from("a=1/orphan-mid.parquet"), 10)]
+        );
+
+        Ok(())
+    }
+
+    /// Directly exercises `list_orphans_under_prefix`, verifying that valid,
+    /// kept, and tombstoned files are excluded while untracked files --
+    /// including one nested under a `_`-prefixed subdirectory, which
+    /// `is_hidden_directory` does not special-case for non-root locations --
+    /// are returned as orphans.
+    #[tokio::test]
+    async fn test_list_orphans_under_prefix_orphan_detection() -> DeltaResult<()> {
+        let store = InMemory::new();
+        for (path, contents) in [
+            ("leaf/valid.parquet", "valid"),
+            ("leaf/kept.parquet", "kept"),
+            ("leaf/_hidden/file.parquet", "hidden"),
+            ("leaf/expired-tombstone.parquet", "expired"),
+            ("leaf/recent-tombstone.parquet", "recent"),
+            ("leaf/orphan.parquet", "orphan!"),
+        ] {
+            store
+                .put(
+                    &object_store::path::Path::from(path),
+                    PutPayload::from_bytes(bytes::Bytes::from_static(contents.as_bytes())),
+                )
+                .await?;
+        }
+
+        let valid_files: HashSet<object_store::path::Path> =
+            [object_store::path::Path::from("leaf/valid.parquet")]
+                .into_iter()
+                .collect();
+        let keep_files: HashSet<object_store::path::Path> =
+            [object_store::path::Path::from("leaf/kept.parquet")]
+                .into_iter()
+                .collect();
+        let partition_columns = vec!["modified".to_string()];
+
+        let mut tombstone_path_sets = TombstonePathSets::default();
+        tombstone_path_sets.record(
+            object_store::path::Path::from("leaf/expired-tombstone.parquet"),
+            true,
+        );
+        tombstone_path_sets.record(
+            object_store::path::Path::from("leaf/recent-tombstone.parquet"),
+            false,
+        );
+
+        // retention_millis = 0 so the untracked orphan is always considered stale.
+        let scanned = Arc::new(AtomicUsize::new(0));
+        let mut orphans = list_orphans_under_prefix(
+            Arc::new(store),
+            object_store::path::Path::from("leaf"),
+            Arc::new(valid_files),
+            Arc::new(keep_files),
+            Arc::new(partition_columns),
+            Arc::new(tombstone_path_sets),
+            i64::MAX / 2,
+            0,
+            Arc::clone(&scanned),
+        )
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        assert_eq!(scanned.load(Ordering::Relaxed), 6);
+        orphans.sort();
+        assert_eq!(
+            orphans,
+            vec![
+                (
+                    object_store::path::Path::from("leaf/_hidden/file.parquet"),
+                    6
+                ),
+                (object_store::path::Path::from("leaf/orphan.parquet"), 7),
+            ]
+        );
+
+        Ok(())
+    }
+
+    /// Directly exercises `list_orphans_under_prefix` protecting an untracked
+    /// file that is younger than the retention period.
+    #[tokio::test]
+    async fn test_list_orphans_under_prefix_protects_recent_files() -> DeltaResult<()> {
+        let store = InMemory::new();
+        store
+            .put(
+                &object_store::path::Path::from("leaf/recent-orphan.parquet"),
+                PutPayload::from_static(b"recent"),
+            )
+            .await?;
+
+        let valid_files = HashSet::new();
+        let keep_files = HashSet::new();
+        let partition_columns = vec!["modified".to_string()];
+        let tombstone_path_sets = TombstonePathSets::default();
+
+        let now_millis = Utc::now().timestamp_millis();
+        // Retention far larger than any possible elapsed time since the put above.
+        let retention_millis = 24 * 60 * 60 * 1000;
+
+        let scanned = Arc::new(AtomicUsize::new(0));
+        let orphans = list_orphans_under_prefix(
+            Arc::new(store),
+            object_store::path::Path::from("leaf"),
+            Arc::new(valid_files),
+            Arc::new(keep_files),
+            Arc::new(partition_columns),
+            Arc::new(tombstone_path_sets),
+            now_millis,
+            retention_millis,
+            Arc::clone(&scanned),
+        )
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        assert_eq!(scanned.load(Ordering::Relaxed), 1);
+        assert!(
+            orphans.is_empty(),
+            "recent untracked file should be protected: {orphans:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Shared multi-level full-vacuum fixture: 2 partition columns, tracked data
+    /// file, stale orphans at root/mid/leaf, and one recent protected orphan.
+    async fn multi_level_full_vacuum_fixture() -> DeltaResult<(
+        tempfile::TempDir,
+        crate::DeltaTable,
+        i64,
+        Vec<String>,
+        String,
+        String,
+        String,
+        String,
+    )> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+        let partition_cols = vec!["modified".to_string(), "id".to_string()];
+        let mut table = create_initialized_table(table_path, &partition_cols).await;
+
+        let current_time = SystemTime::now();
+        let current_time_millis =
+            current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let stale_time = current_time - StdDuration::from_secs(10);
+        let recent_time = current_time - StdDuration::from_secs(1);
+
+        let mut writer = JsonWriter::for_table(&table)?;
+        writer
+            .write(vec![
+                json!({"id": "A", "value": 1, "modified": "2021-02-01"}),
+            ])
+            .await?;
+        writer.flush_and_commit(&mut table).await?;
+
+        let valid_paths: Vec<String> = table
+            .snapshot()?
+            .log_data()
+            .into_iter()
+            .map(|add| add.object_store_path().to_string())
+            .collect();
+        assert_eq!(valid_paths.len(), 1);
+
+        let root_orphan = "orphan-root.parquet".to_string();
+        std::fs::write(temp_dir.path().join(&root_orphan), b"root orphan").unwrap();
+        set_last_modified(&temp_dir.path().join(&root_orphan), stale_time);
+
+        let modified_prefix = "modified=2021-02-01";
+        let mid_orphan = format!("{modified_prefix}/orphan-mid.parquet");
+        std::fs::write(temp_dir.path().join(&mid_orphan), b"mid orphan").unwrap();
+        set_last_modified(&temp_dir.path().join(&mid_orphan), stale_time);
+
+        let deep_dir = format!("{modified_prefix}/id=A");
+        let deep_orphan = format!("{deep_dir}/orphan-deep.parquet");
+        std::fs::write(temp_dir.path().join(&deep_orphan), b"deep orphan").unwrap();
+        set_last_modified(&temp_dir.path().join(&deep_orphan), stale_time);
+
+        let recent_orphan = format!("{deep_dir}/orphan-recent.parquet");
+        std::fs::write(temp_dir.path().join(&recent_orphan), b"recent orphan").unwrap();
+        set_last_modified(&temp_dir.path().join(&recent_orphan), recent_time);
+
+        Ok((
+            temp_dir,
+            table,
+            current_time_millis,
+            valid_paths,
+            root_orphan,
+            mid_orphan,
+            deep_orphan,
+            recent_orphan,
+        ))
+    }
+
+    fn assert_multi_level_vacuum_result(
+        result: &VacuumMetrics,
+        root_orphan: &str,
+        mid_orphan: &str,
+        deep_orphan: &str,
+        recent_orphan: &str,
+        valid_paths: &[String],
+    ) {
+        for expected in [root_orphan, mid_orphan, deep_orphan] {
+            assert!(
+                result.files_deleted.contains(&expected.to_string()),
+                "expected {expected} to be vacuumed: {:?}",
+                result.files_deleted
+            );
+        }
+        assert!(
+            !result.files_deleted.contains(&recent_orphan.to_string()),
+            "recent orphan should be protected: {:?}",
+            result.files_deleted
+        );
+        for valid in valid_paths {
+            assert!(
+                !result.files_deleted.contains(valid),
+                "valid tracked file should never be vacuumed: {valid}"
+            );
+        }
+    }
+
+    /// Exercises the hierarchical parallel-listing path used for multi-level
+    /// partitioned tables (`should_try_parallel_vacuum` / `expand_partition_prefixes`
+    /// / `list_orphans_under_prefix`), covering orphans found at the table root
+    /// (intermediate level), directly under the first partition level, and nested
+    /// under the leaf partition directory.
+    #[tokio::test]
+    async fn test_vacuum_full_parallel_multi_level_partitions() -> DeltaResult<()> {
+        let (
+            _temp_dir,
+            table,
+            current_time_millis,
+            valid_paths,
+            root_orphan,
+            mid_orphan,
+            deep_orphan,
+            recent_orphan,
+        ) = multi_level_full_vacuum_fixture().await?;
+
+        assert!(!should_try_parallel_vacuum(&[]));
+        assert!(should_try_parallel_vacuum(&[
+            "modified".to_string(),
+            "id".to_string()
+        ]));
+
+        let (_table, result) =
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
+                .with_retention_period(Duration::seconds(5))
+                .with_dry_run(true)
+                .with_mode(VacuumMode::Full)
+                .with_enforce_retention_duration(false)
+                .with_clock(Arc::new(MockClock::new(current_time_millis)))
+                .await?;
+
+        assert_multi_level_vacuum_result(
+            &result,
+            &root_orphan,
+            &mid_orphan,
+            &deep_orphan,
+            &recent_orphan,
+            &valid_paths,
+        );
+        Ok(())
+    }
+
+    /// Same multi-level fixture as the parallel test, but with
+    /// [`VacuumBuilder::parallel_scan`] forcing the flat `list(None)`
+    /// path. Results must match the parallel path.
+    #[tokio::test]
+    async fn test_vacuum_full_flat_scan_with_disable_parallel_scan() -> DeltaResult<()> {
+        let (
+            _temp_dir,
+            table,
+            current_time_millis,
+            valid_paths,
+            root_orphan,
+            mid_orphan,
+            deep_orphan,
+            recent_orphan,
+        ) = multi_level_full_vacuum_fixture().await?;
+
+        let builder =
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
+                .with_retention_period(Duration::seconds(5))
+                .with_dry_run(true)
+                .with_mode(VacuumMode::Full)
+                .with_enforce_retention_duration(false)
+                .parallel_scan(false)
+                .with_clock(Arc::new(MockClock::new(current_time_millis)));
+        assert!(!builder.parallel_scan);
+
+        let (_table, result) = builder.await?;
+
+        assert_multi_level_vacuum_result(
+            &result,
+            &root_orphan,
+            &mid_orphan,
+            &deep_orphan,
+            &recent_orphan,
+            &valid_paths,
+        );
+        Ok(())
+    }
+
+    /// Parallel and flat full-mode scans on the same multi-level table must
+    /// select the same delete set.
+    #[tokio::test]
+    async fn test_vacuum_full_parallel_and_flat_agree() -> DeltaResult<()> {
+        let (
+            _temp_dir,
+            table,
+            current_time_millis,
+            _valid_paths,
+            _root_orphan,
+            _mid_orphan,
+            _deep_orphan,
+            _recent_orphan,
+        ) = multi_level_full_vacuum_fixture().await?;
+
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new(current_time_millis));
+        let snapshot = table.snapshot()?.snapshot.clone();
+
+        let (_t1, parallel) = VacuumBuilder::new(table.log_store(), Some(snapshot.clone()))
+            .with_retention_period(Duration::seconds(5))
+            .with_dry_run(true)
+            .with_mode(VacuumMode::Full)
+            .with_enforce_retention_duration(false)
+            .with_clock(Arc::clone(&clock))
+            .await?;
+
+        let (_t2, flat) = VacuumBuilder::new(table.log_store(), Some(snapshot))
+            .with_retention_period(Duration::seconds(5))
+            .with_dry_run(true)
+            .with_mode(VacuumMode::Full)
+            .with_enforce_retention_duration(false)
+            .parallel_scan(false)
+            .with_clock(clock)
+            .await?;
+
+        let mut parallel_files = parallel.files_deleted;
+        let mut flat_files = flat.files_deleted;
+        parallel_files.sort();
+        flat_files.sort();
+        assert_eq!(
+            parallel_files, flat_files,
+            "parallel and flat full scans must agree on delete set"
+        );
         Ok(())
     }
 }

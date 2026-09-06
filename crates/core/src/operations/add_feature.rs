@@ -7,11 +7,13 @@ use futures::future::BoxFuture;
 use itertools::Itertools;
 
 use super::{CustomExecuteHandler, Operation};
+use crate::DeltaTable;
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::{resolve_snapshot, EagerSnapshot, ProtocolExt as _, TableFeatures};
+use crate::kernel::{
+    Action, EagerSnapshot, ProtocolExt as _, SnapshotMetadataRef, TableFeatures, resolve_snapshot,
+};
 use crate::logstore::LogStoreRef;
 use crate::protocol::DeltaOperation;
-use crate::DeltaTable;
 use crate::{DeltaResult, DeltaTableError};
 
 /// Enable table features for a table
@@ -83,6 +85,43 @@ impl AddTableFeatureBuilder {
     }
 }
 
+fn plan_add_table_feature_actions(
+    snapshot: SnapshotMetadataRef<'_>,
+    name: &[TableFeatures],
+    allow_protocol_versions_increase: bool,
+) -> DeltaResult<(Vec<Action>, DeltaOperation)> {
+    debug_assert!(!name.is_empty());
+
+    let (reader_features, writer_features): (Vec<Option<TableFeature>>, Vec<Option<TableFeature>>) =
+        name.iter().map(|v| v.to_reader_writer_features()).unzip();
+    let reader_features = reader_features.into_iter().flatten().collect_vec();
+    let writer_features = writer_features.into_iter().flatten().collect_vec();
+
+    let mut protocol = snapshot.protocol.clone();
+
+    if !allow_protocol_versions_increase {
+        if !reader_features.is_empty()
+            && !writer_features.is_empty()
+            && !(protocol.min_reader_version() == 3 && protocol.min_writer_version() == 7)
+        {
+            return Err(DeltaTableError::Generic("Table feature enables reader and writer feature, but reader is not v3, and writer not v7. Set allow_protocol_versions_increase or increase versions explicitly through set_tbl_properties".to_string()));
+        } else if !reader_features.is_empty() && protocol.min_reader_version() < 3 {
+            return Err(DeltaTableError::Generic("Table feature enables reader feature, but min_reader is not v3. Set allow_protocol_versions_increase or increase version explicitly through set_tbl_properties".to_string()));
+        } else if !writer_features.is_empty() && protocol.min_writer_version() < 7 {
+            return Err(DeltaTableError::Generic("Table feature enables writer feature, but min_writer is not v7. Set allow_protocol_versions_increase or increase version explicitly through set_tbl_properties".to_string()));
+        }
+    }
+
+    protocol = protocol.append_reader_features(&reader_features);
+    protocol = protocol.append_writer_features(&writer_features);
+
+    let operation = DeltaOperation::AddFeature {
+        name: name.to_vec(),
+    };
+
+    Ok((vec![protocol.into()], operation))
+}
+
 impl std::future::IntoFuture for AddTableFeatureBuilder {
     type Output = DeltaResult<DeltaTable>;
 
@@ -92,46 +131,20 @@ impl std::future::IntoFuture for AddTableFeatureBuilder {
         let this = self;
 
         Box::pin(async move {
-            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), false).await?;
+            let snapshot =
+                resolve_snapshot(&this.log_store, this.snapshot.clone(), false, None).await?;
 
-            let name = if this.name.is_empty() {
+            if this.name.is_empty() {
                 return Err(DeltaTableError::Generic("No features provided".to_string()));
-            } else {
-                &this.name
-            };
+            }
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
-            let (reader_features, writer_features): (
-                Vec<Option<TableFeature>>,
-                Vec<Option<TableFeature>>,
-            ) = name.iter().map(|v| v.to_reader_writer_features()).unzip();
-            let reader_features = reader_features.into_iter().flatten().collect_vec();
-            let writer_features = writer_features.into_iter().flatten().collect_vec();
-
-            let mut protocol = snapshot.protocol().clone();
-
-            if !this.allow_protocol_versions_increase {
-                if !reader_features.is_empty()
-                    && !writer_features.is_empty()
-                    && !(protocol.min_reader_version() == 3 && protocol.min_writer_version() == 7)
-                {
-                    return Err(DeltaTableError::Generic("Table feature enables reader and writer feature, but reader is not v3, and writer not v7. Set allow_protocol_versions_increase or increase versions explicitly through set_tbl_properties".to_string()));
-                } else if !reader_features.is_empty() && protocol.min_reader_version() < 3 {
-                    return Err(DeltaTableError::Generic("Table feature enables reader feature, but min_reader is not v3. Set allow_protocol_versions_increase or increase version explicitly through set_tbl_properties".to_string()));
-                } else if !writer_features.is_empty() && protocol.min_writer_version() < 7 {
-                    return Err(DeltaTableError::Generic("Table feature enables writer feature, but min_writer is not v7. Set allow_protocol_versions_increase or increase version explicitly through set_tbl_properties".to_string()));
-                }
-            }
-
-            protocol = protocol.append_reader_features(&reader_features);
-            protocol = protocol.append_writer_features(&writer_features);
-
-            let operation = DeltaOperation::AddFeature {
-                name: name.to_vec(),
-            };
-
-            let actions = vec![protocol.into()];
+            let (actions, operation) = plan_add_table_feature_actions(
+                snapshot.snapshot().metadata_state(),
+                &this.name,
+                this.allow_protocol_versions_increase,
+            )?;
 
             let commit = CommitBuilder::from(this.commit_properties.clone())
                 .with_actions(actions)
@@ -156,19 +169,17 @@ mod tests {
     use crate::{
         kernel::TableFeatures,
         writer::test_utils::{create_bare_table, get_record_batch},
-        DeltaOps,
     };
-    use delta_kernel::table_features::TableFeature;
     use delta_kernel::DeltaResult;
+    use delta_kernel::table_features::TableFeature;
 
     #[tokio::test]
     async fn add_feature() -> DeltaResult<()> {
         let batch = get_record_batch(None, false);
-        let write = DeltaOps(create_bare_table())
+        let table = create_bare_table()
             .write(vec![batch.clone()])
             .await
             .unwrap();
-        let table = DeltaOps(write);
         let result = table
             .add_feature()
             .with_feature(TableFeatures::ChangeDataFeed)
@@ -176,15 +187,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(&result
-            .snapshot()
-            .unwrap()
-            .protocol()
-            .writer_features()
-            .unwrap_or_default()
-            .contains(&TableFeature::ChangeDataFeed));
+        assert!(
+            &result
+                .snapshot()
+                .unwrap()
+                .protocol()
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::ChangeDataFeed)
+        );
 
-        let result = DeltaOps(result)
+        let result = result
             .add_feature()
             .with_feature(TableFeatures::DeletionVectors)
             .with_allow_protocol_versions_increase(true)
@@ -192,14 +205,18 @@ mod tests {
             .unwrap();
 
         let current_protocol = &result.snapshot().unwrap().protocol().clone();
-        assert!(&current_protocol
-            .writer_features()
-            .unwrap_or_default()
-            .contains(&TableFeature::DeletionVectors));
-        assert!(&current_protocol
-            .reader_features()
-            .unwrap_or_default()
-            .contains(&TableFeature::DeletionVectors));
+        assert!(
+            &current_protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::DeletionVectors)
+        );
+        assert!(
+            &current_protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::DeletionVectors)
+        );
         assert_eq!(result.version(), Some(2));
         Ok(())
     }
@@ -207,11 +224,10 @@ mod tests {
     #[tokio::test]
     async fn add_feature_disallowed_increase() -> DeltaResult<()> {
         let batch = get_record_batch(None, false);
-        let write = DeltaOps(create_bare_table())
+        let table = create_bare_table()
             .write(vec![batch.clone()])
             .await
             .unwrap();
-        let table = DeltaOps(write);
         let result = table
             .add_feature()
             .with_feature(TableFeatures::ChangeDataFeed)

@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
@@ -40,7 +40,7 @@ fn generate_commit_log_complex(
             add_json.push_str(r#","deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}"#);
         }
 
-        add_json.push_str("}");
+        add_json.push('}');
         log_lines.push(format!(r#"{{"add":{}}}"#, add_json));
     }
 

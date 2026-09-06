@@ -72,6 +72,27 @@ pl.scan_delta("tmp/a_table").filter(pl.col("age") < 20).collect()
 
 Polars can use the Delta table metadata to skip the file that does not contain data relevant to the query.
 
+## File skipping with deltalake
+
+The same skipping is exposed directly on `DeltaTable`: the file-listing
+methods accept a `file_pruning_predicate` (a SQL string or tuple filters) and
+prune files against the transaction log before any data is read, and `filters`
+on the read methods prunes the same way before filtering rows.
+
+```python
+dt = DeltaTable("tmp/a_table")
+
+dt.file_uris(file_pruning_predicate="age < 20")  # only the file that may contain age < 20
+dt.to_pandas(filters=[("age", "<", 20)])
+```
+
+On non-partition columns like `age` the pruning is conservative: a file is
+dropped only when its min/max statistics prove no row can match, so the file
+list is a complete superset of the matching files. Partition-column predicates
+prune exactly. See
+[Querying Delta Tables](../usage/querying-delta-tables.md#selecting-files-with-a-pruning-predicate)
+for details.
+
 ## How Delta Lake implements file skipping
 
 Here’s how engines execute queries on Delta tables:
@@ -180,4 +201,4 @@ Delta Lake allows for file skipping, which is a powerful performance optimizatio
 
 Delta Lake also provides built-in utilities to colocate data in the same files like partitioning, Z Ordering, and compaction to improve file skipping.
 
-Delta Lake users need to know how to assess the tradeoffs of these techniques to optimize file skipping.  Users also need to understand the most frequent query patterns of their tables to best allow for file maximal file skipping.
+Delta Lake users need to know how to assess the tradeoffs of these techniques to optimize file skipping.  Users also need to understand the most frequent query patterns of their tables to best allow for maximal file skipping.

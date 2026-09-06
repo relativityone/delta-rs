@@ -4,10 +4,14 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::Statistics;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::error::DataFusionError;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{
-    DisplayAs, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    ChildrenPropertiesMode, DisplayAs, ExecutionPlan, PhysicalExpr, RecordBatchStream,
+    ReplaceChildrenOptions, SendableRecordBatchStream,
 };
 use futures::{Stream, StreamExt};
 
@@ -78,15 +82,11 @@ impl ExecutionPlan for MetricObserverExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.parent.schema()
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         self.parent.properties()
     }
 
@@ -108,22 +108,51 @@ impl ExecutionPlan for MetricObserverExec {
         }))
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> datafusion::common::Result<Statistics> {
-        self.parent.partition_statistics(partition)
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> datafusion::common::Result<Arc<Statistics>> {
+        input_stats.first().map(Arc::clone).ok_or_else(|| {
+            DataFusionError::Internal(
+                "MetricObserverExec expects statistics for exactly one child".to_string(),
+            )
+        })
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        MetricObserverExec::try_new(self.id.clone(), &children, self.update)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        MetricObserverExec::try_new(self.id.clone(), &children, self.update)
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+
+    fn apply_expressions(
+        &self,
+        _expr_rewriter: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<TreeNodeRecursion, DataFusionError>,
+    ) -> Result<TreeNodeRecursion, DataFusionError> {
+        Ok(TreeNodeRecursion::Continue)
     }
 }
 
@@ -166,10 +195,10 @@ pub(crate) fn find_metric_node(
     parent: &Arc<dyn ExecutionPlan>,
 ) -> Option<Arc<dyn ExecutionPlan>> {
     //! Used to locate the physical MetricCountExec Node after the planner converts the logical node
-    if let Some(metric) = parent.as_any().downcast_ref::<MetricObserverExec>() {
-        if metric.id().eq(id) {
-            return Some(parent.to_owned());
-        }
+    if let Some(metric) = parent.downcast_ref::<MetricObserverExec>()
+        && metric.id().eq(id)
+    {
+        return Some(parent.to_owned());
     }
 
     for child in &parent.children() {

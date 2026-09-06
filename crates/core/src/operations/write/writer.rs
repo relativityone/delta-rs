@@ -1,6 +1,8 @@
 //! Abstractions and implementations for writing data to delta tables
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use arrow_array::RecordBatch;
@@ -11,19 +13,17 @@ use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use parquet::arrow::async_writer::ParquetObjectWriter;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tokio::task::JoinSet;
 use tracing::*;
 
-use crate::crate_version;
-
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::{Add, PartitionsExt};
 use crate::logstore::ObjectStoreRef;
-use crate::writer::record_batch::{divide_by_partition_values, PartitionResult};
+use crate::parquet_utils::default_writer_properties;
+use crate::writer::record_batch::{PartitionResult, divide_by_partition_values};
 use crate::writer::stats::create_add;
 use crate::writer::utils::{
     arrow_schema_without_partitions, next_data_path, record_batch_without_partitions,
@@ -31,8 +31,6 @@ use crate::writer::utils::{
 
 use parquet::file::metadata::ParquetMetaData;
 
-// TODO databricks often suggests a file size of 100mb, should we set this default?
-const DEFAULT_TARGET_FILE_SIZE: usize = 104_857_600;
 const DEFAULT_WRITE_BATCH_SIZE: usize = 1024;
 const DEFAULT_UPLOAD_PART_SIZE: usize = 1024 * 1024 * 5;
 const DEFAULT_MAX_CONCURRENCY_TASKS: usize = 10;
@@ -70,10 +68,19 @@ fn get_max_concurrency_tasks() -> usize {
     })
 }
 
+fn roll_on_row_group_boundary_default() -> bool {
+    static ROLL_ON_ROW_GROUP_BOUNDARY: OnceLock<bool> = OnceLock::new();
+    *ROLL_ON_ROW_GROUP_BOUNDARY.get_or_init(|| {
+        std::env::var("DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY")
+            .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
 /// Upload a parquet file to object store and return metadata for creating an Add action
 #[instrument(skip(arrow_writer), fields(rows = 0, size = 0))]
 async fn upload_parquet_file(
-    mut arrow_writer: AsyncArrowWriter<ParquetObjectWriter>,
+    mut arrow_writer: AsyncArrowWriter<BufWriter>,
     path: Path,
 ) -> DeltaResult<(Path, usize, ParquetMetaData)> {
     let metadata = arrow_writer.finish().await?;
@@ -83,6 +90,10 @@ async fn upload_parquet_file(
     debug!("multipart upload completed successfully");
 
     Ok((path, file_size, metadata))
+}
+
+fn sort_completed_writes_by_path<T>(results: &mut [(Path, usize, T)]) {
+    results.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -123,7 +134,7 @@ impl From<WriteError> for DeltaTableError {
 }
 
 /// Configuration to write data into Delta tables
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WriterConfig {
     /// Schema of the delta table
     table_schema: ArrowSchemaRef,
@@ -132,7 +143,8 @@ pub struct WriterConfig {
     /// Properties passed to underlying parquet writer
     writer_properties: WriterProperties,
     /// Size above which we will write a buffered parquet file to disk.
-    target_file_size: usize,
+    /// If None, the writer will not create a new file until the writer is closed.
+    target_file_size: Option<NonZeroU64>,
     /// Row chunks passed to parquet writer. This and the internal parquet writer settings
     /// determine how fine granular we can track / control the size of resulting files.
     write_batch_size: usize,
@@ -140,6 +152,9 @@ pub struct WriterConfig {
     num_indexed_cols: DataSkippingNumIndexedCols,
     /// Stats columns, specific columns to collect stats from, takes precedence over num_indexed_cols
     stats_columns: Option<Vec<String>>,
+    /// When set, write data files under a random prefix directory of this length instead of
+    /// Hive-style partition dirs — keeps physical (UUID) column names out of paths under CM.
+    random_prefix_length: Option<usize>,
 }
 
 impl WriterConfig {
@@ -148,17 +163,13 @@ impl WriterConfig {
         table_schema: ArrowSchemaRef,
         partition_columns: Vec<String>,
         writer_properties: Option<WriterProperties>,
-        target_file_size: Option<usize>,
+        target_file_size: Option<NonZeroU64>,
         write_batch_size: Option<usize>,
         num_indexed_cols: DataSkippingNumIndexedCols,
         stats_columns: Option<Vec<String>>,
     ) -> Self {
-        let writer_properties = writer_properties.unwrap_or_else(|| {
-            WriterProperties::builder()
-                .set_compression(Compression::SNAPPY)
-                .build()
-        });
-        let target_file_size = target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE);
+        let writer_properties =
+            writer_properties.unwrap_or_else(|| default_writer_properties(Compression::SNAPPY));
         let write_batch_size = write_batch_size.unwrap_or(DEFAULT_WRITE_BATCH_SIZE);
 
         Self {
@@ -169,7 +180,15 @@ impl WriterConfig {
             write_batch_size,
             num_indexed_cols,
             stats_columns,
+            random_prefix_length: None,
         }
+    }
+
+    /// Write data files under a random prefix of `length` chars instead of Hive-style dirs
+    /// (column-mapped tables); `None` keeps the Hive layout.
+    pub fn with_random_prefix_length(mut self, length: Option<usize>) -> Self {
+        self.random_prefix_length = length;
+        self
     }
 
     /// Schema of files written to disk
@@ -234,13 +253,18 @@ impl DeltaWriter {
                 writer.write(&record_batch).await?;
             }
             None => {
+                let prefix_override = match self.config.random_prefix_length {
+                    Some(length) => Some(Path::parse(random_prefix(length))?),
+                    None => None,
+                };
                 let config = PartitionWriterConfig::try_new(
                     self.config.file_schema(),
                     partition_values.clone(),
                     Some(self.config.writer_properties.clone()),
-                    Some(self.config.target_file_size),
+                    self.config.target_file_size,
                     Some(self.config.write_batch_size),
                     None,
+                    prefix_override,
                 )?;
                 let mut writer = PartitionWriter::try_with_config(
                     self.object_store.clone(),
@@ -290,6 +314,13 @@ impl DeltaWriter {
     }
 }
 
+/// Random hex (URI-safe) directory prefix of `length` chars, used to keep physical column
+/// names out of data-file paths on column-mapped tables.
+fn random_prefix(length: usize) -> String {
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    uuid[..length.min(uuid.len())].to_string()
+}
+
 /// Write configuration for partition writers
 #[derive(Debug, Clone)]
 pub struct PartitionWriterConfig {
@@ -302,12 +333,17 @@ pub struct PartitionWriterConfig {
     /// Properties passed to underlying parquet writer
     writer_properties: WriterProperties,
     /// Size above which we will write a buffered parquet file to disk.
-    target_file_size: usize,
+    /// If None, the writer will not create a new file until the writer is closed.
+    target_file_size: Option<NonZeroU64>,
     /// Row chunks passed to parquet writer. This and the internal parquet writer settings
     /// determine how fine granular we can track / control the size of resulting files.
     write_batch_size: usize,
     /// Concurrency level for writing to object store
     max_concurrency_tasks: usize,
+    /// Defer the `target_file_size` roll until the current row group is complete, so no
+    /// file ends in a truncated row group. See
+    /// [`PartitionWriterConfig::with_roll_on_row_group_boundary`].
+    roll_on_row_group_boundary: bool,
 }
 
 impl PartitionWriterConfig {
@@ -316,18 +352,22 @@ impl PartitionWriterConfig {
         file_schema: ArrowSchemaRef,
         partition_values: IndexMap<String, Scalar>,
         writer_properties: Option<WriterProperties>,
-        target_file_size: Option<usize>,
+        target_file_size: Option<NonZeroU64>,
         write_batch_size: Option<usize>,
         max_concurrency_tasks: Option<usize>,
+        prefix_override: Option<Path>,
     ) -> DeltaResult<Self> {
-        let part_path = partition_values.hive_partition_path();
-        let prefix = Path::parse(part_path)?;
-        let writer_properties = writer_properties.unwrap_or_else(|| {
-            WriterProperties::builder()
-                .set_created_by(format!("delta-rs version {}", crate_version()))
-                .build()
-        });
-        let target_file_size = target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE);
+        let prefix = match prefix_override {
+            Some(prefix) => prefix,
+            None => Path::parse(partition_values.hive_partition_path())?,
+        };
+        let writer_properties =
+            writer_properties.unwrap_or_else(|| default_writer_properties(Compression::SNAPPY));
+        if write_batch_size == Some(0) {
+            return Err(DeltaTableError::generic(
+                "write_batch_size must be greater than 0",
+            ));
+        }
         let write_batch_size = write_batch_size.unwrap_or(DEFAULT_WRITE_BATCH_SIZE);
 
         Ok(Self {
@@ -338,27 +378,45 @@ impl PartitionWriterConfig {
             target_file_size,
             write_batch_size,
             max_concurrency_tasks: max_concurrency_tasks.unwrap_or_else(get_max_concurrency_tasks),
+            roll_on_row_group_boundary: roll_on_row_group_boundary_default(),
         })
+    }
+
+    /// Defer the `target_file_size` file roll until the parquet writer's current row group is
+    /// complete, so no file ends in a truncated row group.
+    ///
+    /// A row group cannot span files, so the plain byte roll cuts each file's last row group
+    /// wherever the target happens to land. Columnar readers that map one row group to one
+    /// in-memory segment degrade on those runt tail groups. With this enabled, every row group
+    /// is exactly the configured `max_row_group_row_count` — the single end-of-data remainder
+    /// written at close is the one exception — and a file may overshoot `target_file_size` by
+    /// up to one row group.
+    ///
+    /// Only effective when the writer properties bound row groups by row count alone
+    /// (`max_row_group_row_count` set, `max_row_group_bytes` unset); byte-bounded row groups
+    /// keep the legacy roll behavior. Defaults to the `DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY`
+    /// env var ("1"/"true"/"yes"), else `false`.
+    pub fn with_roll_on_row_group_boundary(mut self, roll_on_row_group_boundary: bool) -> Self {
+        self.roll_on_row_group_boundary = roll_on_row_group_boundary;
+        self
     }
 }
 
 enum LazyArrowWriter {
     Initialized(Path, ObjectStoreRef, PartitionWriterConfig),
-    Writing(Path, AsyncArrowWriter<ParquetObjectWriter>),
+    Writing(Path, AsyncArrowWriter<BufWriter>),
 }
 
 impl LazyArrowWriter {
     async fn write_batch(&mut self, batch: &RecordBatch) -> DeltaResult<()> {
         match self {
             LazyArrowWriter::Initialized(path, object_store, config) => {
-                let writer = ParquetObjectWriter::from_buf_writer(
-                    BufWriter::with_capacity(
-                        object_store.clone(),
-                        path.clone(),
-                        upload_part_size(),
-                    )
-                    .with_max_concurrency(config.max_concurrency_tasks),
-                );
+                let writer = BufWriter::with_capacity(
+                    Arc::clone(object_store),
+                    path.clone(),
+                    upload_part_size(),
+                )
+                .with_max_concurrency(config.max_concurrency_tasks);
                 let mut arrow_writer = AsyncArrowWriter::try_new(
                     writer,
                     config.file_schema.clone(),
@@ -381,6 +439,13 @@ impl LazyArrowWriter {
             LazyArrowWriter::Writing(_, arrow_writer) => {
                 arrow_writer.bytes_written() + arrow_writer.in_progress_size()
             }
+        }
+    }
+
+    fn in_progress_rows(&self) -> usize {
+        match self {
+            LazyArrowWriter::Initialized(_, _, _) => 0,
+            LazyArrowWriter::Writing(_, arrow_writer) => arrow_writer.in_progress_rows(),
         }
     }
 }
@@ -446,7 +511,7 @@ impl PartitionWriter {
         )
     }
 
-    async fn reset_writer(&mut self) -> DeltaResult<()> {
+    fn reset_writer(&mut self) -> DeltaResult<()> {
         let next_path = self.next_data_path();
         let new_writer = Self::create_writer(self.object_store.clone(), next_path, &self.config)?;
         let state = std::mem::replace(&mut self.writer, new_writer);
@@ -456,6 +521,28 @@ impl PartitionWriter {
                 .spawn(upload_parquet_file(arrow_writer, path));
         }
         Ok(())
+    }
+
+    /// Rows the parquet writer will accept before its current row group completes, when the
+    /// group-aligned roll is enabled and row groups are bounded by row count alone. `None`
+    /// means slices need no alignment: the feature is off, no row-count bound is configured
+    /// (both bounds unset writes a single row group per file), or row groups are byte-bounded
+    /// and can close early on bytes, where a row-count-aligned slice cannot hit the boundary
+    /// reliably.
+    fn rows_to_row_group_boundary(&self) -> Option<usize> {
+        if !self.config.roll_on_row_group_boundary {
+            return None;
+        }
+        if self
+            .config
+            .writer_properties
+            .max_row_group_bytes()
+            .is_some()
+        {
+            return None;
+        }
+        let max_rows = self.config.writer_properties.max_row_group_row_count()?;
+        Some(max_rows - (self.writer.in_progress_rows() % max_rows))
     }
 
     /// Buffers record batches in-memory up to appx. `target_file_size`.
@@ -473,16 +560,29 @@ impl PartitionWriter {
         }
 
         let max_offset = batch.num_rows();
-        for offset in (0..max_offset).step_by(self.config.write_batch_size) {
-            let length = usize::min(self.config.write_batch_size, max_offset - offset);
+        let mut offset = 0;
+        while offset < max_offset {
+            let mut length = usize::min(self.config.write_batch_size, max_offset - offset);
+            // Never let a slice straddle a row-group boundary: the roll below may only fire
+            // when the writer sits exactly on one (no rows buffered in an open group).
+            let boundary = self.rows_to_row_group_boundary();
+            if let Some(to_boundary) = boundary {
+                length = usize::min(length, to_boundary);
+            }
             self.writer
                 .write_batch(&batch.slice(offset, length))
                 .await?;
-            // flush currently buffered data to disk once we meet or exceed the target file size.
-            let estimated_size = self.writer.estimated_size();
-            if estimated_size >= self.config.target_file_size {
-                debug!("Writing file with estimated size {estimated_size:?} in background.");
-                self.reset_writer().await?;
+            offset += length;
+            if let Some(target_file_size) = self.config.target_file_size {
+                let estimated_size = self.writer.estimated_size();
+                // flush currently buffered data to disk once we meet or exceed the target file
+                // size — with the group-aligned roll, only once the open row group completed.
+                if estimated_size as u64 >= target_file_size.get()
+                    && (boundary.is_none() || self.writer.in_progress_rows() == 0)
+                {
+                    debug!("Writing file with estimated size {estimated_size:?} in background.");
+                    self.reset_writer()?;
+                }
             }
         }
 
@@ -508,10 +608,12 @@ impl PartitionWriter {
                 Err(e) => {
                     return Err(DeltaTableError::GenericError {
                         source: Box::new(e),
-                    })
+                    });
                 }
             }
         }
+
+        sort_completed_writes_by_path(&mut results);
 
         let adds = results
             .into_iter()
@@ -537,19 +639,23 @@ impl PartitionWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DeltaTableBuilder;
+    use crate::crate_version;
     use crate::logstore::tests::flatten_list_stream as list;
     use crate::table::config::DEFAULT_NUM_INDEX_COLS;
     use crate::writer::test_utils::*;
-    use crate::DeltaTableBuilder;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use object_store::ObjectStoreExt as _;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::schema::types::ColumnPath;
     use std::sync::Arc;
 
     fn get_delta_writer(
         object_store: ObjectStoreRef,
         batch: &RecordBatch,
         writer_properties: Option<WriterProperties>,
-        target_file_size: Option<usize>,
+        target_file_size: Option<NonZeroU64>,
         write_batch_size: Option<usize>,
     ) -> DeltaWriter {
         let config = WriterConfig::new(
@@ -568,7 +674,7 @@ mod tests {
         object_store: ObjectStoreRef,
         batch: &RecordBatch,
         writer_properties: Option<WriterProperties>,
-        target_file_size: Option<usize>,
+        target_file_size: Option<NonZeroU64>,
         write_batch_size: Option<usize>,
     ) -> PartitionWriter {
         let config = PartitionWriterConfig::try_new(
@@ -577,6 +683,7 @@ mod tests {
             writer_properties,
             target_file_size,
             write_batch_size,
+            None,
             None,
         )
         .unwrap();
@@ -589,9 +696,62 @@ mod tests {
         .unwrap()
     }
 
+    fn assert_default_created_by(writer_properties: &WriterProperties) {
+        assert_eq!(
+            writer_properties.created_by(),
+            format!("delta-rs version {}", crate_version())
+        );
+    }
+
+    #[test]
+    fn test_writer_config_defaults_include_delta_rs_created_by() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let config = WriterConfig::new(
+            schema,
+            vec![],
+            None,
+            None,
+            None,
+            DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEX_COLS),
+            None,
+        );
+
+        assert_default_created_by(&config.writer_properties);
+        assert_eq!(
+            config
+                .writer_properties
+                .compression(&ColumnPath::from("id")),
+            Compression::SNAPPY
+        );
+    }
+
+    #[test]
+    fn test_partition_writer_config_defaults_include_delta_rs_created_by() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let config =
+            PartitionWriterConfig::try_new(schema, IndexMap::new(), None, None, None, None, None)
+                .unwrap();
+
+        assert_default_created_by(&config.writer_properties);
+        assert_eq!(
+            config
+                .writer_properties
+                .compression(&ColumnPath::from("id")),
+            Compression::SNAPPY
+        );
+    }
+
     #[tokio::test]
     async fn test_write_partition() {
-        let log_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+        let log_store = DeltaTableBuilder::from_url(url::Url::parse("memory:///").unwrap())
             .unwrap()
             .build_storage()
             .unwrap();
@@ -624,17 +784,22 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(schema, vec![base_str, base_int]).unwrap();
 
-        let object_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+        let object_store = DeltaTableBuilder::from_url(url::Url::parse("memory:///").unwrap())
             .unwrap()
             .build_storage()
             .unwrap()
             .object_store(None);
         let properties = WriterProperties::builder()
-            .set_max_row_group_size(1024)
+            .set_max_row_group_row_count(Some(1024))
             .build();
         // configure small target file size and and row group size so we can observe multiple files written
-        let mut writer =
-            get_partition_writer(object_store, &batch, Some(properties), Some(10_000), None);
+        let mut writer = get_partition_writer(
+            object_store,
+            &batch,
+            Some(properties),
+            Some(NonZeroU64::new(10_000).unwrap()),
+            None,
+        );
         writer.write(&batch).await.unwrap();
 
         // check that we have written more then once file, and no more then 1 is below target size
@@ -644,6 +809,103 @@ mod tests {
             .iter()
             .fold(0, |acc, add| acc + (add.size > 10_000) as i32);
         assert!(target_file_count >= adds.len() as i32 - 1)
+    }
+
+    /// Write 10_000 rows in 1024-row groups with 700-row write batches and a tiny byte
+    /// target, then return the row counts of every written row group. The 700-row batch
+    /// size never lands on a 1024 multiple, so the byte target is always crossed with a
+    /// row group open — only the group-aligned roll keeps groups intact.
+    async fn write_and_collect_group_sizes(roll_on_row_group_boundary: bool) -> Vec<i64> {
+        let base_int = Arc::new(Int32Array::from((0..10000).collect::<Vec<i32>>()));
+        let base_str = Arc::new(StringArray::from(vec!["A"; 10000]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![base_str, base_int]).unwrap();
+
+        let object_store = DeltaTableBuilder::from_url(url::Url::parse("memory:///").unwrap())
+            .unwrap()
+            .build_storage()
+            .unwrap()
+            .object_store(None);
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1024))
+            .build();
+        let config = PartitionWriterConfig::try_new(
+            batch.schema(),
+            IndexMap::new(),
+            Some(properties),
+            Some(NonZeroU64::new(10_000).unwrap()),
+            Some(700),
+            None,
+            None,
+        )
+        .unwrap()
+        .with_roll_on_row_group_boundary(roll_on_row_group_boundary);
+        let mut writer = PartitionWriter::try_with_config(
+            object_store.clone(),
+            config,
+            DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEX_COLS),
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        let adds = writer.close().await.unwrap();
+        // the byte target still splits the write into multiple files
+        assert!(adds.len() > 1);
+
+        let mut group_sizes = Vec::new();
+        for add in &adds {
+            let bytes = object_store
+                .get(&Path::from(add.path.clone()))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let reader = SerializedFileReader::new(bytes).unwrap();
+            for rg in reader.metadata().row_groups() {
+                group_sizes.push(rg.num_rows());
+            }
+        }
+        assert_eq!(group_sizes.iter().sum::<i64>(), 10_000);
+        group_sizes
+    }
+
+    #[tokio::test]
+    async fn test_roll_on_row_group_boundary_never_truncates_groups() {
+        // With the group-aligned roll, every row group is exactly 1024 rows except the
+        // single end-of-data remainder (10_000 = 9 * 1024 + 784).
+        let group_sizes = write_and_collect_group_sizes(true).await;
+        let runts: Vec<_> = group_sizes.iter().filter(|n| **n != 1024).collect();
+        assert_eq!(runts.len(), 1);
+        assert_eq!(*runts[0], 10_000 % 1024);
+
+        // Negative control: the same setup with the plain byte roll cuts row groups
+        // mid-file, so the assertions above genuinely depend on the feature.
+        let group_sizes = write_and_collect_group_sizes(false).await;
+        let runts: Vec<_> = group_sizes.iter().filter(|n| **n != 1024).collect();
+        assert!(runts.len() > 1);
+    }
+
+    #[tokio::test]
+    async fn test_zero_write_batch_size_is_rejected() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]));
+        let result = PartitionWriterConfig::try_new(
+            schema,
+            IndexMap::new(),
+            None,
+            None,
+            Some(0),
+            None,
+            None,
+        );
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -656,13 +918,19 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(schema, vec![base_str, base_int]).unwrap();
 
-        let object_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+        let object_store = DeltaTableBuilder::from_url(url::Url::parse("memory:///").unwrap())
             .unwrap()
             .build_storage()
             .unwrap()
             .object_store(None);
         // configure small target file size so we can observe multiple files written
-        let mut writer = get_partition_writer(object_store, &batch, None, Some(10_000), None);
+        let mut writer = get_partition_writer(
+            object_store,
+            &batch,
+            None,
+            Some(NonZeroU64::new(10_000).unwrap()),
+            None,
+        );
         writer.write(&batch).await.unwrap();
 
         // check that we have written more then once file, and no more then 1 is below target size
@@ -684,23 +952,53 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(schema, vec![base_str, base_int]).unwrap();
 
-        let object_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+        let object_store = DeltaTableBuilder::from_url(url::Url::parse("memory:///").unwrap())
             .unwrap()
             .build_storage()
             .unwrap()
             .object_store(None);
         // configure high batch size and low file size to observe one file written and flushed immediately
         // upon writing batch, then ensures the buffer is empty upon closing writer
-        let mut writer = get_partition_writer(object_store, &batch, None, Some(9000), Some(10000));
+        let mut writer = get_partition_writer(
+            object_store,
+            &batch,
+            None,
+            Some(NonZeroU64::new(9000).unwrap()),
+            Some(10000),
+        );
         writer.write(&batch).await.unwrap();
 
         let adds = writer.close().await.unwrap();
         assert_eq!(adds.len(), 1);
     }
 
+    #[test]
+    fn test_sort_completed_writes_by_path() {
+        let mut results = vec![
+            (Path::from("part-00002.parquet"), 3, 2_u8),
+            (Path::from("part-00000.parquet"), 1, 0_u8),
+            (Path::from("part-00001.parquet"), 2, 1_u8),
+        ];
+
+        sort_completed_writes_by_path(&mut results);
+
+        let ordered_paths = results
+            .iter()
+            .map(|(path, _, _)| path.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_paths,
+            vec![
+                "part-00000.parquet",
+                "part-00001.parquet",
+                "part-00002.parquet"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_write_mismatched_schema() {
-        let log_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+        let log_store = DeltaTableBuilder::from_url(url::Url::parse("memory:///").unwrap())
             .unwrap()
             .build_storage()
             .unwrap();

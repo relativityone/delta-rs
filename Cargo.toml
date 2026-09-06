@@ -1,14 +1,14 @@
 [workspace]
-members = ["crates/*", "delta-inspect", "python"]
+members = ["crates/*", "python"]
 exclude = []
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
-authors = ["Qingping Hou <dave2008713@gmail.com>"]
-rust-version = "1.86"
+authors = ["Qingping Hou <dave2008713@gmail.com>", "R Tyler Croy <rtyler@brokenco.de>"]
+rust-version = "1.94.1"
 keywords = ["deltalake", "delta", "datalake"]
 readme = "README.md"
-edition = "2021"
+edition = "2024"
 description = "Native Delta Lake implementation in Rust"
 homepage = "https://github.com/delta-io/delta.rs"
 license = "Apache-2.0"
@@ -16,41 +16,47 @@ documentation = "https://docs.rs/deltalake"
 repository = "https://github.com/delta-io/delta.rs"
 
 [workspace.dependencies]
-delta_kernel = { version = "0.18.0", features = [
-    "arrow-57",
-    "default-engine-rustls",
+#delta_kernel = { package = "buoyant_kernel", path = "../delta-kernel-rs/kernel", features = [
+#delta_kernel = { package = "buoyant_kernel", git = "https://github.com/buoyant-data/delta-kernel-rs", branch = "buoyant/main", features = [
+delta_kernel = { package = "buoyant_kernel", version = "0.25.0,<0.25.100", features = [
+    "arrow-59",
     "internal-api",
 ] }
+#delta_kernel_default_engine = {  package = "buoyant_kernel_engine",  path = "../delta-kernel-rs/default-engine", features = ["arrow-58", "rustls"], default-features = false }
+#delta_kernel_default_engine = {  package = "buoyant_kernel_engine",  git = "https://github.com/buoyant-data/delta-kernel-rs", branch = "buoyant/main", features = ["arrow-58", "rustls"], default-features = false }
+delta_kernel_default_engine = {  package = "buoyant_kernel_engine",  version = "0.25.0,<0.25.100", features = ["arrow-59", "rustls"], default-features = false }
 
 
 # arrow
-arrow = { version = "57" }
-arrow-arith = { version = "57" }
-arrow-array = { version = "57", features = ["chrono-tz"] }
-arrow-buffer = { version = "57" }
-arrow-cast = { version = "57" }
-arrow-ipc = { version = "57" }
-arrow-json = { version = "57" }
-arrow-ord = { version = "57" }
-arrow-row = { version = "57" }
-arrow-schema = { version = "57" }
-arrow-select = { version = "57" }
-object_store = { version = "0.12.1" }
-parquet = { version = "57" }
+arrow = { version = "59" }
+arrow-arith = { version = "59" }
+arrow-array = { version = "59", features = ["chrono-tz"] }
+arrow-buffer = { version = "59" }
+arrow-cast = { version = "59" }
+arrow-ipc = { version = "59" }
+arrow-json = { version = "59" }
+arrow-ord = { version = "59" }
+arrow-row = { version = "59" }
+arrow-schema = { version = "59" }
+arrow-select = { version = "59" }
+object_store = { version = "0.13.2" }
+parquet = { version = "59" }
 
-# datafusion
-datafusion = "51.0"
-datafusion-ffi = "51.0"
-datafusion-proto = "51.0"
+# datafusion 54
+datafusion = { version = "55" }
+datafusion-datasource = { version = "55" }
+datafusion-physical-expr-adapter = { version = "55" }
+datafusion-ffi = { version = "55" }
+datafusion-proto = { version = "55" }
 
 # serde
 serde = { version = "1.0.194", features = ["derive"] }
 serde_json = "1"
-strum = { version = "0.27" }
 
 # "stdlib"
 bytes = { version = "1" }
 chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
+time = { version = "=0.3.53" }
 tracing = { version = "0.1", features = ["log"] }
 regex = { version = "1" }
 thiserror = { version = "2" }
@@ -127,15 +133,15 @@ debug = true
 # CI profile - optimized for Continuous Integration
 # Usage: cargo build --profile=ci
 [profile.ci]
-inherits = "dev"           
-debug = false              
-incremental = false        
+inherits = "dev"
+debug = false
+incremental = false
 
 [profile.ci.package."*"]
-opt-level = 3              
-debug = false             
-debug-assertions = false   
-strip = "debuginfo"       
+opt-level = 3
+debug = false
+debug-assertions = false
+strip = "debuginfo"
 incremental = false
 
 # Python wheel release profile - for PyPI distribution
@@ -144,4 +150,13 @@ incremental = false
 inherits = "release"
 opt-level = 3
 codegen-units = 1
-lto = "fat"         
+lto = "fat"
+
+
+# Python wheel release profile ARM - for PyPI distribution
+# Usage: maturin build --profile python-release-arm (via .github/workflows/python_release.yml)
+[profile.python-release-arm]
+inherits = "release"
+opt-level = 3
+codegen-units = 1
+lto = "thin"

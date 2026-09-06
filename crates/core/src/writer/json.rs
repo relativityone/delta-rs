@@ -10,10 +10,7 @@ use delta_kernel::expressions::Scalar;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use object_store::path::Path;
-use parquet::{
-    arrow::ArrowWriter, basic::Compression, errors::ParquetError,
-    file::properties::WriterProperties,
-};
+use parquet::{arrow::ArrowWriter, errors::ParquetError, file::properties::WriterProperties};
 use serde_json::Value;
 use tracing::*;
 use url::Url;
@@ -24,14 +21,15 @@ use super::utils::{
     arrow_schema_without_partitions, next_data_path, record_batch_from_message,
     record_batch_without_partitions,
 };
-use super::{DeltaWriter, DeltaWriterError, WriteMode};
+use super::{DeltaWriter, DeltaWriterError, WriteMode, ensure_legacy_writer_supports_table};
+use crate::DeltaTable;
 use crate::errors::DeltaTableError;
-use crate::kernel::{scalars::ScalarExt, Add, PartitionsExt};
+use crate::kernel::{Add, PartitionsExt, scalars::ScalarExt};
 use crate::logstore::ObjectStoreRetryExt;
-use crate::table::builder::{ensure_table_uri, DeltaTableBuilder};
+use crate::parquet_utils::default_writer_properties;
+use crate::table::builder::DeltaTableBuilder;
 use crate::table::config::TablePropertiesExt as _;
 use crate::writer::utils::ShareableBuffer;
-use crate::DeltaTable;
 
 type BadValue = (Value, ParquetError);
 
@@ -94,7 +92,9 @@ impl DataArrowWriter {
         json_buffer: Vec<Value>,
         parquet_error: ParquetError,
     ) -> Result<(), DeltaWriterError> {
-        warn!("Failed with parquet error while writing record batch. Attempting quarantine of bad records.");
+        warn!(
+            "Failed with parquet error while writing record batch. Attempting quarantine of bad records."
+        );
         let (good, bad) = quarantine_failed_parquet_rows(arrow_schema.clone(), json_buffer)?;
         let record_batch = record_batch_from_message(arrow_schema, good.as_slice())?;
         self.write_record_batch(partition_columns, record_batch)
@@ -191,15 +191,14 @@ impl JsonWriter {
         partition_columns: Option<Vec<String>>,
         storage_options: Option<HashMap<String, String>>,
     ) -> Result<Self, DeltaTableError> {
-        let table = DeltaTableBuilder::from_uri(ensure_table_uri(&table_url)?)?
+        let table = DeltaTableBuilder::from_url(table_url)?
             .with_storage_options(storage_options.unwrap_or_default())
             .load()
             .await?;
+        ensure_legacy_writer_supports_table(&table, "JsonWriter")?;
+
         // Initialize writer properties for the underlying arrow writer
-        let writer_properties = WriterProperties::builder()
-            // NOTE: Consider extracting config for writer properties and setting more than just compression
-            .set_compression(Compression::SNAPPY)
-            .build();
+        let writer_properties = default_writer_properties(parquet::basic::Compression::SNAPPY);
 
         Ok(Self {
             table,
@@ -212,15 +211,14 @@ impl JsonWriter {
 
     /// Creates a JsonWriter to write to the given table
     pub fn for_table(table: &DeltaTable) -> Result<JsonWriter, DeltaTableError> {
+        ensure_legacy_writer_supports_table(table, "JsonWriter")?;
+
         // Initialize an arrow schema ref from the delta table schema
         let metadata = table.snapshot()?.metadata();
-        let partition_columns = metadata.partition_columns().clone();
+        let partition_columns = metadata.partition_columns().into();
 
         // Initialize writer properties for the underlying arrow writer
-        let writer_properties = WriterProperties::builder()
-            // NOTE: Consider extracting config for writer properties and setting more than just compression
-            .set_compression(Compression::SNAPPY)
-            .build();
+        let writer_properties = default_writer_properties(parquet::basic::Compression::SNAPPY);
 
         Ok(Self {
             table: table.clone(),
@@ -317,7 +315,9 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
         mode: WriteMode,
     ) -> Result<(), DeltaTableError> {
         if mode != WriteMode::Default {
-            warn!("The JsonWriter does not currently support non-default write modes, falling back to default mode");
+            warn!(
+                "The JsonWriter does not currently support non-default write modes, falling back to default mode"
+            );
         }
         let mut partial_writes: Vec<(Value, ParquetError)> = Vec::new();
         let arrow_schema = self.arrow_schema();
@@ -482,7 +482,6 @@ mod tests {
 
     use crate::arrow::array::Int32Array;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
-    use crate::ensure_table_uri;
     use crate::operations::create::CreateBuilder;
     use crate::writer::test_utils::get_delta_schema;
 
@@ -509,7 +508,7 @@ mod tests {
         let table = get_test_table(&table_dir).await;
         let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
-            ensure_table_uri(&table.table_uri()).unwrap(),
+            table.table_url().clone(),
             arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
@@ -542,6 +541,40 @@ mod tests {
             .map(|desc| desc.name().to_string())
             .collect::<Vec<String>>();
         assert_eq!(columns, vec!["id".to_string(), "value".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_json_writer_for_table_defaults_include_delta_rs_created_by() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_test_table(&table_dir).await;
+
+        let writer = JsonWriter::for_table(&table).unwrap();
+
+        assert_eq!(
+            writer.writer_properties.created_by(),
+            format!("delta-rs version {}", crate::crate_version())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_writer_try_new_defaults_include_delta_rs_created_by() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_test_table(&table_dir).await;
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
+
+        let writer = JsonWriter::try_new(
+            table.table_url().clone(),
+            arrow_schema,
+            Some(vec!["modified".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            writer.writer_properties.created_by(),
+            format!("delta-rs version {}", crate::crate_version())
+        );
     }
 
     #[test]
@@ -585,7 +618,7 @@ mod tests {
 
         let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
-            ensure_table_uri(&table.table_uri()).unwrap(),
+            table.table_url().clone(),
             arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
@@ -661,7 +694,7 @@ mod tests {
             let mut table = get_test_table(&table_dir).await;
 
             let mut writer = JsonWriter::try_new(
-                ensure_table_uri(&table.table_uri()).unwrap(),
+                table.table_url().clone(),
                 table.snapshot().unwrap().snapshot().arrow_schema(),
                 Some(vec!["modified".to_string()]),
                 None,
@@ -696,7 +729,7 @@ mod tests {
     }
 
     #[cfg(feature = "datafusion")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_json_write_checkpoint() {
         use std::fs;
 
@@ -768,7 +801,7 @@ mod tests {
         assert_eq!(table.version(), Some(0));
         let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
-            crate::ensure_table_uri(&table.table_uri()).unwrap(),
+            table.table_url().clone(),
             arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
@@ -833,7 +866,7 @@ mod tests {
         assert_eq!(table.version(), Some(0));
         let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
-            crate::ensure_table_uri(&table.table_uri()).unwrap(),
+            table.table_url().clone(),
             arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
