@@ -8,35 +8,32 @@
 //!
 //! # Example
 //! ```rust ignore
-//! let mut table = open_table("../path/to/table")?;
+//! let mut table = open_table(Url::from_directory_path("/abs/path/to/table").unwrap())?;
 //! let (table, metrics) = FileSystemCheckBuilder::new(table.object_store(), table.state).await?;
 //! ````
 
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use futures::future::BoxFuture;
 use futures::StreamExt;
+use futures::TryStreamExt;
+use futures::future::BoxFuture;
 use object_store::ObjectStore;
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use tracing::*;
 use url::{ParseError, Url};
-use uuid::Uuid;
 
-use super::CustomExecuteHandler;
-use super::Operation;
+use crate::DeltaTable;
 use crate::errors::{DeltaResult, DeltaTableError};
-use crate::kernel::resolve_snapshot;
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::EagerSnapshot;
 use crate::kernel::{Action, Add, Remove};
+use crate::kernel::{ActiveAddOptions, AddStatsPolicy, EagerSnapshot, Snapshot, resolve_snapshot};
 use crate::logstore::LogStoreRef;
+use crate::logstore::with_operation;
 use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
-use crate::DeltaTable;
 
 /// Audit the Delta Table's active files with the underlying file system.
 /// See this module's documentation for more information
@@ -49,7 +46,6 @@ pub struct FileSystemCheckBuilder {
     dry_run: bool,
     /// Commit properties and configuration
     commit_properties: CommitProperties,
-    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
 /// Details of the FSCK operation including which files were removed from the log
@@ -57,7 +53,7 @@ pub struct FileSystemCheckBuilder {
 pub struct FileSystemCheckMetrics {
     /// Was this a dry run
     pub dry_run: bool,
-    /// Files that wrere removed successfully
+    /// Files that were removed successfully
     #[serde(
         serialize_with = "serialize_vec_string",
         deserialize_with = "deserialize_vec_string"
@@ -66,8 +62,6 @@ pub struct FileSystemCheckMetrics {
 }
 
 struct FileSystemCheckPlan {
-    /// Delta object store for handling data files
-    log_store: LogStoreRef,
     /// Files that no longer exists in undlying ObjectStore but have active add actions
     pub files_to_remove: Vec<Add>,
 }
@@ -101,15 +95,6 @@ fn is_absolute_path(path: &str) -> DeltaResult<bool> {
     }
 }
 
-impl super::Operation for FileSystemCheckBuilder {
-    fn log_store(&self) -> &LogStoreRef {
-        &self.log_store
-    }
-    fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>> {
-        self.custom_execute_handler.clone()
-    }
-}
-
 impl FileSystemCheckBuilder {
     /// Create a new [`FileSystemCheckBuilder`]
     pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
@@ -118,7 +103,6 @@ impl FileSystemCheckBuilder {
             log_store,
             dry_run: false,
             commit_properties: CommitProperties::default(),
-            custom_execute_handler: None,
         }
     }
 
@@ -134,17 +118,20 @@ impl FileSystemCheckBuilder {
         self
     }
 
-    /// Set a custom execute handler, for pre and post execution
-    pub fn with_custom_execute_handler(mut self, handler: Arc<dyn CustomExecuteHandler>) -> Self {
-        self.custom_execute_handler = Some(handler);
-        self
-    }
-
-    async fn create_fsck_plan(&self, snapshot: &EagerSnapshot) -> DeltaResult<FileSystemCheckPlan> {
+    async fn create_fsck_plan(&self, snapshot: &Snapshot) -> DeltaResult<FileSystemCheckPlan> {
         let mut files_relative: HashMap<String, Add> = HashMap::new();
         let log_store = self.log_store.clone();
-        let file_stream = snapshot.log_data().into_iter().map(|f| f.add_action());
-        for active in file_stream {
+        let mut file_stream = snapshot
+            .active_adds(
+                log_store.as_ref(),
+                ActiveAddOptions {
+                    predicate: None,
+                    stats: AddStatsPolicy::None,
+                },
+            )
+            .map_ok(|f| f.to_add());
+        while let Some(active) = file_stream.next().await {
+            let active = active?;
             if is_absolute_path(&active.path)? {
                 return Err(DeltaTableError::Generic(
                     "Filesystem check does not support absolute paths".to_string(),
@@ -154,7 +141,7 @@ impl FileSystemCheckBuilder {
             }
         }
 
-        let object_store = log_store.object_store(None);
+        let object_store = log_store.object_store();
         let list_span = info_span!("list_files", operation = "filesystem_check");
         let mut files = list_span.in_scope(|| object_store.list(None));
 
@@ -179,20 +166,16 @@ impl FileSystemCheckBuilder {
             .map(|file| file.to_owned())
             .collect();
 
-        Ok(FileSystemCheckPlan {
-            files_to_remove,
-            log_store,
-        })
+        Ok(FileSystemCheckPlan { files_to_remove })
     }
 }
 
 impl FileSystemCheckPlan {
     pub async fn execute(
         self,
+        log_store: LogStoreRef,
         snapshot: &EagerSnapshot,
         mut commit_properties: CommitProperties,
-        operation_id: Uuid,
-        handle: Option<Arc<dyn CustomExecuteHandler>>,
     ) -> DeltaResult<FileSystemCheckMetrics> {
         let mut actions = Vec::with_capacity(self.files_to_remove.len());
         let mut removed_file_paths = Vec::with_capacity(self.files_to_remove.len());
@@ -208,7 +191,7 @@ impl FileSystemCheckPlan {
                 extended_file_metadata: None,
                 partition_values: Some(file.partition_values),
                 size: Some(file.size),
-                deletion_vector: None,
+                deletion_vector: file.deletion_vector,
                 tags: file.tags,
                 base_row_id: file.base_row_id,
                 default_row_commit_version: file.default_row_commit_version,
@@ -228,12 +211,10 @@ impl FileSystemCheckPlan {
         );
 
         CommitBuilder::from(commit_properties)
-            .with_operation_id(operation_id)
-            .with_post_commit_hook_handler(handle)
             .with_actions(actions)
             .build(
                 Some(snapshot),
-                self.log_store.clone(),
+                log_store,
                 DeltaOperation::FileSystemCheck {},
             )
             .await?;
@@ -250,9 +231,9 @@ impl std::future::IntoFuture for FileSystemCheckBuilder {
         let this = self;
 
         Box::pin(async move {
-            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), true).await?;
+            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), None).await?;
 
-            let plan = this.create_fsck_plan(&snapshot).await?;
+            let plan = this.create_fsck_plan(snapshot.snapshot()).await?;
             if this.dry_run {
                 return Ok((
                     DeltaTable::new_with_state(this.log_store, DeltaTableState::new(snapshot)),
@@ -271,23 +252,17 @@ impl std::future::IntoFuture for FileSystemCheckBuilder {
                     },
                 ));
             };
-            let operation_id = this.get_operation_id();
-            this.pre_execute(operation_id).await?;
+            let parent = this.log_store.clone();
+            let commit_properties = this.commit_properties;
+            let snapshot_ref = &snapshot;
+            let metrics = with_operation(&parent, |log_store| async move {
+                plan.execute(log_store, snapshot_ref, commit_properties)
+                    .await
+            })
+            .await?;
 
-            let metrics = plan
-                .execute(
-                    &snapshot,
-                    this.commit_properties.clone(),
-                    operation_id,
-                    this.get_custom_execute_handler(),
-                )
-                .await?;
-
-            this.post_execute(operation_id).await?;
-
-            let mut table =
-                DeltaTable::new_with_state(this.log_store, DeltaTableState::new(snapshot));
-            table.update().await?;
+            let mut table = DeltaTable::new_with_state(parent, DeltaTableState::new(snapshot));
+            table.update_state().await?;
             Ok((table, metrics))
         })
     }
@@ -295,18 +270,225 @@ impl std::future::IntoFuture for FileSystemCheckBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use object_store::{ObjectStoreExt as _, PutPayload};
+
     use super::*;
+    use crate::TableProperty;
+    use crate::kernel::{
+        DataType, DeletionVectorDescriptor, PrimitiveType, Snapshot, StorageType, StructField,
+    };
+
+    async fn metadata_rich_missing_file_table() -> DeltaResult<(DeltaTable, Add)> {
+        let mut source_add = crate::test_utils::make_test_add(
+            "part=a/metadata-rich.parquet",
+            &[("part", "a")],
+            1_725_000_000_000,
+        );
+        source_add.size = 1234;
+        source_add.stats = Some(
+            r#"{"numRecords":5,"minValues":{"id":1},"maxValues":{"id":5},"nullCount":{"id":0}}"#
+                .to_string(),
+        );
+        source_add.tags = Some(HashMap::from([
+            ("source".to_string(), Some("metadata-rich".to_string())),
+            ("nullable-tag".to_string(), None),
+        ]));
+        source_add.deletion_vector = Some(DeletionVectorDescriptor {
+            storage_type: StorageType::Inline,
+            path_or_inline_dv: "AAAA".to_string(),
+            offset: None,
+            size_in_bytes: 0,
+            cardinality: 2,
+        });
+        source_add.base_row_id = Some(41);
+        source_add.default_row_commit_version = Some(3);
+        source_add.clustering_provider = Some("liquid".to_string());
+
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(vec![
+                StructField::new(
+                    "id".to_string(),
+                    DataType::Primitive(PrimitiveType::Integer),
+                    false,
+                ),
+                StructField::new(
+                    "part".to_string(),
+                    DataType::Primitive(PrimitiveType::String),
+                    false,
+                ),
+            ])
+            .with_partition_columns(["part"])
+            .with_configuration_property(TableProperty::EnableDeletionVectors, Some("true"))
+            .with_actions([Action::Add(source_add.clone())])
+            .await?;
+        let snapshot = table.snapshot().unwrap();
+        let protocol = snapshot.protocol();
+        assert_eq!(
+            protocol.min_writer_version(),
+            7,
+            "The table did not set the expected minWriterVersion"
+        );
+        println!("PROTOCOL: {protocol:?}");
+
+        Ok((table, source_add))
+    }
+
+    fn normalize_adds(mut adds: Vec<Add>) -> DeltaResult<Vec<serde_json::Value>> {
+        adds.sort_by(|left, right| left.path.cmp(&right.path));
+        adds.into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "datafusion")]
+    #[tokio::test]
+    async fn fsck_removes_missing_deletion_vector_logical_file() -> DeltaResult<()> {
+        let (table, source_add) = metadata_rich_missing_file_table().await?;
+        let log_store = table.log_store();
+
+        let (table, metrics) = table
+            .filesystem_check()
+            .await
+            .expect("Failed to run filesystem check");
+
+        assert_eq!(metrics.files_removed, vec![source_add.path]);
+        let active_files: Vec<_> = table
+            .snapshot()?
+            .snapshot()
+            .snapshot()
+            .active_adds(
+                log_store.as_ref(),
+                ActiveAddOptions {
+                    predicate: None,
+                    stats: AddStatsPolicy::None,
+                },
+            )
+            .try_collect()
+            .await?;
+        assert!(active_files.is_empty());
+
+        Ok(())
+    }
+
+    const FSCK_PATH_CASES: &[(&str, &str)] = &[
+        (
+            "partition=a/file with spaces.parquet",
+            "partition=a/file%20with%20spaces.parquet",
+        ),
+        (
+            "partition=a/file%20with%20spaces.parquet",
+            "partition=a/file%2520with%2520spaces.parquet",
+        ),
+    ];
+
+    async fn fsck_path_table(physical_path: &str, wire_path: &str) -> DeltaResult<DeltaTable> {
+        let add = crate::test_utils::make_test_add(physical_path, &[("partition", "a")], 0);
+        // Check the encoded path that Add writes to the log.
+        assert_eq!(serde_json::to_value(&add)?["path"], wire_path);
+        DeltaTable::new_in_memory()
+            .create()
+            .with_columns([
+                StructField::new("id", DataType::INTEGER, false),
+                StructField::new("partition", DataType::STRING, false),
+            ])
+            .with_partition_columns(["partition"])
+            .with_actions([Action::Add(add)])
+            .await
+    }
+
+    #[tokio::test]
+    async fn fsck_preserves_present_files_with_spaces_or_literal_percent_sequences()
+    -> DeltaResult<()> {
+        for &(physical_path, wire_path) in FSCK_PATH_CASES {
+            let table = fsck_path_table(physical_path, wire_path).await?;
+            let version = table.snapshot()?.version();
+            // Use parse to preserve literal percent signs in the object path.
+            table
+                .object_store()
+                .put(
+                    &object_store::path::Path::parse(physical_path)?,
+                    PutPayload::from_static(b"data"),
+                )
+                .await?;
+
+            let (table, metrics) = table.filesystem_check().await?;
+
+            assert!(
+                metrics.files_removed.is_empty(),
+                "{physical_path}: {metrics:?}"
+            );
+            assert_eq!(table.snapshot()?.version(), version);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fsck_removes_missing_files_with_spaces_or_literal_percent_sequences() -> DeltaResult<()>
+    {
+        for &(physical_path, wire_path) in FSCK_PATH_CASES {
+            let table = fsck_path_table(physical_path, wire_path).await?;
+            let version = table.snapshot()?.version();
+            let log_store = table.log_store();
+
+            let (table, metrics) = table.filesystem_check().with_dry_run(true).await?;
+            assert!(metrics.dry_run);
+            assert_eq!(metrics.files_removed, vec![physical_path]);
+            assert_eq!(table.snapshot()?.version(), version);
+
+            let (table, metrics) = table.filesystem_check().await?;
+            assert!(!metrics.dry_run);
+            assert_eq!(metrics.files_removed, vec![physical_path]);
+            assert_eq!(table.snapshot()?.version(), version + 1);
+
+            let snapshot = Snapshot::try_new(log_store.as_ref(), None).await?;
+            let active_files: Vec<_> = snapshot
+                .active_adds(
+                    log_store.as_ref(),
+                    ActiveAddOptions {
+                        predicate: None,
+                        stats: AddStatsPolicy::None,
+                    },
+                )
+                .try_collect()
+                .await?;
+            assert!(active_files.is_empty(), "{physical_path}");
+
+            // Read the JSON path before Remove deserialization decodes it.
+            let commit = log_store
+                .read_commit_entry(version + 1)
+                .await?
+                .expect("expected the FSCK commit");
+            let actions = serde_json::Deserializer::from_slice(&commit)
+                .into_iter::<serde_json::Value>()
+                .collect::<Result<Vec<_>, _>>()?;
+            let removes: Vec<_> = actions
+                .iter()
+                .filter_map(|action| action.get("remove"))
+                .collect();
+            assert_eq!(removes.len(), 1);
+            assert_eq!(removes[0]["path"], wire_path);
+        }
+        Ok(())
+    }
 
     #[test]
     fn absolute_path() {
-        assert!(!is_absolute_path(
-            "part-00003-53f42606-6cda-4f13-8d07-599a21197296-c000.snappy.parquet"
-        )
-        .unwrap());
-        assert!(!is_absolute_path(
-            "x=9/y=9.9/part-00007-3c50fba1-4264-446c-9c67-d8e24a1ccf83.c000.snappy.parquet"
-        )
-        .unwrap());
+        assert!(
+            !is_absolute_path(
+                "part-00003-53f42606-6cda-4f13-8d07-599a21197296-c000.snappy.parquet"
+            )
+            .unwrap()
+        );
+        assert!(
+            !is_absolute_path(
+                "x=9/y=9.9/part-00007-3c50fba1-4264-446c-9c67-d8e24a1ccf83.c000.snappy.parquet"
+            )
+            .unwrap()
+        );
 
         assert!(is_absolute_path("abfss://container@account_name.blob.core.windows.net/full/part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet").unwrap());
         assert!(is_absolute_path("file:///C:/my_table/windows.parquet").unwrap());

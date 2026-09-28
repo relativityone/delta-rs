@@ -14,25 +14,36 @@ class QueryBuilder:
     """
     QueryBuilder is an API which exposes Apache DataFusion SQL to Python users of the deltalake library.
 
-    >>> qb = QueryBuilder()
+    ```py
+    qb = QueryBuilder()
+    ```
     """
 
-    def __init__(self) -> None:
-        self._query_builder = PyQueryBuilder()
+    def __init__(self, session_config: dict[str, str] | None = None) -> None:
+        """Create a QueryBuilder, optionally overriding the DataFusion session config.
+
+        Example:
+            ```py
+            from deltalake import QueryBuilder
+            qb = QueryBuilder({"datafusion.execution.batch_size": "1024"})
+            ```
+
+        Args:
+            session_config: [DataFusion configuration settings](https://datafusion.apache.org/user-guide/configs.html)
+                applied on top of the defaults deltalake tunes for Delta tables.
+        """
+        self._query_builder = PyQueryBuilder(session_config)
 
     def register(self, table_name: str, delta_table: DeltaTable) -> QueryBuilder:
-        """
-        Add a table to the query builder instance by name. The `table_name`
-        will be how the referenced `DeltaTable` can be referenced in SQL
-        queries.
+        """Add a table to the query builder instance by name. Table `DeltaTable`
+        is available in SQL queries as `table_name`.
 
-        For example:
-
-        ```python
-        from deltalake import DeltaTable, QueryBuilder
-        dt = DeltaTable("my_table")
-        qb = QueryBuilder().register('test', dt)
-        ```
+        Example:
+            ```py
+            from deltalake import DeltaTable, QueryBuilder
+            dt = DeltaTable("my_table")
+            qb = QueryBuilder().register('test', dt)
+            ```
         """
         self._query_builder.register(
             table_name=table_name,
@@ -44,11 +55,11 @@ class QueryBuilder:
         """
         Prepares the sql query to be executed.
 
-        For example:
-        ```python
-        from deltalake import DeltaTable, QueryBuilder
-        dt = DeltaTable("my_table")
-        data = QueryBuilder().register('test', dt).execute("select * from my_table").read_all()
-        ```
+        Example:
+            ```py
+            from deltalake import DeltaTable, QueryBuilder
+            dt = DeltaTable("my_table")
+            data = QueryBuilder().register('test', dt).execute("select * from test").read_all()
+            ```
         """
         return self._query_builder.execute(sql)

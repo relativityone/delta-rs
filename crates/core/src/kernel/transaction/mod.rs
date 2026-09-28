@@ -74,6 +74,7 @@
 //!       └───────────────────────────────┘
 //!</pre>
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -81,26 +82,28 @@ use chrono::Utc;
 use conflict_checker::ConflictChecker;
 use delta_kernel::table_properties::TableProperties;
 use futures::future::BoxFuture;
-use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
+use object_store::ObjectStoreExt as _;
+use object_store::path::Path;
 use serde_json::Value;
 use tracing::*;
-use uuid::Uuid;
 
 use delta_kernel::table_features::TableFeature;
 use serde::{Deserialize, Serialize};
 
 use self::conflict_checker::{TransactionInfo, WinningCommitSummary};
 use crate::errors::DeltaTableError;
-use crate::kernel::{Action, CommitInfo, EagerSnapshot, Metadata, Protocol, Transaction};
+use crate::kernel::{
+    Action, CommitInfo, EagerSnapshot, IsolationLevel, Metadata, Protocol, Transaction, Version,
+};
 use crate::logstore::ObjectStoreRef;
-use crate::logstore::{CommitOrBytes, LogStoreRef};
-use crate::operations::CustomExecuteHandler;
-use crate::protocol::DeltaOperation;
+use crate::logstore::with_operation;
+use crate::logstore::{CommitOrBytes, CommitResponse, Committer, LogStoreRef, PayloadKind};
+use crate::protocol::{DeltaOperation, operation_parameter_value};
 use crate::protocol::{cleanup_expired_logs_for, create_checkpoint_for};
 use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
-use crate::{crate_version, DeltaResult};
+use crate::{DeltaResult, crate_version};
 
 pub use self::conflict_checker::CommitConflictError;
 pub use self::protocol::INSTANCE as PROTOCOL;
@@ -114,8 +117,24 @@ mod state;
 
 const DELTA_LOG_FOLDER: &str = "_delta_log";
 pub(crate) const DEFAULT_RETRIES: usize = 15;
+// These keys map to typed CommitInfo fields used by common Spark compatible writers. They are not
+// required by the protocol, but leaving them in flattened metadata can produce duplicate JSON keys.
+// Keep this list aligned with validate_reserved_commit_metadata in python/src/lib.rs.
+const RESERVED_COMMIT_INFO_KEYS: &[&str] = &[
+    "timestamp",
+    "userId",
+    "userName",
+    "operation",
+    "operationParameters",
+    "readVersion",
+    "isolationLevel",
+    "isBlindAppend",
+    "engineInfo",
+    "userMetadata",
+];
 
 #[derive(Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
+/// Metrics describing the work performed to land a single commit.
 #[serde(rename_all = "camelCase")]
 pub struct CommitMetrics {
     /// Number of retries before a successful commit
@@ -123,6 +142,7 @@ pub struct CommitMetrics {
 }
 
 #[derive(Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
+/// Metrics describing work performed by post-commit hooks (checkpointing, log cleanup).
 #[serde(rename_all = "camelCase")]
 pub struct PostCommitMetrics {
     /// Whether a new checkpoint was created as part of this commit
@@ -133,6 +153,7 @@ pub struct PostCommitMetrics {
 }
 
 #[derive(Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
+/// Aggregate metrics for a commit, combining commit-time and post-commit measurements.
 #[serde(rename_all = "camelCase")]
 pub struct Metrics {
     /// Number of retries before a successful commit
@@ -150,7 +171,7 @@ pub struct Metrics {
 pub enum TransactionError {
     /// Version already exists
     #[error("Tried committing existing table version: {0}")]
-    VersionAlreadyExists(i64),
+    VersionAlreadyExists(Version),
 
     /// Error returned when reading the delta log object failed.
     #[error("Error serializing commit log to json: {json_err}")]
@@ -289,6 +310,142 @@ pub struct CommitData {
     pub app_transactions: Vec<Transaction>,
 }
 
+/// Moves reserved commit metadata into typed CommitInfo fields.
+///
+/// This prevents serde flatten from serializing duplicate commitInfo keys when callers pass fields
+/// such as readVersion or operationParameters through custom metadata. Rust callers keep the
+/// existing tolerant behavior: invalid reserved metadata is logged and dropped. Python validates
+/// the same key set early in validate_reserved_commit_metadata and raises ValueError instead.
+/// See issue 4443 for the Python custom metadata request that introduced this normalization path.
+fn normalize_reserved_commit_metadata(
+    commit_info: &mut CommitInfo,
+    app_metadata: &mut HashMap<String, Value>,
+) {
+    match app_metadata.remove("operationParameters") {
+        Some(Value::Object(operation_parameters)) => {
+            let generated_parameters = commit_info
+                .operation_parameters
+                .get_or_insert_with(HashMap::new);
+            for (key, value) in operation_parameters {
+                generated_parameters
+                    .entry(key)
+                    .or_insert_with(|| operation_parameter_value(value));
+            }
+        }
+        Some(value) => log_unexpected_reserved_metadata_type(
+            "operationParameters",
+            &value,
+            "object with string-compatible values",
+        ),
+        None => {}
+    }
+
+    if let Some(value) = app_metadata.remove("readVersion") {
+        if let Some(value) = value.as_u64() {
+            if commit_info.read_version.is_none() {
+                commit_info.read_version = Some(value);
+            }
+        } else {
+            log_unexpected_reserved_metadata_type("readVersion", &value, "non-negative integer");
+        }
+    }
+
+    promote_string_reserved_metadata(app_metadata, "userId", &mut commit_info.user_id);
+    promote_string_reserved_metadata(app_metadata, "userName", &mut commit_info.user_name);
+    promote_string_reserved_metadata(app_metadata, "userMetadata", &mut commit_info.user_metadata);
+
+    if let Some(value) = app_metadata.remove("isolationLevel") {
+        if let Some(value) = value
+            .as_str()
+            .and_then(|value| IsolationLevel::from_str(value).ok())
+        {
+            if commit_info.isolation_level.is_none() {
+                commit_info.isolation_level = Some(value);
+            }
+        } else {
+            log_unexpected_reserved_metadata_type(
+                "isolationLevel",
+                &value,
+                "valid IsolationLevel string",
+            );
+        }
+    }
+
+    if let Some(value) = app_metadata.remove("isBlindAppend") {
+        if let Some(value) = value.as_bool() {
+            if commit_info.is_blind_append.is_none() {
+                commit_info.is_blind_append = Some(value);
+            }
+        } else {
+            log_unexpected_reserved_metadata_type("isBlindAppend", &value, "boolean");
+        }
+    }
+
+    for key in RESERVED_COMMIT_INFO_KEYS {
+        app_metadata.remove(*key);
+    }
+}
+
+fn promote_string_reserved_metadata(
+    metadata: &mut HashMap<String, Value>,
+    key: &'static str,
+    target: &mut Option<String>,
+) {
+    let Some(value) = metadata.remove(key) else {
+        return;
+    };
+
+    if let Value::String(value) = value {
+        if target.is_none() {
+            *target = Some(value);
+        }
+    } else {
+        log_unexpected_reserved_metadata_type(key, &value, "string");
+    }
+}
+
+fn log_unexpected_reserved_metadata_type(key: &str, value: &Value, expected: &str) {
+    debug!(
+        key,
+        expected,
+        actual = json_value_kind(value),
+        "Ignoring reserved commit metadata key with unexpected type"
+    );
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn assign_commit_info_metadata(
+    commit_info: &mut CommitInfo,
+    app_metadata: &mut HashMap<String, Value>,
+) {
+    normalize_reserved_commit_metadata(commit_info, app_metadata);
+
+    let mut existing_info = std::mem::take(&mut commit_info.info);
+    normalize_reserved_commit_metadata(commit_info, &mut existing_info);
+    // app_metadata is the override layer for flattened commit info. It fills missing typed fields
+    // above, and wins over provided CommitInfo.info keys for custom fields.
+    for (key, value) in existing_info {
+        app_metadata.entry(key).or_insert(value);
+    }
+    debug_assert!(
+        RESERVED_COMMIT_INFO_KEYS
+            .iter()
+            .all(|key| !app_metadata.contains_key(*key))
+    );
+
+    commit_info.info = app_metadata.clone();
+}
+
 impl CommitData {
     /// Create new data to be committed
     pub fn new(
@@ -297,16 +454,25 @@ impl CommitData {
         mut app_metadata: HashMap<String, Value>,
         app_transactions: Vec<Transaction>,
     ) -> Self {
-        if !actions.iter().any(|a| matches!(a, Action::CommitInfo(..))) {
+        if let Some(Action::CommitInfo(commit_info)) = actions
+            .iter_mut()
+            .find(|action| matches!(action, Action::CommitInfo(..)))
+        {
+            // Callers that provide a CommitInfo action own generated typed fields such as
+            // timestamp and engineInfo. Flattened app metadata overrides custom keys, and callers
+            // may provide clientVersion for compatibility.
+            assign_commit_info_metadata(commit_info, &mut app_metadata);
+        } else {
             let mut commit_info = operation.get_commit_info();
             commit_info.timestamp = Some(Utc::now().timestamp_millis());
-            app_metadata.insert(
-                "clientVersion".to_string(),
-                Value::String(format!("delta-rs.{}", crate_version())),
-            );
-            app_metadata.extend(commit_info.info);
-            commit_info.info = app_metadata.clone();
-            actions.push(Action::CommitInfo(commit_info))
+            // clientVersion is provenance metadata, but it is not reserved. Callers can override it
+            // while engineInfo remains a generated typed CommitInfo field.
+            app_metadata
+                .entry("clientVersion".to_string())
+                .or_insert(Value::String(format!("delta-rs.{}", crate_version())));
+            assign_commit_info_metadata(&mut commit_info, &mut app_metadata);
+            // commit info should be the first action to support in-commit timestamps.
+            actions.insert(0, Action::CommitInfo(commit_info));
         }
 
         for txn in &app_transactions {
@@ -330,6 +496,42 @@ impl CommitData {
             jsons.push(json);
         }
         Ok(bytes::Bytes::from(jsons.join("\n")))
+    }
+
+    /// Update num_retries in operationMetrics within serialized bytes.
+    /// This allows updating the retry count without re-serializing all actions.
+    pub fn update_retry_count_in_bytes(
+        bytes: &Bytes,
+        num_retries: u64,
+    ) -> Result<Bytes, TransactionError> {
+        let bytes_str = std::str::from_utf8(bytes.as_ref())
+            .expect("Delta log bytes should always be valid UTF-8");
+
+        let lines: Vec<&str> = bytes_str.split('\n').collect();
+        let mut updated_lines = Vec::with_capacity(lines.len());
+
+        for line in lines {
+            if line.contains("\"commitInfo\"") {
+                let mut action: Value = serde_json::from_str(line)
+                    .map_err(|e| TransactionError::SerializeLogJson { json_err: e })?;
+
+                if let Some(commit_info) = action.get_mut("commitInfo") {
+                    if let Some(Value::Object(metrics)) = commit_info.get_mut("operationMetrics") {
+                        metrics
+                            .insert("num_retries".to_string(), Value::Number(num_retries.into()));
+                    }
+                }
+                // Serialize just this updated line
+                let updated_line = serde_json::to_string(&action)
+                    .map_err(|e| TransactionError::SerializeLogJson { json_err: e })?;
+                updated_lines.push(updated_line);
+            } else {
+                // Keep other action lines unchanged (Add, Remove, etc.)
+                updated_lines.push(line.to_string());
+            }
+        }
+
+        Ok(Bytes::from(updated_lines.join("\n")))
     }
 }
 
@@ -427,8 +629,6 @@ pub struct CommitBuilder {
     app_transaction: Vec<Transaction>,
     max_retries: usize,
     post_commit_hook: Option<PostCommitHookProperties>,
-    post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
-    operation_id: Uuid,
 }
 
 impl Default for CommitBuilder {
@@ -439,8 +639,6 @@ impl Default for CommitBuilder {
             app_transaction: Vec::new(),
             max_retries: DEFAULT_RETRIES,
             post_commit_hook: None,
-            post_commit_hook_handler: None,
-            operation_id: Uuid::new_v4(),
         }
     }
 }
@@ -470,22 +668,10 @@ impl<'a> CommitBuilder {
         self
     }
 
-    /// Propagate operation id to log store
-    pub fn with_operation_id(mut self, operation_id: Uuid) -> Self {
-        self.operation_id = operation_id;
-        self
-    }
-
-    /// Set a custom execute handler, for pre and post execution
-    pub fn with_post_commit_hook_handler(
-        mut self,
-        handler: Option<Arc<dyn CustomExecuteHandler>>,
-    ) -> Self {
-        self.post_commit_hook_handler = handler;
-        self
-    }
-
     /// Prepare a Commit operation using the configured builder
+    ///
+    /// `log_store` is the store the commit is written through. Inside an operation this is the
+    /// operation-scoped store; a standalone commit writes through the table's store directly.
     pub fn build(
         self,
         table_data: Option<&'a dyn TableReference>,
@@ -504,8 +690,6 @@ impl<'a> CommitBuilder {
             max_retries: self.max_retries,
             data,
             post_commit_hook: self.post_commit_hook,
-            post_commit_hook_handler: self.post_commit_hook_handler,
-            operation_id: self.operation_id,
         }
     }
 }
@@ -517,8 +701,6 @@ pub struct PreCommit<'a> {
     data: CommitData,
     max_retries: usize,
     post_commit_hook: Option<PostCommitHookProperties>,
-    post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
-    operation_id: Uuid,
 }
 
 impl<'a> std::future::IntoFuture for PreCommit<'a> {
@@ -553,29 +735,24 @@ impl<'a> PreCommit<'a> {
             }
             let log_entry = this.data.get_bytes()?;
 
-            // With the DefaultLogStore & LakeFSLogstore, we just pass the bytes around, since we use conditionalPuts
-            // Other stores will use tmp_commits
-            let commit_or_bytes = if ["LakeFSLogStore", "DefaultLogStore"]
-                .contains(&this.log_store.name().as_str())
-            {
-                CommitOrBytes::LogBytes(log_entry)
-            } else {
-                write_tmp_commit(
-                    log_entry,
-                    this.log_store.object_store(Some(this.operation_id)),
-                )
-                .await?
+            // The committer decides how the payload is prepared: conditional-put stores take the
+            // bytes, rename-based stores need a temporary commit file first.
+            let committer = this.log_store.committer();
+            let commit_or_bytes = match committer.payload_kind() {
+                PayloadKind::Bytes => CommitOrBytes::LogBytes(log_entry),
+                PayloadKind::TmpCommit => {
+                    write_tmp_commit(log_entry, this.log_store.object_store()).await?
+                }
             };
 
             Ok(PreparedCommit {
                 commit_or_bytes,
+                committer,
                 log_store: this.log_store,
                 table_data: this.table_data,
                 max_retries: this.max_retries,
                 data: this.data,
                 post_commit: this.post_commit_hook,
-                post_commit_hook_handler: this.post_commit_hook_handler,
-                operation_id: this.operation_id,
             })
         })
     }
@@ -584,13 +761,12 @@ impl<'a> PreCommit<'a> {
 /// Represents a inflight commit
 pub struct PreparedCommit<'a> {
     commit_or_bytes: CommitOrBytes,
+    committer: Arc<dyn Committer>,
     log_store: LogStoreRef,
     data: CommitData,
     table_data: Option<&'a dyn TableReference>,
     max_retries: usize,
     post_commit: Option<PostCommitHookProperties>,
-    post_commit_hook_handler: Option<Arc<dyn CustomExecuteHandler>>,
-    operation_id: Uuid,
 }
 
 impl PreparedCommit<'_> {
@@ -609,179 +785,231 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
 
         Box::pin(async move {
             let commit_or_bytes = this.commit_or_bytes;
+            let committer = this.committer;
+            let log_store = this.log_store;
+            let data = this.data;
+            let post_commit = this.post_commit;
+            let max_retries = this.max_retries;
 
-            if this.table_data.is_none() {
-                debug!("committing initial table version 0");
-                this.log_store
-                    .write_commit_entry(0, commit_or_bytes.clone(), this.operation_id)
-                    .await?;
-                return Ok(PostCommit {
-                    version: 0,
-                    data: this.data,
-                    create_checkpoint: false,
-                    cleanup_expired_logs: None,
-                    log_store: this.log_store,
-                    table_data: None,
-                    custom_execute_handler: this.post_commit_hook_handler,
-                    metrics: CommitMetrics { num_retries: 0 },
-                });
-            }
+            // The version of the most recent commit attempt. Every non-success exit aborts that
+            // attempt so that temporary commit files and staged commit entries do not leak.
+            let mut attempted_version: Version = 0;
 
-            // unwrap() is safe here due to the above check
-            let mut read_snapshot = this.table_data.unwrap().eager_snapshot().clone();
+            let result: DeltaResult<PostCommit> = async {
+                let mut attempt_number: usize = 1;
 
-            let commit_span = info_span!(
-                "commit_with_retries",
-                base_version = read_snapshot.version(),
-                max_retries = this.max_retries,
-                attempt = field::Empty,
-                target_version = field::Empty,
-                conflicts_checked = 0
-            );
+                // Handle the case where table doesn't exist yet (initial table creation)
+                let read_snapshot: EagerSnapshot = if let Some(table_data) = this.table_data {
+                    table_data.eager_snapshot().clone()
+                } else {
+                    debug!("committing initial table version 0");
+                    match committer.commit(0, commit_or_bytes.clone()).await {
+                        Ok(CommitResponse::Committed) => {
+                            return Ok(PostCommit {
+                                version: 0,
+                                data,
+                                create_checkpoint: false,
+                                cleanup_expired_logs: None,
+                                log_store,
+                                table_data: None,
+                                metrics: CommitMetrics { num_retries: 0 },
+                            });
+                        }
+                        Ok(CommitResponse::Conflict { .. })
+                        | Err(TransactionError::VersionAlreadyExists(_)) => {
+                            // Table was created by another writer since the `table_data.is_none()`
+                            // check. Load the current table state and continue with the retry loop.
+                            debug!("version 0 already exists, loading table state for retry");
+                            attempt_number = 2;
+                            let latest_version: Version = log_store.get_latest_version(0).await?;
+                            EagerSnapshot::try_new(log_store.as_ref(), Some(latest_version)).await?
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                };
 
-            async move {
-                let mut attempt_number = 1;
-                let total_retries = this.max_retries + 1;
-                while attempt_number <= total_retries {
-                    Span::current().record("attempt", attempt_number);
-                    let latest_version = this
-                        .log_store
-                        .get_latest_version(read_snapshot.version())
-                        .await?;
+                let mut read_snapshot = read_snapshot;
 
-                    if latest_version > read_snapshot.version() {
-                        // If max_retries are set to 0, do not try to use the conflict checker to resolve the conflict
-                        // and throw immediately
-                        if this.max_retries == 0 {
+                let commit_span = info_span!(
+                    "commit_with_retries",
+                    base_version = read_snapshot.version(),
+                    max_retries = max_retries,
+                    attempt = field::Empty,
+                    target_version = field::Empty,
+                    conflicts_checked = 0
+                );
+
+                async {
+                    let total_retries = max_retries + 1;
+                    while attempt_number <= total_retries {
+                        Span::current().record("attempt", attempt_number);
+                        let latest_version = log_store
+                            .get_latest_version(read_snapshot.version())
+                            .await?;
+
+                        if latest_version > read_snapshot.version() {
+                            // If max_retries are set to 0, do not try to use the conflict checker to resolve the conflict
+                            // and throw immediately
+                            if max_retries == 0 {
+                                warn!(
+                                    base_version = read_snapshot.version(),
+                                    latest_version = latest_version,
+                                    "table updated but max_retries is 0, failing immediately"
+                                );
+                                return Err(TransactionError::MaxCommitAttempts(
+                                    max_retries as i32,
+                                )
+                                .into());
+                            }
                             warn!(
                                 base_version = read_snapshot.version(),
                                 latest_version = latest_version,
-                                "table updated but max_retries is 0, failing immediately"
+                                versions_behind = latest_version - read_snapshot.version(),
+                                "table updated during transaction, checking for conflicts"
                             );
-                            return Err(TransactionError::MaxCommitAttempts(
-                                this.max_retries as i32,
-                            )
-                            .into());
-                        }
-                        warn!(
-                            base_version = read_snapshot.version(),
-                            latest_version = latest_version,
-                            versions_behind = latest_version - read_snapshot.version(),
-                            "table updated during transaction, checking for conflicts"
-                        );
-                        let mut steps = latest_version - read_snapshot.version();
-                        let mut conflicts_checked = 0;
+                            let mut steps = latest_version - read_snapshot.version();
+                            let mut conflicts_checked = 0;
 
-                        // Need to check for conflicts with each version between the read_snapshot and
-                        // the latest!
-                        while steps != 0 {
-                            conflicts_checked += 1;
-                            let summary = WinningCommitSummary::try_new(
-                                this.log_store.as_ref(),
-                                latest_version - steps,
-                                (latest_version - steps) + 1,
-                            )
-                            .await?;
-                            let transaction_info = TransactionInfo::try_new(
-                                read_snapshot.log_data(),
-                                this.data.operation.read_predicate(),
-                                &this.data.actions,
-                                this.data.operation.read_whole_table(),
-                            )?;
-                            let conflict_checker = ConflictChecker::new(
-                                transaction_info,
-                                summary,
-                                Some(&this.data.operation),
-                            );
-
-                            match conflict_checker.check_conflicts() {
-                                Ok(_) => {}
-                                Err(err) => {
-                                    error!(
-                                        conflicts_checked = conflicts_checked,
-                                        error = %err,
-                                        "conflict detected, aborting transaction"
-                                    );
-                                    return Err(TransactionError::CommitConflict(err).into());
-                                }
-                            }
-                            steps -= 1;
-                        }
-                        Span::current().record("conflicts_checked", conflicts_checked);
-                        debug!(
-                            conflicts_checked = conflicts_checked,
-                            "all conflicts resolved, updating snapshot"
-                        );
-                        // Update snapshot to latest version after successful conflict check
-                        read_snapshot
-                            .update(&this.log_store, Some(latest_version as u64))
-                            .await?;
-                    }
-                    let version: i64 = latest_version + 1;
-                    Span::current().record("target_version", version);
-
-                    match this
-                        .log_store
-                        .write_commit_entry(version, commit_or_bytes.clone(), this.operation_id)
-                        .await
-                    {
-                        Ok(()) => {
-                            info!(
-                                version = version,
-                                num_retries = attempt_number as u64 - 1,
-                                "transaction committed successfully"
-                            );
-                            return Ok(PostCommit {
-                                version,
-                                data: this.data,
-                                create_checkpoint: this
-                                    .post_commit
-                                    .map(|v| v.create_checkpoint)
-                                    .unwrap_or_default(),
-                                cleanup_expired_logs: this
-                                    .post_commit
-                                    .map(|v| v.cleanup_expired_logs)
-                                    .unwrap_or_default(),
-                                log_store: this.log_store,
-                                table_data: Some(Box::new(read_snapshot)),
-                                custom_execute_handler: this.post_commit_hook_handler,
-                                metrics: CommitMetrics {
-                                    num_retries: attempt_number as u64 - 1,
-                                },
-                            });
-                        }
-                        Err(TransactionError::VersionAlreadyExists(version)) => {
-                            warn!(
-                                version = version,
-                                attempt = attempt_number,
-                                "version already exists, will retry"
-                            );
-                            // If the version already exists, loop through again and re-check
-                            // conflicts
-                            attempt_number += 1;
-                        }
-                        Err(err) => {
-                            error!(
-                                version = version,
-                                error = %err,
-                                "commit failed, aborting"
-                            );
-                            this.log_store
-                                .abort_commit_entry(version, commit_or_bytes, this.operation_id)
+                            // Need to check for conflicts with each version between the read_snapshot and
+                            // the latest!
+                            while steps != 0 {
+                                conflicts_checked += 1;
+                                let summary = WinningCommitSummary::try_new(
+                                    log_store.as_ref(),
+                                    latest_version - steps,
+                                    (latest_version - steps) + 1,
+                                )
                                 .await?;
-                            return Err(err.into());
+                                let conflict_read_set = read_snapshot
+                                    .snapshot()
+                                    .conflict_read_set(log_store.as_ref())
+                                    .await?;
+                                let transaction_info = TransactionInfo::try_new(
+                                    conflict_read_set,
+                                    data.operation.read_predicate(),
+                                    &data.actions,
+                                    data.operation.read_whole_table(),
+                                )?;
+                                let conflict_checker = ConflictChecker::new(
+                                    transaction_info,
+                                    summary,
+                                    Some(&data.operation),
+                                );
+
+                                match conflict_checker.check_conflicts() {
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        error!(
+                                            conflicts_checked = conflicts_checked,
+                                            error = %err,
+                                            "conflict detected, aborting transaction"
+                                        );
+                                        return Err(TransactionError::CommitConflict(err).into());
+                                    }
+                                }
+                                steps -= 1;
+                            }
+                            Span::current().record("conflicts_checked", conflicts_checked);
+                            debug!(
+                                conflicts_checked = conflicts_checked,
+                                "all conflicts resolved, updating snapshot"
+                            );
+                            // Update snapshot to latest version after successful conflict check
+                            read_snapshot
+                                .update(&log_store, Some(latest_version))
+                                .await?;
+                        }
+                        let version: Version = latest_version + 1;
+                        attempted_version = version;
+                        Span::current().record("target_version", version);
+
+                        // Calculate current retry count (attempt 1 = 0 retries, attempt 2 = 1 retry, etc.)
+                        let current_retries = (attempt_number - 1) as u64;
+
+                        // Update operationMetrics.numRetries in the serialized bytes
+                        let updated_commit_or_bytes = match &commit_or_bytes {
+                            CommitOrBytes::LogBytes(bytes) => {
+                                let updated_bytes = if current_retries > 0 {
+                                    CommitData::update_retry_count_in_bytes(bytes, current_retries)?
+                                } else {
+                                    bytes.clone()
+                                };
+                                CommitOrBytes::LogBytes(updated_bytes)
+                            }
+                            CommitOrBytes::TmpCommit(_path) => {
+                                // For TmpCommit stores, keep original behavior for now
+                                // (these stores write to tmp file first, then rename)
+                                commit_or_bytes.clone()
+                            }
+                        };
+
+                        match committer.commit(version, updated_commit_or_bytes).await {
+                            Ok(CommitResponse::Committed) => {
+                                info!(
+                                    version = version,
+                                    num_retries = attempt_number - 1,
+                                    "transaction committed successfully"
+                                );
+                                return Ok(PostCommit {
+                                    version,
+                                    data,
+                                    create_checkpoint: post_commit
+                                        .map(|v| v.create_checkpoint)
+                                        .unwrap_or_default(),
+                                    cleanup_expired_logs: post_commit
+                                        .map(|v| v.cleanup_expired_logs)
+                                        .unwrap_or_default(),
+                                    log_store,
+                                    table_data: Some(Box::new(read_snapshot)),
+                                    metrics: CommitMetrics {
+                                        num_retries: (attempt_number - 1) as u64,
+                                    },
+                                });
+                            }
+                            Ok(CommitResponse::Conflict { .. })
+                            | Err(TransactionError::VersionAlreadyExists(_)) => {
+                                warn!(
+                                    version = version,
+                                    attempt = attempt_number,
+                                    "version already exists, will retry"
+                                );
+                                // If the version already exists, loop through again and re-check
+                                // conflicts
+                                attempt_number += 1;
+                            }
+                            Err(err) => {
+                                error!(
+                                    version = version,
+                                    error = %err,
+                                    "commit failed, aborting"
+                                );
+                                return Err(err.into());
+                            }
                         }
                     }
-                }
 
-                error!(
-                    max_retries = this.max_retries,
-                    "exceeded maximum commit attempts"
-                );
-                Err(TransactionError::MaxCommitAttempts(this.max_retries as i32).into())
+                    error!(
+                        max_retries = max_retries,
+                        "exceeded maximum commit attempts"
+                    );
+                    Err(TransactionError::MaxCommitAttempts(max_retries as i32).into())
+                }
+                .instrument(commit_span)
+                .await
             }
-            .instrument(commit_span)
-            .await
+            .await;
+
+            match result {
+                Ok(post_commit) => Ok(post_commit),
+                Err(err) => {
+                    if let Err(abort_err) =
+                        committer.abort(attempted_version, commit_or_bytes).await
+                    {
+                        warn!(error = %abort_err, "failed to abort commit attempt");
+                    }
+                    Err(err)
+                }
+            }
         })
     }
 }
@@ -789,14 +1017,13 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
 /// Represents items for the post commit hook
 pub struct PostCommit {
     /// The winning version number of the commit
-    pub version: i64,
+    pub version: Version,
     /// The data that was committed to the log store
     pub data: CommitData,
     create_checkpoint: bool,
     cleanup_expired_logs: Option<bool>,
     log_store: LogStoreRef,
     table_data: Option<Box<dyn TableReference>>,
-    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
     metrics: CommitMetrics,
 }
 
@@ -804,12 +1031,9 @@ impl PostCommit {
     /// Runs the post commit activities
     async fn run_post_commit_hook(&self) -> DeltaResult<(DeltaTableState, PostCommitMetrics)> {
         if let Some(table) = &self.table_data {
-            let post_commit_operation_id = Uuid::new_v4();
             let mut snapshot = table.eager_snapshot().clone();
             if self.version != snapshot.version() {
-                snapshot
-                    .update(&self.log_store, Some(self.version as u64))
-                    .await?;
+                snapshot.update(&self.log_store, Some(self.version)).await?;
             }
 
             let mut state = DeltaTableState { snapshot };
@@ -820,61 +1044,47 @@ impl PostCommit {
                 state.table_config().enable_expired_log_cleanup()
             };
 
-            // Run arbitrary before_post_commit_hook code
-            if let Some(custom_execute_handler) = &self.custom_execute_handler {
-                custom_execute_handler
-                    .before_post_commit_hook(
-                        &self.log_store,
-                        cleanup_logs || self.create_checkpoint,
-                        post_commit_operation_id,
-                    )
-                    .await?
-            }
-
             let mut new_checkpoint_created = false;
-            if self.create_checkpoint {
-                // Execute create checkpoint hook
-                new_checkpoint_created = self
-                    .create_checkpoint(
-                        &state,
-                        &self.log_store,
-                        self.version,
-                        post_commit_operation_id,
-                    )
-                    .await?;
-            }
-
             let mut num_log_files_cleaned_up: u64 = 0;
-            if cleanup_logs {
-                // Execute clean up logs hook
-                num_log_files_cleaned_up = cleanup_expired_logs_for(
-                    self.version,
-                    self.log_store.as_ref(),
-                    Utc::now().timestamp_millis()
-                        - state.table_config().log_retention_duration().as_millis() as i64,
-                    Some(post_commit_operation_id),
-                )
-                .await? as u64;
-                if num_log_files_cleaned_up > 0 {
-                    state = DeltaTableState::try_new(
-                        &self.log_store,
-                        state.load_config().clone(),
-                        Some(self.version),
-                    )
+
+            if self.create_checkpoint || cleanup_logs {
+                let version = self.version;
+                let create_checkpoint = self.create_checkpoint;
+                let checkpoint_interval = state.config().checkpoint_interval().get();
+                let cutoff_timestamp = Utc::now().timestamp_millis()
+                    - state.table_config().log_retention_duration().as_millis() as i64;
+
+                // File-only work runs in a sibling scope. The operation-scoped store forwards
+                // `begin_operation` to its parent, so on an isolating backend this is a second
+                // isolated write set that is published on success and discarded on error.
+                let (checkpoint_created, files_cleaned_up) =
+                    with_operation(&self.log_store, |log_store| async move {
+                        let mut checkpoint_created = false;
+                        if create_checkpoint {
+                            checkpoint_created =
+                                maybe_create_checkpoint(checkpoint_interval, version, &log_store)
+                                    .await?;
+                        }
+                        let mut files_cleaned_up: u64 = 0;
+                        if cleanup_logs {
+                            files_cleaned_up = cleanup_expired_logs_for(
+                                version,
+                                log_store.as_ref(),
+                                cutoff_timestamp,
+                            )
+                            .await? as u64;
+                        }
+                        Ok((checkpoint_created, files_cleaned_up))
+                    })
                     .await?;
+
+                new_checkpoint_created = checkpoint_created;
+                num_log_files_cleaned_up = files_cleaned_up;
+                if num_log_files_cleaned_up > 0 {
+                    state = DeltaTableState::try_new(&self.log_store, Some(self.version)).await?;
                 }
             }
 
-            // Run arbitrary after_post_commit_hook code
-            if let Some(custom_execute_handler) = &self.custom_execute_handler {
-                custom_execute_handler
-                    .after_post_commit_hook(
-                        &self.log_store,
-                        cleanup_logs || self.create_checkpoint,
-                        post_commit_operation_id,
-                    )
-                    .await?
-            }
             Ok((
                 state,
                 PostCommitMetrics {
@@ -883,9 +1093,7 @@ impl PostCommit {
                 },
             ))
         } else {
-            let state =
-                DeltaTableState::try_new(&self.log_store, Default::default(), Some(self.version))
-                    .await?;
+            let state = DeltaTableState::try_new(&self.log_store, Some(self.version)).await?;
             Ok((
                 state,
                 PostCommitMetrics {
@@ -895,25 +1103,19 @@ impl PostCommit {
             ))
         }
     }
-    async fn create_checkpoint(
-        &self,
-        table_state: &DeltaTableState,
-        log_store: &LogStoreRef,
-        version: i64,
-        operation_id: Uuid,
-    ) -> DeltaResult<bool> {
-        if !table_state.load_config().require_files {
-            warn!("Checkpoint creation in post_commit_hook has been skipped due to table being initialized without files.");
-            return Ok(false);
-        }
+}
 
-        let checkpoint_interval = table_state.config().checkpoint_interval().get() as i64;
-        if ((version + 1) % checkpoint_interval) == 0 {
-            create_checkpoint_for(version as u64, log_store.as_ref(), Some(operation_id)).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+/// Create a checkpoint for `version` when the table's checkpoint interval says so.
+async fn maybe_create_checkpoint(
+    checkpoint_interval: u64,
+    version: Version,
+    log_store: &LogStoreRef,
+) -> DeltaResult<bool> {
+    if (version + 1).is_multiple_of(checkpoint_interval) {
+        create_checkpoint_for(version, log_store.as_ref()).await?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -923,7 +1125,7 @@ pub struct FinalizedCommit {
     pub snapshot: DeltaTableState,
 
     /// Version of the finalized commit
-    pub version: i64,
+    pub version: Version,
 
     /// Metrics associated with the commit operation
     pub metrics: Metrics,
@@ -944,7 +1146,7 @@ impl FinalizedCommit {
         self.snapshot.clone()
     }
     /// Version of the finalized commit
-    pub fn version(&self) -> i64 {
+    pub fn version(&self) -> Version {
         self.version
     }
 }
@@ -978,17 +1180,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::logstore::{commit_uri_from_version, default_logstore::DefaultLogStore, LogStore};
-    use object_store::{memory::InMemory, ObjectStore, PutPayload};
+    use crate::kernel::IsolationLevel;
+    use crate::logstore::{LogStore, StorageConfig, default_logstore::DefaultLogStore};
+    use crate::protocol::SaveMode;
+    use object_store::{PutPayload, memory::InMemory};
+    use serde_json::json;
     use url::Url;
-
-    #[test]
-    fn test_commit_uri_from_version() {
-        let version = commit_uri_from_version(0);
-        assert_eq!(version, Path::from("_delta_log/00000000000000000000.json"));
-        let version = commit_uri_from_version(123);
-        assert_eq!(version, Path::from("_delta_log/00000000000000000123.json"))
-    }
 
     #[tokio::test]
     async fn test_try_commit_transaction() {
@@ -997,33 +1194,25 @@ mod tests {
         let log_store = DefaultLogStore::new(
             store.clone(),
             store.clone(),
-            crate::logstore::LogStoreConfig {
-                location: url,
-                options: Default::default(),
-            },
+            crate::logstore::LogStoreConfig::new(&url, StorageConfig::default()),
         );
         let version_path = Path::from("_delta_log/00000000000000000000.json");
         store.put(&version_path, PutPayload::new()).await.unwrap();
 
-        let res = log_store
-            .write_commit_entry(
-                0,
-                CommitOrBytes::LogBytes(PutPayload::new().into()),
-                Uuid::new_v4(),
-            )
-            .await;
-        // fails if file version already exists
-        assert!(res.is_err());
-
-        // succeeds for next version
-        log_store
-            .write_commit_entry(
-                1,
-                CommitOrBytes::LogBytes(PutPayload::new().into()),
-                Uuid::new_v4(),
-            )
+        let committer = log_store.committer();
+        let res = committer
+            .commit(0, CommitOrBytes::LogBytes(PutPayload::new().into()))
             .await
             .unwrap();
+        // conflicts if file version already exists
+        assert_eq!(res, CommitResponse::Conflict { version: 0 });
+
+        // succeeds for next version
+        let res = committer
+            .commit(1, CommitOrBytes::LogBytes(PutPayload::new().into()))
+            .await
+            .unwrap();
+        assert_eq!(res, CommitResponse::Committed);
     }
 
     #[test]
@@ -1061,5 +1250,220 @@ mod tests {
     fn test_commit_metrics() {
         let metrics = CommitMetrics { num_retries: 3 };
         assert_eq!(metrics.num_retries, 3);
+    }
+
+    #[test]
+    fn test_commit_data_client_version() {
+        let no_metadata = CommitData::new(
+            vec![],
+            DeltaOperation::FileSystemCheck {},
+            HashMap::new(),
+            vec![],
+        );
+        assert_eq!(
+            *no_metadata.app_metadata.get("clientVersion").unwrap(),
+            json!(format!("delta-rs.{}", crate_version()))
+        );
+
+        let with_metadata = CommitData::new(
+            vec![],
+            DeltaOperation::FileSystemCheck {},
+            HashMap::from([("clientVersion".to_owned(), json!("test-client.0.0.1"))]),
+            vec![],
+        );
+        assert_eq!(
+            *with_metadata.app_metadata.get("clientVersion").unwrap(),
+            json!("test-client.0.0.1")
+        );
+    }
+
+    fn commit_info(data: &CommitData) -> &CommitInfo {
+        match &data.actions[0] {
+            Action::CommitInfo(info) => info,
+            action => panic!("expected first action to be commitInfo, got {action:?}"),
+        }
+    }
+
+    #[test]
+    fn test_commit_data_strips_and_promotes_reserved_metadata() {
+        let data = CommitData::new(
+            vec![],
+            DeltaOperation::FileSystemCheck {},
+            HashMap::from([
+                ("readVersion".to_owned(), json!(7)),
+                ("userId".to_owned(), json!("user-1")),
+                ("userName".to_owned(), json!("Jane Doe")),
+                ("userMetadata".to_owned(), json!("metadata")),
+                ("isolationLevel".to_owned(), json!("SnapshotIsolation")),
+                ("isBlindAppend".to_owned(), json!(true)),
+                ("timestamp".to_owned(), json!(1)),
+                ("operation".to_owned(), json!("CUSTOM OPERATION")),
+                ("engineInfo".to_owned(), json!("custom-engine")),
+                ("custom".to_owned(), json!({"kept": true})),
+            ]),
+            vec![],
+        );
+
+        let info = commit_info(&data);
+        assert_eq!(info.read_version, Some(7));
+        assert_eq!(info.user_id.as_deref(), Some("user-1"));
+        assert_eq!(info.user_name.as_deref(), Some("Jane Doe"));
+        assert_eq!(info.user_metadata.as_deref(), Some("metadata"));
+        assert_eq!(
+            info.isolation_level,
+            Some(IsolationLevel::SnapshotIsolation)
+        );
+        assert_eq!(info.is_blind_append, Some(true));
+        assert_eq!(info.operation.as_deref(), Some("FSCK"));
+        assert_ne!(info.engine_info.as_deref(), Some("custom-engine"));
+        assert_eq!(info.info.get("custom"), Some(&json!({"kept": true})));
+
+        for key in [
+            "timestamp",
+            "userId",
+            "userName",
+            "operation",
+            "operationParameters",
+            "readVersion",
+            "isolationLevel",
+            "isBlindAppend",
+            "engineInfo",
+            "userMetadata",
+        ] {
+            assert!(
+                !info.info.contains_key(key),
+                "reserved key {key} must not remain in flattened commit info"
+            );
+        }
+    }
+
+    #[test]
+    fn test_commit_data_merges_operation_parameters_generated_keys_win() {
+        let data = CommitData::new(
+            vec![],
+            DeltaOperation::Write {
+                mode: SaveMode::Overwrite,
+                partition_by: Some(vec!["id".to_owned()]),
+                predicate: None,
+            },
+            HashMap::from([(
+                "operationParameters".to_owned(),
+                json!({
+                    "mode": "custom-mode",
+                    "partitionBy": "custom-partitioning",
+                    "customParameter": {"kept": true},
+                    "customBoolean": true,
+                    "customNumber": 7,
+                }),
+            )]),
+            vec![],
+        );
+
+        let info = commit_info(&data);
+        let operation_parameters = info
+            .operation_parameters
+            .as_ref()
+            .expect("operation parameters should be present");
+        assert_eq!(operation_parameters.get("mode"), Some(&json!("Overwrite")));
+        assert_eq!(
+            operation_parameters.get("partitionBy"),
+            Some(&json!("[\"id\"]"))
+        );
+        assert_eq!(
+            operation_parameters.get("customParameter"),
+            Some(&json!("{\"kept\":true}"))
+        );
+        assert_eq!(
+            operation_parameters.get("customBoolean"),
+            Some(&json!("true"))
+        );
+        assert_eq!(operation_parameters.get("customNumber"), Some(&json!("7")));
+        assert!(!info.info.contains_key("operationParameters"));
+    }
+
+    #[test]
+    fn test_commit_data_normalizes_reserved_keys_from_existing_commit_info_info() {
+        let data = CommitData::new(
+            vec![Action::CommitInfo(CommitInfo {
+                info: HashMap::from([
+                    ("userName".to_owned(), json!("shadow-user")),
+                    (
+                        "operationParameters".to_owned(),
+                        json!({"custom": {"kept": true}}),
+                    ),
+                    ("custom".to_owned(), json!("kept")),
+                ]),
+                ..Default::default()
+            })],
+            DeltaOperation::FileSystemCheck {},
+            HashMap::from([("custom".to_owned(), json!("metadata-wins"))]),
+            vec![],
+        );
+
+        let info = commit_info(&data);
+        assert_eq!(info.user_name.as_deref(), Some("shadow-user"));
+        let operation_parameters = info
+            .operation_parameters
+            .as_ref()
+            .expect("operation parameters should be promoted");
+        assert_eq!(
+            operation_parameters.get("custom"),
+            Some(&json!("{\"kept\":true}"))
+        );
+        assert_eq!(info.info.get("custom"), Some(&json!("metadata-wins")));
+        assert!(!info.info.contains_key("userName"));
+        assert!(!info.info.contains_key("operationParameters"));
+    }
+
+    #[test]
+    fn test_commit_data_does_not_promote_reserved_metadata_over_typed_fields() {
+        let data = CommitData::new(
+            vec![Action::CommitInfo(CommitInfo {
+                user_name: Some("typed-user".to_owned()),
+                read_version: Some(10),
+                ..Default::default()
+            })],
+            DeltaOperation::FileSystemCheck {},
+            HashMap::from([
+                ("userName".to_owned(), json!("metadata-user")),
+                ("readVersion".to_owned(), json!(11)),
+                ("custom".to_owned(), json!("kept")),
+            ]),
+            vec![],
+        );
+
+        let info = commit_info(&data);
+        assert_eq!(info.user_name.as_deref(), Some("typed-user"));
+        assert_eq!(info.read_version, Some(10));
+        assert!(!info.info.contains_key("userName"));
+        assert!(!info.info.contains_key("readVersion"));
+        assert_eq!(info.info.get("custom"), Some(&json!("kept")));
+    }
+
+    #[test]
+    fn test_commit_data_strips_wrong_typed_reserved_metadata_without_clobbering_typed_fields() {
+        let data = CommitData::new(
+            vec![Action::CommitInfo(CommitInfo {
+                user_name: Some("typed-user".to_owned()),
+                read_version: Some(10),
+                ..Default::default()
+            })],
+            DeltaOperation::FileSystemCheck {},
+            HashMap::from([
+                ("userName".to_owned(), json!(123)),
+                ("readVersion".to_owned(), json!("abc")),
+                ("isBlindAppend".to_owned(), json!("not-a-bool")),
+                ("custom".to_owned(), json!("kept")),
+            ]),
+            vec![],
+        );
+
+        let info = commit_info(&data);
+        assert_eq!(info.user_name.as_deref(), Some("typed-user"));
+        assert_eq!(info.read_version, Some(10));
+        assert_eq!(info.info.get("custom"), Some(&json!("kept")));
+        assert!(!info.info.contains_key("userName"));
+        assert!(!info.info.contains_key("readVersion"));
+        assert!(!info.info.contains_key("isBlindAppend"));
     }
 }

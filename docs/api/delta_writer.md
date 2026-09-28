@@ -4,9 +4,12 @@ search:
 ---
 
 # Writer
+
 ## Write to Delta Tables
 
 ::: deltalake.write_deltalake
+
+::: deltalake.TableProperty
 
 ::: deltalake.BloomFilterProperties
 
@@ -15,6 +18,6 @@ search:
 ::: deltalake.WriterProperties
 
 ## Convert to Delta Tables
-::: deltalake.convert_to_deltalake
 
+::: deltalake.convert_to_deltalake
 

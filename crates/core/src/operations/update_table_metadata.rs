@@ -1,16 +1,14 @@
 //! Update table metadata operation
 
-use std::sync::Arc;
-
 use futures::future::BoxFuture;
 use validator::Validate;
 
-use super::{CustomExecuteHandler, Operation};
-use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::{resolve_snapshot, Action, EagerSnapshot, MetadataExt};
-use crate::logstore::LogStoreRef;
-use crate::protocol::DeltaOperation;
 use crate::DeltaTable;
+use crate::kernel::transaction::CommitProperties;
+use crate::kernel::{Action, EagerSnapshot, MetadataExt, SnapshotMetadataRef, resolve_snapshot};
+use crate::logstore::LogStoreRef;
+use crate::operations::commit_actions_in_scope;
+use crate::protocol::DeltaOperation;
 use crate::{DeltaResult, DeltaTableError};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Validate)]
@@ -18,14 +16,18 @@ use crate::{DeltaResult, DeltaTableError};
     function = "validate_at_least_one_field",
     message = "No metadata update specified"
 ))]
+/// A validated set of metadata fields to update on a Delta table.
+///
+/// At least one field must be provided; lengths are validated to stay within Delta's limits.
 pub struct TableMetadataUpdate {
+    /// New table name. When set, must be 1-255 characters.
     #[validate(length(
         min = 1,
         max = 255,
         message = "Table name cannot be empty and cannot exceed 255 characters"
     ))]
     pub name: Option<String>,
-
+    /// New table description. When set, must be at most 4000 characters.
     #[validate(length(
         max = 4000,
         message = "Table description cannot exceed 4000 characters"
@@ -52,16 +54,6 @@ pub struct UpdateTableMetadataBuilder {
     log_store: LogStoreRef,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
-    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
-}
-
-impl super::Operation for UpdateTableMetadataBuilder {
-    fn log_store(&self) -> &LogStoreRef {
-        &self.log_store
-    }
-    fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>> {
-        self.custom_execute_handler.clone()
-    }
 }
 
 impl UpdateTableMetadataBuilder {
@@ -72,7 +64,6 @@ impl UpdateTableMetadataBuilder {
             snapshot,
             log_store,
             commit_properties: CommitProperties::default(),
-            custom_execute_handler: None,
         }
     }
 
@@ -87,12 +78,26 @@ impl UpdateTableMetadataBuilder {
         self.commit_properties = commit_properties;
         self
     }
+}
 
-    /// Set a custom execute handler, for pre and post execution
-    pub fn with_custom_execute_handler(mut self, handler: Arc<dyn CustomExecuteHandler>) -> Self {
-        self.custom_execute_handler = Some(handler);
-        self
+fn plan_update_table_metadata_actions(
+    snapshot: SnapshotMetadataRef<'_>,
+    update: TableMetadataUpdate,
+) -> DeltaResult<(Vec<Action>, DeltaOperation)> {
+    let mut metadata = snapshot.metadata.clone();
+
+    if let Some(name) = &update.name {
+        metadata = metadata.with_name(name.clone())?;
     }
+    if let Some(description) = &update.description {
+        metadata = metadata.with_description(description.clone())?;
+    }
+
+    let operation = DeltaOperation::UpdateTableMetadata {
+        metadata_update: update,
+    };
+
+    Ok((vec![Action::Metadata(metadata)], operation))
 }
 
 impl std::future::IntoFuture for UpdateTableMetadataBuilder {
@@ -104,10 +109,7 @@ impl std::future::IntoFuture for UpdateTableMetadataBuilder {
         let this = self;
 
         Box::pin(async move {
-            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), false).await?;
-
-            let operation_id = this.get_operation_id();
-            this.pre_execute(operation_id).await?;
+            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), None).await?;
 
             let update = this.update.ok_or_else(|| {
                 DeltaTableError::MetadataError("No metadata update specified".to_string())
@@ -116,35 +118,17 @@ impl std::future::IntoFuture for UpdateTableMetadataBuilder {
                 .validate()
                 .map_err(|e| DeltaTableError::MetadataError(format!("{e}")))?;
 
-            let mut metadata = snapshot.metadata().clone();
+            let (actions, operation) =
+                plan_update_table_metadata_actions(snapshot.snapshot().metadata_state(), update)?;
 
-            if let Some(name) = &update.name {
-                metadata = metadata.with_name(name.clone())?;
-            }
-            if let Some(description) = &update.description {
-                metadata = metadata.with_description(description.clone())?;
-            }
-
-            let operation = DeltaOperation::UpdateTableMetadata {
-                metadata_update: update,
-            };
-
-            let actions = vec![Action::Metadata(metadata)];
-
-            let commit = CommitBuilder::from(this.commit_properties.clone())
-                .with_actions(actions)
-                .with_operation_id(operation_id)
-                .with_post_commit_hook_handler(this.custom_execute_handler.clone())
-                .build(Some(&snapshot), this.log_store.clone(), operation.clone())
-                .await?;
-
-            if let Some(handler) = this.custom_execute_handler {
-                handler.post_execute(&this.log_store, operation_id).await?;
-            }
-            Ok(DeltaTable::new_with_state(
-                this.log_store,
-                commit.snapshot(),
-            ))
+            commit_actions_in_scope(
+                &this.log_store,
+                &snapshot,
+                this.commit_properties,
+                actions,
+                operation,
+            )
+            .await
         })
     }
 }

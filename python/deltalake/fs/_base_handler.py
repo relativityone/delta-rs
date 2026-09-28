@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 class BaseDeltaStorageHandler:
     """
-    BaseDeltaStorageHandler is a concrete implementations of a PyArrow FileSystemHandler.
+    BaseDeltaStorageHandler is a implementations of a PyArrow FileSystemHandler.
     """
 
     def __init__(
@@ -40,12 +40,12 @@ class BaseDeltaStorageHandler:
     def get_type_name(self) -> str:
         return self._handler.get_type_name()
 
-    def copy_file(self, src: str, dst: str) -> None:
+    def copy_file(self, src: str, dest: str) -> None:
         """Copy a file.
 
         If the destination exists and is a directory, an error is returned. Otherwise, it is replaced.
         """
-        return self._handler.copy_file(src=src, dst=dst)
+        return self._handler.copy_file(src=src, dest=dest)
 
     def create_dir(self, path: str, recursive: bool = True) -> None:
         """Create a directory and subdirectories.

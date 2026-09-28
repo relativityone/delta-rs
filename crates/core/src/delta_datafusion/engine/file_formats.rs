@@ -1,26 +1,24 @@
 use std::sync::Arc;
 
-use dashmap::{mapref::one::Ref, DashMap};
+use dashmap::{DashMap, mapref::one::Ref};
 use datafusion::execution::{
-    object_store::{ObjectStoreRegistry, ObjectStoreUrl},
     TaskContext,
+    object_store::{ObjectStoreRegistry, ObjectStoreUrl},
 };
 use delta_kernel::engine::parse_json as arrow_parse_json;
 use delta_kernel::{
-    engine::default::{
-        executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor},
-        json::DefaultJsonHandler,
-        parquet::DefaultParquetHandler,
-    },
-    error::DeltaResult as KernelResult,
-    schema::SchemaRef,
     EngineData, FileDataReadResultIterator, FileMeta, FilteredEngineData, JsonHandler,
-    ParquetHandler, PredicateRef,
+    ParquetHandler, PredicateRef, error::DeltaResult as KernelResult, schema::SchemaRef,
+};
+use delta_kernel_default_engine::{
+    executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor},
+    json::DefaultJsonHandler,
+    parquet::DefaultParquetHandler,
 };
 use itertools::Itertools;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
-use super::storage::{group_by_store, AsObjectStoreUrl};
+use super::storage::{AsObjectStoreUrl, group_by_store};
 
 #[derive(Clone)]
 pub struct DataFusionFileFormatHandler {
@@ -128,6 +126,19 @@ impl ParquetHandler for DataFusionFileFormatHandler {
                 .flatten(),
         ))
     }
+
+    fn write_parquet_file(
+        &self,
+        _location: url::Url,
+        _data: Box<dyn Iterator<Item = KernelResult<Box<dyn EngineData>>> + Send>,
+    ) -> KernelResult<()> {
+        todo!("write parquet file")
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<delta_kernel::ParquetFooter> {
+        self.get_or_create_pq(file.as_object_store_url())?
+            .read_parquet_footer(file)
+    }
 }
 
 impl JsonHandler for DataFusionFileFormatHandler {
@@ -170,7 +181,7 @@ impl JsonHandler for DataFusionFileFormatHandler {
         path: &url::Url,
         data: Box<dyn Iterator<Item = KernelResult<FilteredEngineData>> + Send + '_>,
         overwrite: bool,
-    ) -> KernelResult<()> {
+    ) -> KernelResult<u64> {
         self.get_or_create_json(path.as_object_store_url())?
             .write_json_file(path, data, overwrite)
     }

@@ -1,6 +1,7 @@
 use chrono::Utc;
 use deltalake_core::errors::DeltaTableError;
 use deltalake_core::logstore::LogStore;
+use deltalake_core::logstore::object_store::ObjectStoreExt as _;
 use deltalake_core::table::builder::DeltaTableBuilder;
 use deltalake_gcp::register_handlers;
 use deltalake_test::utils::*;
@@ -33,8 +34,8 @@ pub async fn sync_stores(
     from_store: Arc<dyn LogStore>,
     to_store: Arc<dyn LogStore>,
 ) -> Result<(), DeltaTableError> {
-    let from_store = from_store.object_store(None).clone();
-    let to_store = to_store.object_store(None).clone();
+    let from_store = from_store.object_store().clone();
+    let to_store = to_store.object_store().clone();
     // TODO if a table is copied within the same root store (i.e bucket), using copy would be MUCH more efficient
     let mut meta_stream = from_store.list(None);
     while let Some(file) = meta_stream.next().await {
@@ -54,12 +55,12 @@ pub async fn copy_table(
     allow_http: bool,
 ) -> Result<(), DeltaTableError> {
     let from_url = deltalake_core::table::builder::parse_table_uri(from)?;
-    let from_store = DeltaTableBuilder::from_uri(from_url)?
+    let from_store = DeltaTableBuilder::from_url(from_url)?
         .with_storage_options(from_options.unwrap_or_default())
         .with_allow_http(allow_http)
         .build_storage()?;
     let to_url = deltalake_core::table::builder::parse_table_uri(to)?;
-    let to_store = DeltaTableBuilder::from_uri(to_url)?
+    let to_store = DeltaTableBuilder::from_url(to_url)?
         .with_storage_options(to_options.unwrap_or_default())
         .with_allow_http(allow_http)
         .build_storage()?;

@@ -1,15 +1,14 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use deltalake::{
-    datafusion::prelude::SessionContext,
-    delta_datafusion::{
-        DataFusionMixins, DeltaScanConfigBuilder, DeltaSessionConfig, DeltaTableProvider,
-    },
+    datafusion::{catalog::TableProvider, prelude::SessionContext},
+    delta_datafusion::{DeltaScanConfig, DeltaScanNext, DeltaSessionContext},
 };
 use pyo3::prelude::*;
 use pyo3_arrow::PyRecordBatchReader;
 
-use crate::{convert_stream_to_reader, error::PythonError, utils::rt, RawDeltaTable};
+use crate::{RawDeltaTable, convert_stream_to_reader, error::PythonError, utils::rt};
 
 /// PyQueryBuilder supports the _experimental_ `QueryBuilder` Python interface which allows users
 /// to take advantage of the [Apache DataFusion](https://datafusion.apache.org) engine already
@@ -24,11 +23,16 @@ pub(crate) struct PyQueryBuilder {
 #[pymethods]
 impl PyQueryBuilder {
     #[new]
-    pub fn new() -> Self {
-        let config = DeltaSessionConfig::default().into();
-        let ctx = SessionContext::new_with_config(config);
+    #[pyo3(signature = (session_config = None))]
+    pub fn new(session_config: Option<HashMap<String, String>>) -> PyResult<Self> {
+        let delta_ctx = match session_config {
+            Some(overrides) => DeltaSessionContext::new_with_session_overrides(&overrides)
+                .map_err(PythonError::from)?,
+            None => DeltaSessionContext::new(),
+        };
+        let ctx = delta_ctx.into_inner();
 
-        PyQueryBuilder { ctx }
+        Ok(PyQueryBuilder { ctx })
     }
 
     /// Register the given [RawDeltaTable] into the [SessionContext] using the provided
@@ -39,16 +43,14 @@ impl PyQueryBuilder {
     pub fn register(&self, table_name: &str, delta_table: &RawDeltaTable) -> PyResult<()> {
         let snapshot = delta_table.cloned_state()?;
         let log_store = delta_table.log_store()?;
+        let url = log_store.root_url();
 
-        let scan_config = DeltaScanConfigBuilder::default()
-            .with_schema(snapshot.input_schema())
-            .build(&snapshot)
-            .map_err(PythonError::from)?;
+        self.ctx
+            .register_object_store(url, log_store.root_object_store());
 
-        let provider = Arc::new(
-            DeltaTableProvider::try_new(snapshot, log_store, scan_config)
-                .map_err(PythonError::from)?,
-        );
+        let config = DeltaScanConfig::new().with_wrap_partition_values(false);
+        let provider = Arc::new(DeltaScanNext::new(snapshot, config).map_err(PythonError::from)?)
+            as Arc<dyn TableProvider>;
 
         self.ctx
             .register_table(table_name, provider)
@@ -63,7 +65,7 @@ impl PyQueryBuilder {
     /// instances, it may result unexpected memory consumption for queries which return large data
     /// sets.
     pub fn execute(&self, py: Python, sql: &str) -> PyResult<PyRecordBatchReader> {
-        let stream = py.allow_threads(|| {
+        let stream = py.detach(|| {
             rt().block_on(async {
                 let df = self.ctx.sql(sql).await?;
                 df.execute_stream().await

@@ -1,3 +1,4 @@
+import json
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -9,6 +10,19 @@ from deltalake.table import DeltaTable
 
 if TYPE_CHECKING:
     import pyarrow as pa
+
+
+def _strip_add_stats(table_path: pathlib.Path) -> None:
+    # Simulates a writer that elided optional Add.stats per Delta spec.
+    log_path = table_path / "_delta_log" / "00000000000000000000.json"
+    rewritten_lines = []
+    for line in log_path.read_text().splitlines():
+        payload = json.loads(line)
+        if "add" in payload:
+            payload["add"].pop("stats", None)
+        rewritten_lines.append(json.dumps(payload, separators=(",", ":")))
+
+    log_path.write_text("\n".join(rewritten_lines) + "\n")
 
 
 def test_delete_no_predicates(existing_sample_table: DeltaTable):
@@ -29,7 +43,7 @@ def test_delete_no_predicates(existing_sample_table: DeltaTable):
     data = qb.execute("select * from tbl").read_all()
 
     assert data.num_rows == 0
-    assert len(existing_sample_table.files()) == 0
+    assert len(existing_sample_table.file_uris()) == 0
 
 
 @pytest.mark.pyarrow
@@ -51,7 +65,58 @@ def test_delete_a_partition(tmp_path: pathlib.Path, sample_data_pyarrow: "pa.Tab
 
     table = dt.to_pyarrow_table()
     assert table.equals(expected_table)
-    assert len(dt.files()) == 1
+    assert len(dt.file_uris()) == 1
+
+
+@pytest.mark.pyarrow
+def test_delete_partition_only_reports_deleted_rows_when_stats_exist(
+    tmp_path: pathlib.Path,
+):
+    import pyarrow as pa
+
+    write_deltalake(
+        tmp_path,
+        pa.table(
+            {
+                "part": pa.array(["a", "a", "a", "b"]),
+                "value": pa.array([1, 2, 3, 4], pa.int64()),
+            }
+        ),
+        partition_by=["part"],
+    )
+
+    dt = DeltaTable(tmp_path)
+    metrics = dt.delete(predicate="part = 'a'")
+
+    assert metrics["num_removed_files"] == 1
+    assert metrics["num_deleted_rows"] == 3
+    assert metrics["num_copied_rows"] == 0
+
+
+@pytest.mark.pyarrow
+def test_delete_partition_only_omits_deleted_rows_when_stats_missing(
+    tmp_path: pathlib.Path,
+):
+    import pyarrow as pa
+
+    write_deltalake(
+        tmp_path,
+        pa.table(
+            {
+                "part": pa.array(["a", "a", "a", "b"]),
+                "value": pa.array([1, 2, 3, 4], pa.int64()),
+            }
+        ),
+        partition_by=["part"],
+    )
+    _strip_add_stats(tmp_path)
+
+    dt = DeltaTable(tmp_path)
+    metrics = dt.delete(predicate="part = 'a'")
+
+    assert metrics["num_removed_files"] == 1
+    assert "num_deleted_rows" not in metrics
+    assert metrics["num_copied_rows"] == 0
 
 
 @pytest.mark.pyarrow
@@ -133,3 +198,42 @@ def test_delete_stats_columns_stats_provided(tmp_path: pathlib.Path):
 
     with pytest.raises(Exception):
         get_value("null_count.bar")
+
+
+@pytest.mark.pandas
+def test_delete_concurrent_with_non_overlapping_append(tmp_path: pathlib.Path):
+    """A delete must not report an error for a commit that succeeded.
+
+    Regression test for https://github.com/delta-io/delta-rs/issues/2509.
+    """
+    import pandas as pd
+
+    df = pd.DataFrame.from_dict({"k": [1], "v": [1]})
+    write_deltalake(tmp_path, df, mode="overwrite")
+
+    # Read the table before the append, so that the delete below is concurrent.
+    table_2 = DeltaTable(tmp_path)
+
+    data_1 = pd.DataFrame.from_dict({"k": [3], "v": [-3]})
+    write_deltalake(tmp_path, data_1, mode="append")
+
+    table_2.delete("k = 1")
+
+    assert table_2.version() == 2
+    assert table_2.history(1)[0]["operation"] == "DELETE"
+
+    from deltalake.query import QueryBuilder
+
+    expected = Table.from_pydict(
+        {
+            "k": Array([3], Field("k", type=DataType.int64(), nullable=True)),
+            "v": Array([-3], Field("v", type=DataType.int64(), nullable=True)),
+        }
+    )
+    result = (
+        QueryBuilder()
+        .register("tbl", DeltaTable(tmp_path))
+        .execute("select k, v from tbl")
+        .read_all()
+    )
+    assert result == expected

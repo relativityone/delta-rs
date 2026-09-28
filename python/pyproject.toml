@@ -7,11 +7,10 @@ name = "deltalake"
 description = "Native Delta Lake Python binding based on delta-rs with Pandas integration"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["deltalake", "delta", "datalake", "pandas", "arrow"]
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -22,7 +21,7 @@ dependencies = ["arro3-core>=0.5.0", "deprecated>=1.2.18"]
 
 [project.optional-dependencies]
 pandas = ["pandas"]
-pyarrow = ["pyarrow>=16"]
+pyarrow = ["pyarrow>=21"]
 
 [project.urls]
 documentation = "https://delta-io.github.io/delta-rs/"
@@ -88,6 +87,7 @@ markers = [
     "unitycatalog_databricks: marks tests that require unitycatalog_databricks",
     "unitycatalog_oss: marks tests that require unitycatalog_oss",
     "pyspark: marks tests that require pyspark",
+    "datafusion: marks tests that require datafusion"
 ]
 
 [tool.coverage.run]
@@ -96,6 +96,7 @@ source = ["deltalake"]
 
 [dependency-groups]
 dev = [
+    "arro3-io",
     "pytest",
     "pytest-benchmark",
     "pytest-cov",
@@ -108,14 +109,14 @@ dev = [
     "testcontainers[minio]>=4.13.0",
 ]
 opentelemetry = ["opentelemetry-sdk>=1.20.0", "opentelemetry-api>=1.20.0"]
-polars = ["polars==1.32"]
+polars = ["polars==1.44.2"]
 lakefs = ["lakefs==0.8.0"]
 pyspark = [
-    "pyspark",
+    "pyspark==4.0.1",
     "delta-spark",
+    "pandas<3",
     "numpy==1.26.4", # pyspark is not compatible with latest numpy
 ]
-docs = ["sphinx<=4.5", "sphinx-rtd-theme"]
 other = [
     "azure-storage-blob==12.20.0",
     "packaging>=20",
@@ -123,6 +124,16 @@ other = [
     "wheel",
     "pip>=24.0",
 ]
+# For bench/streamed_merge, which needs LazyFrame.sink_delta (Polars 1.37 or newer).
+bench = [
+    { include-group = "polars" },
+    "duckdb",
+    # The version comes from the pyarrow extra.
+    "pyarrow",
+    "great_tables>=0.24",
+    "reactable>=0.1.6",
+]
 
 [tool.uv]
-default-groups = ["dev", "opentelemetry", "polars", "lakefs", "docs", "other"]
+# Re-enable a Python DataFusion dependency group once DataFusion 55 wheels are published.
+default-groups = ["dev", "opentelemetry", "polars", "lakefs", "other"]

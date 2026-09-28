@@ -1,17 +1,21 @@
 //! Set table properties on a table
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use futures::future::BoxFuture;
 
-use super::{CustomExecuteHandler, Operation};
-use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::{resolve_snapshot, Action, EagerSnapshot, MetadataExt as _, ProtocolExt as _};
-use crate::logstore::LogStoreRef;
-use crate::protocol::DeltaOperation;
 use crate::DeltaResult;
 use crate::DeltaTable;
+use crate::errors::{ColumnMappingOperation, DeltaTableError};
+use crate::kernel::transaction::CommitProperties;
+use crate::kernel::{
+    Action, EagerSnapshot, MetadataExt as _, ProtocolExt as _, SnapshotMetadataRef,
+    resolve_snapshot,
+};
+use crate::logstore::LogStoreRef;
+use crate::operations::commit_actions_in_scope;
+use crate::protocol::DeltaOperation;
+use crate::table::config::TableProperty;
 
 /// Remove constraints from the table
 pub struct SetTablePropertiesBuilder {
@@ -25,16 +29,6 @@ pub struct SetTablePropertiesBuilder {
     log_store: LogStoreRef,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
-    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
-}
-
-impl super::Operation for SetTablePropertiesBuilder {
-    fn log_store(&self) -> &LogStoreRef {
-        &self.log_store
-    }
-    fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>> {
-        self.custom_execute_handler.clone()
-    }
 }
 
 impl SetTablePropertiesBuilder {
@@ -46,7 +40,6 @@ impl SetTablePropertiesBuilder {
             snapshot,
             log_store,
             commit_properties: CommitProperties::default(),
-            custom_execute_handler: None,
         }
     }
 
@@ -67,12 +60,41 @@ impl SetTablePropertiesBuilder {
         self.commit_properties = commit_properties;
         self
     }
+}
 
-    /// Set a custom execute handler, for pre and post execution
-    pub fn with_custom_execute_handler(mut self, handler: Arc<dyn CustomExecuteHandler>) -> Self {
-        self.custom_execute_handler = Some(handler);
-        self
+fn plan_set_table_properties_actions(
+    snapshot: SnapshotMetadataRef<'_>,
+    properties: HashMap<String, String>,
+    raise_if_not_exists: bool,
+) -> DeltaResult<(Vec<Action>, DeltaOperation)> {
+    if properties.contains_key(TableProperty::ColumnMappingMode.as_ref()) {
+        return Err(DeltaTableError::unsupported_column_mapping(
+            ColumnMappingOperation::Write,
+            "SET TBLPROPERTIES delta.columnMapping.mode",
+        ));
     }
+
+    let mut metadata = snapshot.metadata.clone();
+    let current_protocol = snapshot.protocol;
+    let new_protocol = current_protocol
+        .clone()
+        .apply_properties_to_protocol(&properties, raise_if_not_exists)?;
+
+    for (key, value) in &properties {
+        metadata = metadata.add_config_key(key.clone(), value.to_string())?;
+    }
+
+    let final_protocol = new_protocol.move_table_properties_into_features(metadata.configuration());
+
+    let operation = DeltaOperation::SetTableProperties { properties };
+
+    let mut actions = vec![Action::Metadata(metadata)];
+
+    if current_protocol.ne(&final_protocol) {
+        actions.push(Action::Protocol(final_protocol));
+    }
+
+    Ok((actions, operation))
 }
 
 impl std::future::IntoFuture for SetTablePropertiesBuilder {
@@ -84,68 +106,72 @@ impl std::future::IntoFuture for SetTablePropertiesBuilder {
         let this = self;
 
         Box::pin(async move {
-            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), false).await?;
+            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), None).await?;
 
-            let operation_id = this.get_operation_id();
-            this.pre_execute(operation_id).await?;
-
-            let mut metadata = snapshot.metadata().clone();
-
-            let current_protocol = snapshot.protocol();
             let properties = this.properties;
+            let (actions, operation) = plan_set_table_properties_actions(
+                snapshot.snapshot().metadata_state(),
+                properties,
+                this.raise_if_not_exists,
+            )?;
 
-            let new_protocol = current_protocol
-                .clone()
-                .apply_properties_to_protocol(&properties, this.raise_if_not_exists)?;
-
-            for (key, value) in &properties {
-                metadata = metadata.add_config_key(key.clone(), value.to_string())?;
-            }
-
-            let final_protocol =
-                new_protocol.move_table_properties_into_features(metadata.configuration());
-
-            let operation = DeltaOperation::SetTableProperties { properties };
-
-            let mut actions = vec![Action::Metadata(metadata)];
-
-            if current_protocol.ne(&final_protocol) {
-                actions.push(Action::Protocol(final_protocol));
-            }
-
-            let commit = CommitBuilder::from(this.commit_properties.clone())
-                .with_actions(actions.clone())
-                .with_operation_id(operation_id)
-                .with_post_commit_hook_handler(this.custom_execute_handler.clone())
-                .build(Some(&snapshot), this.log_store.clone(), operation.clone())
-                .await?;
-
-            if let Some(handler) = this.custom_execute_handler {
-                handler.post_execute(&this.log_store, operation_id).await?;
-            }
-            Ok(DeltaTable::new_with_state(
-                this.log_store,
-                commit.snapshot(),
-            ))
+            commit_actions_in_scope(
+                &this.log_store,
+                &snapshot,
+                this.commit_properties,
+                actions,
+                operation,
+            )
+            .await
         })
     }
 }
 
 #[cfg(test)]
+/// Tests for the set-table-properties operation.
 pub mod tests {
     use crate::writer::test_utils::create_initialized_table;
-    use crate::DeltaOps;
     use std::collections::HashMap;
-    use std::env::temp_dir;
+    use tempfile::tempdir;
 
+    /// Verify that setting table properties is persisted to table metadata.
     #[tokio::test]
-    pub async fn test_set_tbl_properties() -> crate::DeltaResult<()> {
-        let temp_loc = temp_dir().join("test_table");
-        let ops = DeltaOps(create_initialized_table(temp_loc.to_str().unwrap(), &[]).await);
-        let props = HashMap::from([
-            ("delta.minReaderVersion".to_string(), "3".to_string()),
-            ("delta.minWriterVersion".to_string(), "7".to_string()),
-        ]);
+    async fn test_set_tbl_properties() -> crate::DeltaResult<()> {
+        let temp_loc = tempdir()?;
+        let ops = create_initialized_table(temp_loc.path().to_str().unwrap(), &[]).await;
+
+        // Test setting properties that enable features (should work with proper handling)
+        let props = HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]);
+        ops.set_tbl_properties().with_properties(props).await?;
+
+        Ok(())
+    }
+
+    /// Test setting protocol versions with features properly handled.
+    #[tokio::test]
+    async fn test_set_protocol_versions_with_features() -> crate::DeltaResult<()> {
+        let temp_loc = tempdir()?;
+        let ops = create_initialized_table(temp_loc.path().to_str().unwrap(), &[]).await;
+
+        // Test enabling features that automatically set appropriate protocol versions
+        let props = HashMap::from([(
+            "delta.enableDeletionVectors".to_string(),
+            "true".to_string(),
+        )]);
+        ops.set_tbl_properties().with_properties(props).await?;
+
+        Ok(())
+    }
+
+    /// If a user attempts to set a newer minWriterVersion e.g. 7, then the protocol must add
+    /// writer and reader features to the table.
+    #[tokio::test]
+    async fn test_increase_protocol_versions() -> crate::DeltaResult<()> {
+        let temp_loc = tempdir()?;
+        let ops = create_initialized_table(temp_loc.path().to_str().unwrap(), &[]).await;
+
+        // Test enabling features that automatically set appropriate protocol versions
+        let props = HashMap::from([("delta.minWriterVersion".to_string(), "7".to_string())]);
         ops.set_tbl_properties().with_properties(props).await?;
 
         Ok(())

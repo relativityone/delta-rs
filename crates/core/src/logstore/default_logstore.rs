@@ -1,25 +1,14 @@
 //! Default implementation of [`LogStore`] for storage backends with atomic put-if-absent operation
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::{Attributes, Error as ObjectStoreError, ObjectStore, PutOptions, TagSet};
-use uuid::Uuid;
+use object_store::ObjectStore;
 
-use super::storage::{utils::commit_uri_from_version, ObjectStoreRef};
-use super::{CommitOrBytes, LogStore, LogStoreConfig};
-use crate::kernel::transaction::TransactionError;
+use super::storage::ObjectStoreRef;
+use super::{CommitStrategy, Committer, FileSystemCommitter, LogStore, LogStoreConfig};
 use crate::DeltaResult;
-
-fn put_options() -> &'static PutOptions {
-    static PUT_OPTS: OnceLock<PutOptions> = OnceLock::new();
-    PUT_OPTS.get_or_init(|| PutOptions {
-        mode: object_store::PutMode::Create, // Creates if file doesn't exists yet
-        tags: TagSet::default(),
-        attributes: Attributes::default(),
-        extensions: Default::default(),
-    })
-}
+use crate::kernel::Version;
 
 /// Default [`LogStore`] implementation
 #[derive(Debug, Clone)]
@@ -58,65 +47,28 @@ impl LogStore for DefaultLogStore {
         "DefaultLogStore".into()
     }
 
-    async fn read_commit_entry(&self, version: i64) -> DeltaResult<Option<Bytes>> {
-        super::read_commit_entry(self.object_store(None).as_ref(), version).await
+    async fn read_commit_entry(&self, version: Version) -> DeltaResult<Option<Bytes>> {
+        super::read_commit_entry(self.prefixed_store.as_ref(), version).await
     }
 
-    /// Tries to commit a prepared commit file. Returns [`TransactionError`]
-    /// if the given `version` already exists. The caller should handle the retry logic itself.
-    /// This is low-level transaction API. If user does not want to maintain the commit loop then
-    /// the `DeltaTransaction.commit` is desired to be used as it handles `try_commit_transaction`
-    /// with retry logic.
-    async fn write_commit_entry(
-        &self,
-        version: i64,
-        commit_or_bytes: CommitOrBytes,
-        _: Uuid,
-    ) -> Result<(), TransactionError> {
-        match commit_or_bytes {
-            CommitOrBytes::LogBytes(log_bytes) => self
-                .object_store(None)
-                .put_opts(
-                    &commit_uri_from_version(version),
-                    log_bytes.into(),
-                    put_options().clone(),
-                )
-                .await
-                .map_err(|err| -> TransactionError {
-                    match err {
-                        ObjectStoreError::AlreadyExists { .. } => {
-                            TransactionError::VersionAlreadyExists(version)
-                        }
-                        _ => TransactionError::from(err),
-                    }
-                })?,
-            _ => unreachable!(), // Default log store should never get a tmp_commit, since this is for conditional put stores
-        };
-        Ok(())
-    }
-
-    async fn abort_commit_entry(
-        &self,
-        _version: i64,
-        commit_or_bytes: CommitOrBytes,
-        _: Uuid,
-    ) -> Result<(), TransactionError> {
-        match &commit_or_bytes {
-            CommitOrBytes::LogBytes(_) => Ok(()),
-            _ => unreachable!(), // Default log store should never get a tmp_commit, since this is for conditional put stores
-        }
-    }
-
-    async fn get_latest_version(&self, current_version: i64) -> DeltaResult<i64> {
+    async fn get_latest_version(&self, current_version: Version) -> DeltaResult<Version> {
         super::get_latest_version(self, current_version).await
     }
 
-    fn object_store(&self, _: Option<Uuid>) -> Arc<dyn ObjectStore> {
+    fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.prefixed_store.clone()
     }
 
-    fn root_object_store(&self, _: Option<Uuid>) -> Arc<dyn ObjectStore> {
+    fn root_object_store(&self) -> Arc<dyn ObjectStore> {
         self.root_store.clone()
+    }
+
+    /// Commits are put-if-absent writes of the commit bytes.
+    fn committer(&self) -> Arc<dyn Committer> {
+        Arc::new(FileSystemCommitter::new(
+            self.prefixed_store.clone(),
+            CommitStrategy::ConditionalPut,
+        ))
     }
 
     fn config(&self) -> &LogStoreConfig {

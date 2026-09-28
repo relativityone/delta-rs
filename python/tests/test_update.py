@@ -15,7 +15,7 @@ def sample_table():
         {
             "id": Array(
                 ["1", "2", "3", "4", "5"],
-                ArrowField("id", type=DataType.string(), nullable=True),
+                ArrowField("id", type=DataType.string_view(), nullable=True),
             ),
             "price": Array(
                 list(range(nrows)),
@@ -46,7 +46,7 @@ def test_update_with_predicate(tmp_path: pathlib.Path, sample_table: Table):
         {
             "id": Array(
                 ["1", "2", "3", "4", "5"],
-                ArrowField("id", type=DataType.string(), nullable=True),
+                ArrowField("id", type=DataType.string_view(), nullable=True),
             ),
             "price": Array(
                 [0, 1, 2, 3, 4],
@@ -91,7 +91,7 @@ def test_update_wo_predicate(tmp_path: pathlib.Path, sample_table: Table):
         {
             "id": Array(
                 ["1", "2", "3", "4", "5"],
-                ArrowField("id", type=DataType.string(), nullable=True),
+                ArrowField("id", type=DataType.string_view(), nullable=True),
             ),
             "price": Array(
                 [0, 1, 2, 3, 4],
@@ -129,7 +129,7 @@ def test_update_wrong_types_cast(tmp_path: pathlib.Path, sample_table: Table):
     with pytest.raises(Exception) as excinfo:
         dt.update(updates={"deleted": "'hello_world'"})
 
-    expected = """Generic DeltaTable error: type_coercion\ncaused by\nError during planning: Failed to coerce then (Utf8) and else (Boolean) to common types in CASE WHEN expression"""
+    expected = """Generic DeltaTable error: Optimizer rule 'simplify_expressions' failed\ncaused by\nArrow error: Cast error: Cannot cast value 'hello_world' to value of Boolean type"""
     assert str(excinfo.value) == expected
 
 
@@ -144,7 +144,7 @@ def test_update_wo_predicate_multiple_updates(
         {
             "id": Array(
                 ["1_1", "2_1", "3_1", "4_1", "5_1"],
-                ArrowField("id", type=DataType.string(), nullable=True),
+                ArrowField("id", type=DataType.string_view(), nullable=True),
             ),
             "price": Array(
                 [0, 1, 2, 3, 4],
@@ -188,7 +188,7 @@ def test_update_with_predicate_and_new_values(
         {
             "id": Array(
                 ["1", "2", "3", "4", "new_id"],
-                ArrowField("id", type=DataType.string(), nullable=True),
+                ArrowField("id", type=DataType.string_view(), nullable=True),
             ),
             "price": Array(
                 [0, 1, 2, 3, 4],
@@ -225,6 +225,27 @@ def test_update_with_predicate_and_new_values(
 
     assert last_action["operation"] == "UPDATE"
     assert result == expected
+
+
+@pytest.mark.parametrize("value", ["Alice", "O'Reilly", "a' || 'b", ""])
+def test_update_new_values_preserves_strings(tmp_path, value):
+    data = Table(
+        {
+            "name": Array(
+                ["before"],
+                ArrowField("name", type=DataType.string(), nullable=True),
+            )
+        }
+    )
+    write_deltalake(tmp_path, data)
+    dt = DeltaTable(tmp_path)
+
+    dt.update(new_values={"name": value})
+
+    result = (
+        QueryBuilder().register("tbl", dt).execute("SELECT name FROm tbl").read_all()
+    )
+    assert result.column("name")[0].as_py() == value
 
 
 def test_update_no_inputs(tmp_path: pathlib.Path, sample_table: Table):

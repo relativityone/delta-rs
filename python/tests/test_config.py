@@ -1,28 +1,45 @@
+import pytest
 from arro3.core import Table
 
-from deltalake import write_deltalake
-from deltalake.table import DeltaTable, DeltaTableConfig
+from deltalake import DeltaTable, TableProperty, write_deltalake
 
 
-def test_config_roundtrip(tmp_path, sample_table: Table):
+@pytest.mark.parametrize(
+    "options",
+    [{"without_files": True}, {"skip_stats": True}, {"log_buffer_size": 1}],
+)
+def test_deprecated_load_options_are_ignored(tmp_path, sample_table, options):
     write_deltalake(tmp_path, sample_table)
+    expected = DeltaTable(tmp_path)
 
-    config = DeltaTableConfig(without_files=True, log_buffer_size=100)
+    with pytest.warns(DeprecationWarning, match="ignored"):
+        table = DeltaTable(tmp_path, **options)
 
-    dt = DeltaTable(
-        tmp_path,
-        without_files=config.without_files,
-        log_buffer_size=config.log_buffer_size,
+    with pytest.warns(DeprecationWarning):
+        assert table.table_config == expected.table_config
+
+    expected_actions = expected.get_add_actions(flatten=True)
+    actual_actions = table.get_add_actions(flatten=True)
+    assert table.file_uris() == expected.file_uris()
+    assert actual_actions.column_names == expected_actions.column_names
+    for name in expected_actions.column_names:
+        assert (
+            actual_actions.column(name).to_pylist()
+            == expected_actions.column(name).to_pylist()
+        )
+    assert all(
+        value is not None
+        for value in expected_actions.column("num_records").to_pylist()
     )
 
-    assert config == dt.table_config
 
-    config = DeltaTableConfig(without_files=False, log_buffer_size=1)
-
-    dt = DeltaTable(
+def test_table_property_as_configuration_key(tmp_path, sample_table: Table):
+    write_deltalake(
         tmp_path,
-        without_files=config.without_files,
-        log_buffer_size=config.log_buffer_size,
+        sample_table,
+        configuration={TableProperty.APPEND_ONLY: "true"},
     )
 
-    assert config == dt.table_config
+    configuration = DeltaTable(tmp_path).metadata().configuration
+
+    assert configuration[TableProperty.APPEND_ONLY.value] == "true"

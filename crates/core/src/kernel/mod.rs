@@ -5,18 +5,21 @@
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use std::sync::{Arc, LazyLock};
 use tokio::task::JoinHandle;
-use tracing::dispatcher;
 use tracing::Span;
+use tracing::dispatcher;
 
 pub mod arrow;
 pub mod error;
+/// Core Delta log action models (Add, Remove, Metadata, Protocol, ...) and related types.
 pub mod models;
 pub mod scalars;
+/// Delta and Arrow schema types, conversions, casting and partition handling.
 pub mod schema;
-mod snapshot;
+pub(crate) mod snapshot;
 pub mod transaction;
 
 pub use arrow::engine_ext::StructDataExt;
+pub use delta_kernel::Version;
 pub use delta_kernel::engine;
 pub use error::*;
 pub use models::*;
