@@ -16,6 +16,7 @@ use crate::table::config::TablePropertiesExt;
 use crate::table::state::DeltaTableState;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
 use arrow_array::Array;
+use arrow_schema::DataType;
 use datafusion::common::{JoinType, ScalarValue};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::expr::InList;
@@ -219,14 +220,19 @@ impl UpsertBuilder {
         let partition_filters =
             Self::partition_filter_exprs(&relevant_partition_cols, &partition_values);
 
+        let key_range_filters = self.key_range_filters(&relevant_partition_cols).await?;
+
+        let read_scope: Vec<Expr> = partition_filters
+            .into_iter()
+            .chain(key_range_filters)
+            .collect();
+
         // The scan scope and the predicate recorded on the commit are derived from the same
         // expressions, so the commit can never claim to have read less than it did.
-        let commit_predicate = self.commit_predicate(&partition_filters, &state);
+        let commit_predicate = self.commit_predicate(&read_scope, &state);
 
-        // Create target DataFrame with partition filtering
-        let target_df = self
-            .create_target_dataframe(&state, &partition_filters)
-            .await?;
+        // Create target DataFrame with file skipping
+        let target_df = self.create_target_dataframe(&state, &read_scope).await?;
 
         // Check for conflicts between source and target and cache the result for reuse
         let conflicts_df =
@@ -279,27 +285,114 @@ impl UpsertBuilder {
             .collect()
     }
 
-    /// Render the partition filters as the predicate to record on the commit.
-    fn commit_predicate(&self, filters: &[Expr], state: &SessionState) -> Option<String> {
-        let predicate = conjunction(filters.iter().cloned())?;
+    /// Bound each non-partition join key by the source's `[min, max]`.
+    async fn key_range_filters(&self, partition_keys: &[String]) -> DeltaResult<Vec<Expr>> {
+        use datafusion::functions_aggregate::expr_fn::{max, min};
 
-        let sql = match fmt_expr_to_sql(&predicate) {
-            Ok(sql) => sql,
-            Err(e) => {
-                tracing::warn!(
-                    "upsert: partition filters could not be rendered as SQL, committing without a \
-                     read predicate: {e}"
-                );
-                return None;
-            }
+        let target_schema = self.snapshot.arrow_schema();
+        let bounded_keys: Vec<(&String, DataType)> = self
+            .join_keys
+            .iter()
+            .filter(|key| !partition_keys.contains(key))
+            .filter_map(|key| {
+                let data_type = target_schema.field_with_name(key).ok()?.data_type().clone();
+                Self::is_range_boundable(&data_type).then_some((key, data_type))
+            })
+            .collect();
+
+        if bounded_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let aggregates: Vec<Expr> = bounded_keys
+            .iter()
+            .flat_map(|(key, _)| [min(col(*key)), max(col(*key))])
+            .collect();
+        let batches = self
+            .source
+            .clone()
+            .aggregate(vec![], aggregates)?
+            .collect()
+            .await?;
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(Vec::new());
         };
 
-        match self.snapshot.parse_predicate_expression(&sql, state) {
-            Ok(_) => Some(sql),
+        let mut filters = Vec::with_capacity(bounded_keys.len() * 2);
+        for (idx, (key, data_type)) in bounded_keys.iter().enumerate() {
+            let bound = |column: usize| -> DeltaResult<Option<ScalarValue>> {
+                let value = ScalarValue::try_from_array(batch.column(column).as_ref(), 0)?;
+                if value.is_null() {
+                    return Ok(None);
+                }
+                // Match the target column type, e.g. `Utf8View` source vs `Utf8` column.
+                Ok(value.cast_to(data_type).ok())
+            };
+            let (Some(lower), Some(upper)) = (bound(idx * 2)?, bound(idx * 2 + 1)?) else {
+                continue;
+            };
+            filters.push(col(*key).gt_eq(lit(lower)));
+            filters.push(col(*key).lt_eq(lit(upper)));
+        }
+
+        Ok(filters)
+    }
+
+    /// Types whose file min/max stats can be used for range pruning.
+    fn is_range_boundable(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, _)
+                | DataType::Decimal128(_, _)
+        )
+    }
+
+    /// Render the filters as the commit predicate, dropping any that fail to render or parse
+    /// (fewer terms only widen the predicate).
+    fn commit_predicate(&self, filters: &[Expr], state: &SessionState) -> Option<String> {
+        let renderable = filters.iter().filter(|filter| {
+            let sql = match fmt_expr_to_sql(filter) {
+                Ok(sql) => sql,
+                Err(e) => {
+                    tracing::warn!(
+                        "upsert: read scope term {filter} could not be rendered as SQL, \
+                         leaving it out of the commit predicate: {e}"
+                    );
+                    return false;
+                }
+            };
+            match self.snapshot.parse_predicate_expression(&sql, state) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        "upsert: read scope term {sql:?} does not parse against the table schema, \
+                         leaving it out of the commit predicate: {e}"
+                    );
+                    false
+                }
+            }
+        });
+
+        let predicate = conjunction(renderable.cloned())?;
+        match fmt_expr_to_sql(&predicate) {
+            Ok(sql) => Some(sql),
             Err(e) => {
                 tracing::warn!(
-                    "upsert: read predicate {sql:?} does not parse against the table schema, \
-                     committing without one: {e}"
+                    "upsert: read scope could not be rendered as SQL, committing without a \
+                     read predicate: {e}"
                 );
                 None
             }
@@ -1254,5 +1347,50 @@ mod tests {
 
         // The losing upsert left the table exactly as the winner did.
         assert_eq!(first.version(), table_version_now(&first).await);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_upserts_with_disjoint_keys_do_not_conflict() {
+        let table = table_with_files(
+            &[
+                &[row("A", 1), row("B", 2)],
+                &[row("M", 3).in_workspace(2), row("N", 4).in_workspace(2)],
+            ],
+            &["workspace_id"],
+        )
+        .await;
+
+        table
+            .clone()
+            .upsert(source(&[row("A", 10)]), keys(&["id"]))
+            .await
+            .unwrap();
+        let (second, _) = table
+            .upsert(source(&[row("M", 30).in_workspace(2)]), keys(&["id"]))
+            .await
+            .expect("disjoint key ranges must not conflict");
+
+        let data = get_table_data(&second).await;
+        assert_record(&data, ("A", 10));
+        assert_record(&data, ("M", 30));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_inserts_of_same_key_conflict() {
+        let table = setup_test_table().await;
+
+        table
+            .clone()
+            .upsert(source(&[row("Z", 1)]), join_keys())
+            .await
+            .unwrap();
+        let result = table.upsert(source(&[row("Z", 2)]), join_keys()).await;
+
+        assert!(matches!(
+            result,
+            Err(DeltaTableError::Transaction {
+                source: crate::kernel::transaction::TransactionError::CommitConflict(_)
+            })
+        ));
     }
 }
