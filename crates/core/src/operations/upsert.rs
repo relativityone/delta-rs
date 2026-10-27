@@ -8,7 +8,7 @@ use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{Action, EagerSnapshot};
 use crate::logstore::{LogStore, LogStoreRef};
 use crate::operations::cdc::should_write_cdc;
-use crate::operations::write::WriterStatsConfig;
+use crate::operations::write::configs::WriteExecOptions;
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::{CustomExecuteHandler, Operation};
 use crate::protocol::{DeltaOperation, MergePredicate, SaveMode};
@@ -164,10 +164,6 @@ impl UpsertBuilder {
     /// Validate that the table is in a valid state for upsert operations
     fn validate_table_state(snapshot: &EagerSnapshot) -> DeltaResult<()> {
         PROTOCOL.can_write_to(snapshot)?;
-
-        if !snapshot.load_config().require_files {
-            return Err(DeltaTableError::NotInitializedWithFiles("UPSERT".into()));
-        }
 
         if should_write_cdc(snapshot)? {
             return Err(DeltaTableError::Generic(
@@ -497,19 +493,16 @@ impl UpsertBuilder {
         let logical_plan = self.source.clone().into_unoptimized_plan();
         let physical_plan = state.create_physical_plan(&logical_plan).await?;
 
-        // Get partition columns for writing
-        let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns().to_vec();
-
         let (add_actions, write_metrics) = write_execution_plan_v2(
-            Some(&self.snapshot),
+            self.snapshot.table_configuration(),
             state,
             physical_plan,
-            partition_columns,
             self.log_store.object_store(Some(operation_id)),
-            Some(self.snapshot.table_properties().target_file_size()),
-            None,
-            self.writer_properties.clone(),
-            WriterStatsConfig::new(self.snapshot.table_properties().num_indexed_cols(), None),
+            WriteExecOptions {
+                target_file_size: Some(self.snapshot.table_properties().target_file_size()),
+                write_batch_size: None,
+                writer_properties: self.writer_properties.clone(),
+            },
             None,
             false,
             None,
@@ -558,19 +551,16 @@ impl UpsertBuilder {
         let logical_plan = result_df.into_unoptimized_plan();
         let physical_plan = state.create_physical_plan(&logical_plan).await?;
 
-        // Get partition columns for writing
-        let partition_columns: Vec<String> = self.snapshot.metadata().partition_columns().to_vec();
-
         let (add_actions, write_metrics) = write_execution_plan_v2(
-            Some(&self.snapshot),
+            self.snapshot.table_configuration(),
             state,
             physical_plan,
-            partition_columns,
             self.log_store.object_store(Some(operation_id)),
-            Some(self.snapshot.table_properties().target_file_size()),
-            None,
-            self.writer_properties.clone(),
-            WriterStatsConfig::new(self.snapshot.table_properties().num_indexed_cols(), None),
+            WriteExecOptions {
+                target_file_size: Some(self.snapshot.table_properties().target_file_size()),
+                write_batch_size: None,
+                writer_properties: self.writer_properties.clone(),
+            },
             None,
             false,
             None,
