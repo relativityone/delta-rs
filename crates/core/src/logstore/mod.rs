@@ -782,20 +782,53 @@ pub async fn get_latest_version(
     let storage = log_store.engine(None).storage_handler();
     let log_root = log_store.log_root_url();
 
+    let probe_storage = storage.clone();
+    let probe_root = log_root.clone();
+
     let segment = spawn_blocking_with_span(move || {
         LogSegment::for_table_changes(storage.as_ref(), log_root, current_version, None)
     })
     .await
-    .map_err(|e| DeltaTableError::Generic(e.to_string()))?
-    .map_err(|e| {
-        if e.to_string()
-            .contains(&format!("to have version {current_version}"))
+    .map_err(|e| DeltaTableError::Generic(e.to_string()))?;
+
+    let segment = match segment {
+        Ok(segment) => segment,
+        Err(e)
+            if e.to_string()
+                .contains(&format!("to have version {current_version}")) =>
         {
-            DeltaTableError::InvalidVersion(current_version)
-        } else {
-            DeltaTableError::Generic(e.to_string())
+            // The listing that started at `current_version` did not return it as the first
+            // commit, although the caller has already seen that commit. Record the kernel's own
+            // account of what the listing returned, then list again from one version earlier so
+            // the two listings can be compared.
+            let kernel_error = e.to_string();
+            let probe_start_version = current_version.saturating_sub(1);
+            let probe_result = spawn_blocking_with_span(move || {
+                LogSegment::for_table_changes(
+                    probe_storage.as_ref(),
+                    probe_root,
+                    probe_start_version,
+                    None,
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()))
+            .map_or_else(
+                |err| format!("error: {err}"),
+                |seg| format!("ok, end_version={}", seg.end_version),
+            );
+            warn!(
+                current_version,
+                kernel_error = %kernel_error,
+                probe_start_version,
+                probe_result = %probe_result,
+                "listing from the current version did not return it as the first commit"
+            );
+            return Err(DeltaTableError::InvalidVersion(current_version));
         }
-    })?;
+        Err(e) => return Err(DeltaTableError::Generic(e.to_string())),
+    };
 
     Ok(segment.end_version)
 }
