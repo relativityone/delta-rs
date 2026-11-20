@@ -784,6 +784,8 @@ pub async fn get_latest_version(
 
     let probe_storage = storage.clone();
     let probe_root = log_root.clone();
+    let raw_store = log_store.root_object_store(None);
+    let raw_root = log_root.clone();
 
     let segment = spawn_blocking_with_span(move || {
         LogSegment::for_table_changes(storage.as_ref(), log_root, current_version, None)
@@ -818,11 +820,16 @@ pub async fn get_latest_version(
                 |err| format!("error: {err}"),
                 |seg| format!("ok, end_version={}", seg.end_version),
             );
+            // Repeat the kernel's listing request directly against the object store, with the
+            // same prefix and offset the engine derives, so the raw keys can be compared with
+            // what the kernel made of them.
+            let raw_keys = list_raw_log_keys(raw_store, &raw_root, current_version).await;
             warn!(
                 current_version,
                 kernel_error = %kernel_error,
                 probe_start_version,
                 probe_result = %probe_result,
+                raw_keys = %raw_keys,
                 "listing from the current version did not return it as the first commit"
             );
             return Err(DeltaTableError::InvalidVersion(current_version));
@@ -831,6 +838,51 @@ pub async fn get_latest_version(
     };
 
     Ok(segment.end_version)
+}
+
+/// How many entries [`list_raw_log_keys`] reads before it stops counting.
+const RAW_LOG_KEYS_LIMIT: usize = 20;
+
+/// How many of those entries it reports by key.
+const RAW_LOG_KEYS_SHOWN: usize = 5;
+
+/// Lists the delta log from `version` the way the kernel engine does — `list_with_offset` on the
+/// root store, prefix = the log directory, offset = the version-only key — and describes what
+/// came back: the first few keys and how many entries were seen, or the listing error.
+async fn list_raw_log_keys(
+    store: Arc<dyn ObjectStore>,
+    log_root: &Url,
+    version: Version,
+) -> String {
+    let prefix = match Path::from_url_path(log_root.path()) {
+        Ok(prefix) => prefix,
+        Err(e) => return format!("error: invalid log root path: {e}"),
+    };
+    let offset = prefix.clone().join(format!("{version:020}"));
+
+    let mut keys = Vec::new();
+    let mut count = 0usize;
+    let mut stream = store.list_with_offset(Some(&prefix), &offset);
+    while let Some(entry) = stream.next().await {
+        match entry {
+            Ok(meta) => {
+                count += 1;
+                if keys.len() < RAW_LOG_KEYS_SHOWN {
+                    keys.push(
+                        meta.location
+                            .filename()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| meta.location.to_string()),
+                    );
+                }
+                if count >= RAW_LOG_KEYS_LIMIT {
+                    return format!("offset={offset} keys={keys:?} count={count}+");
+                }
+            }
+            Err(e) => return format!("offset={offset} keys={keys:?} count={count} error: {e}"),
+        }
+    }
+    format!("offset={offset} keys={keys:?} count={count}")
 }
 
 /// Get all versions related to the delta table and return a tuple of a vector of versions and a
@@ -959,6 +1011,43 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[tokio::test]
+    async fn list_raw_log_keys_mirrors_the_kernel_listing() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        for key in [
+            "table/_delta_log/00000000000000000004.json",
+            "table/_delta_log/00000000000000000005.json",
+            "table/_delta_log/00000000000000000006.json",
+            "table/_delta_log/_last_checkpoint",
+            "table/part-0.parquet",
+        ] {
+            store
+                .put(&Path::from(key), Bytes::new().into())
+                .await
+                .unwrap();
+        }
+        let log_root = Url::parse("memory:///table/_delta_log/").unwrap();
+
+        // Keys at and after the offset, in order, nothing from outside the log directory.
+        assert_eq!(
+            list_raw_log_keys(store.clone(), &log_root, 5).await,
+            "offset=table/_delta_log/00000000000000000005 \
+             keys=[\"00000000000000000005.json\", \"00000000000000000006.json\", \"_last_checkpoint\"] \
+             count=3"
+        );
+        // Past the last commit only the `_`-prefixed entries remain.
+        assert_eq!(
+            list_raw_log_keys(store.clone(), &log_root, 7).await,
+            "offset=table/_delta_log/00000000000000000007 keys=[\"_last_checkpoint\"] count=1"
+        );
+        // An empty directory lists nothing.
+        let empty_root = Url::parse("memory:///empty/_delta_log/").unwrap();
+        assert_eq!(
+            list_raw_log_keys(store, &empty_root, 0).await,
+            "offset=empty/_delta_log/00000000000000000000 keys=[] count=0"
+        );
+    }
 
     #[test]
     fn test_logstore_config_ctor() {
