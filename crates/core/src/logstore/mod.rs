@@ -782,8 +782,6 @@ pub async fn get_latest_version(
     let storage = log_store.engine(None).storage_handler();
     let log_root = log_store.log_root_url();
 
-    let probe_storage = storage.clone();
-    let probe_root = log_root.clone();
     let raw_store = log_store.root_object_store(None);
     let raw_root = log_root.clone();
 
@@ -801,35 +799,18 @@ pub async fn get_latest_version(
         {
             // The listing that started at `current_version` did not return it as the first
             // commit, although the caller has already seen that commit. Record the kernel's own
-            // account of what the listing returned, then list again from one version earlier so
-            // the two listings can be compared.
+            // account of what the listing returned, then ask the object store directly, with
+            // the probe marker set so the HTTP layer can record these requests: the kernel's
+            // listing replayed as is, and a HEAD on the commit file it should have returned.
             let kernel_error = e.to_string();
-            let probe_start_version = current_version.saturating_sub(1);
-            let probe_result = spawn_blocking_with_span(move || {
-                LogSegment::for_table_changes(
-                    probe_storage.as_ref(),
-                    probe_root,
-                    probe_start_version,
-                    None,
-                )
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.map_err(|e| e.to_string()))
-            .map_or_else(
-                |err| format!("error: {err}"),
-                |seg| format!("ok, end_version={}", seg.end_version),
-            );
-            // Repeat the kernel's listing request directly against the object store, with the
-            // same prefix and offset the engine derives, so the raw keys can be compared with
-            // what the kernel made of them.
-            let raw_keys = list_raw_log_keys(raw_store, &raw_root, current_version).await;
+            let probe = LOG_LISTING_PROBE
+                .scope((), probe_log_listing(raw_store, &raw_root, current_version))
+                .await;
             warn!(
                 current_version,
                 kernel_error = %kernel_error,
-                probe_start_version,
-                probe_result = %probe_result,
-                raw_keys = %raw_keys,
+                raw_keys = %probe.raw_keys,
+                head_result = %probe.head_result,
                 "listing from the current version did not return it as the first commit"
             );
             return Err(DeltaTableError::InvalidVersion(current_version));
@@ -840,34 +821,89 @@ pub async fn get_latest_version(
     Ok(segment.end_version)
 }
 
-/// How many entries [`list_raw_log_keys`] reads before it stops counting.
-const RAW_LOG_KEYS_LIMIT: usize = 20;
+tokio::task_local! {
+    /// Set while [`probe_log_listing`] runs, so an HTTP layer below the object store can tell
+    /// the probe's requests from ordinary traffic and record them: `LOG_LISTING_PROBE
+    /// .try_with(|_| ()).is_ok()` from anything polled inside the probe.
+    pub static LOG_LISTING_PROBE: ();
+}
+
+/// How many entries a probe listing reads before it stops counting.
+const PROBE_KEYS_LIMIT: usize = 20;
 
 /// How many of those entries it reports by key.
-const RAW_LOG_KEYS_SHOWN: usize = 5;
+const PROBE_KEYS_SHOWN: usize = 5;
 
-/// Lists the delta log from `version` the way the kernel engine does — `list_with_offset` on the
-/// root store, prefix = the log directory, offset = the version-only key — and describes what
-/// came back: the first few keys and how many entries were seen, or the listing error.
-async fn list_raw_log_keys(
+/// What [`probe_log_listing`] found out about the log directory, each as a log-ready string.
+#[derive(Debug)]
+struct LogListingProbe {
+    /// The kernel's listing replayed as is: offset listing from the version-only key.
+    raw_keys: String,
+    /// A HEAD on the commit file for `version`.
+    head_result: String,
+}
+
+/// Interrogates the log directory about `version` the way the kernel engine does and one way
+/// it does not, so the responses can be compared for the same moment.
+async fn probe_log_listing(
     store: Arc<dyn ObjectStore>,
     log_root: &Url,
     version: Version,
-) -> String {
+) -> LogListingProbe {
     let prefix = match Path::from_url_path(log_root.path()) {
         Ok(prefix) => prefix,
-        Err(e) => return format!("error: invalid log root path: {e}"),
+        Err(e) => {
+            let err = format!("error: invalid log root path: {e}");
+            return LogListingProbe {
+                raw_keys: err.clone(),
+                head_result: err,
+            };
+        }
     };
     let offset = prefix.clone().join(format!("{version:020}"));
+    LogListingProbe {
+        raw_keys: list_raw_log_keys(store.as_ref(), &prefix, &offset).await,
+        head_result: head_commit_file(store.as_ref(), &prefix, version).await,
+    }
+}
 
+/// Lists the delta log the way the kernel engine does — `list_with_offset` with the log
+/// directory as prefix and the version-only key as offset — and describes what came back.
+async fn list_raw_log_keys(store: &dyn ObjectStore, prefix: &Path, offset: &Path) -> String {
+    let listing = store.list_with_offset(Some(prefix), offset);
+    let summary = summarize_listing(listing).await;
+    format!("offset={offset} {summary}")
+}
+
+/// HEADs the commit file for `version`: its last-modified time if it exists, else the error.
+async fn head_commit_file(store: &dyn ObjectStore, prefix: &Path, version: Version) -> String {
+    let location = prefix.clone().join(format!("{version:020}.json"));
+    match store.head(&location).await {
+        Ok(meta) => format!(
+            "ok last_modified={} size={}",
+            meta.last_modified
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            meta.size
+        ),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// Reads up to [`PROBE_KEYS_LIMIT`] entries and reports the first few filenames and the
+/// count, or the listing error.
+async fn summarize_listing(
+    mut listing: futures::stream::BoxStream<
+        'static,
+        object_store::Result<object_store::ObjectMeta>,
+    >,
+) -> String {
     let mut keys = Vec::new();
     let mut count = 0usize;
-    let mut stream = store.list_with_offset(Some(&prefix), &offset);
-    while let Some(entry) = stream.next().await {
+    while let Some(entry) = listing.next().await {
         match entry {
             Ok(meta) => {
                 count += 1;
-                if keys.len() < RAW_LOG_KEYS_SHOWN {
+                if keys.len() < PROBE_KEYS_SHOWN {
                     keys.push(
                         meta.location
                             .filename()
@@ -875,14 +911,14 @@ async fn list_raw_log_keys(
                             .unwrap_or_else(|| meta.location.to_string()),
                     );
                 }
-                if count >= RAW_LOG_KEYS_LIMIT {
-                    return format!("offset={offset} keys={keys:?} count={count}+");
+                if count >= PROBE_KEYS_LIMIT {
+                    return format!("keys={keys:?} count={count}+");
                 }
             }
-            Err(e) => return format!("offset={offset} keys={keys:?} count={count} error: {e}"),
+            Err(e) => return format!("keys={keys:?} count={count} error: {e}"),
         }
     }
-    format!("offset={offset} keys={keys:?} count={count}")
+    format!("keys={keys:?} count={count}")
 }
 
 /// Get all versions related to the delta table and return a tuple of a vector of versions and a
@@ -1013,12 +1049,13 @@ pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn list_raw_log_keys_mirrors_the_kernel_listing() {
+    async fn probe_log_listing_reports_offset_listing_and_head() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         for key in [
             "table/_delta_log/00000000000000000004.json",
             "table/_delta_log/00000000000000000005.json",
             "table/_delta_log/00000000000000000006.json",
+            "table/_delta_log/00000000000000000105.json",
             "table/_delta_log/_last_checkpoint",
             "table/part-0.parquet",
         ] {
@@ -1029,23 +1066,41 @@ pub(crate) mod tests {
         }
         let log_root = Url::parse("memory:///table/_delta_log/").unwrap();
 
-        // Keys at and after the offset, in order, nothing from outside the log directory.
+        // Marker is visible to anything polled inside the probe.
+        let probe = LOG_LISTING_PROBE
+            .scope((), async {
+                assert!(LOG_LISTING_PROBE.try_with(|_| ()).is_ok());
+                probe_log_listing(store.clone(), &log_root, 5).await
+            })
+            .await;
+        assert!(LOG_LISTING_PROBE.try_with(|_| ()).is_err());
+
+        // Offset listing: keys after the offset, in order, from the whole directory.
         assert_eq!(
-            list_raw_log_keys(store.clone(), &log_root, 5).await,
+            probe.raw_keys,
             "offset=table/_delta_log/00000000000000000005 \
-             keys=[\"00000000000000000005.json\", \"00000000000000000006.json\", \"_last_checkpoint\"] \
-             count=3"
+             keys=[\"00000000000000000005.json\", \"00000000000000000006.json\", \
+             \"00000000000000000105.json\", \"_last_checkpoint\"] count=4"
         );
-        // Past the last commit only the `_`-prefixed entries remain.
-        assert_eq!(
-            list_raw_log_keys(store.clone(), &log_root, 7).await,
-            "offset=table/_delta_log/00000000000000000007 keys=[\"_last_checkpoint\"] count=1"
+        // HEAD: the commit file exists.
+        assert!(
+            probe.head_result.starts_with("ok last_modified=")
+                && probe.head_result.ends_with(" size=0"),
+            "{}",
+            probe.head_result
         );
-        // An empty directory lists nothing.
-        let empty_root = Url::parse("memory:///empty/_delta_log/").unwrap();
+
+        // A version with no commit file.
+        let probe = probe_log_listing(store, &log_root, 7).await;
         assert_eq!(
-            list_raw_log_keys(store, &empty_root, 0).await,
-            "offset=empty/_delta_log/00000000000000000000 keys=[] count=0"
+            probe.raw_keys,
+            "offset=table/_delta_log/00000000000000000007 \
+             keys=[\"00000000000000000105.json\", \"_last_checkpoint\"] count=2"
+        );
+        assert!(
+            probe.head_result.starts_with("error: "),
+            "{}",
+            probe.head_result
         );
     }
 
