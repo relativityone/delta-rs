@@ -50,6 +50,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 #[cfg(feature = "datafusion")]
@@ -811,6 +812,10 @@ pub async fn get_latest_version(
                 kernel_error = %kernel_error,
                 raw_keys = %probe.raw_keys,
                 head_result = %probe.head_result,
+                head_minus_1 = %probe.head_minus_1,
+                head_minus_10 = %probe.head_minus_10,
+                head_minus_100 = %probe.head_minus_100,
+                reappearance = %probe.reappearance,
                 "listing from the current version did not return it as the first commit"
             );
             return Err(DeltaTableError::InvalidVersion(current_version));
@@ -841,6 +846,14 @@ struct LogListingProbe {
     raw_keys: String,
     /// A HEAD on the commit file for `version`.
     head_result: String,
+    /// HEADs on the commit files 1, 10 and 100 versions back, to show how far the blind spot
+    /// reaches (an old one may be gone legitimately if the log has been pruned).
+    head_minus_1: String,
+    head_minus_10: String,
+    head_minus_100: String,
+    /// Repeated HEADs on that file until it is found or the wait runs out: how long it took to
+    /// reappear and its modification time, or that it never did.
+    reappearance: String,
 }
 
 /// Interrogates the log directory about `version` the way the kernel engine does and one way
@@ -856,7 +869,11 @@ async fn probe_log_listing(
             let err = format!("error: invalid log root path: {e}");
             return LogListingProbe {
                 raw_keys: err.clone(),
-                head_result: err,
+                head_result: err.clone(),
+                head_minus_1: err.clone(),
+                head_minus_10: err.clone(),
+                head_minus_100: err.clone(),
+                reappearance: err,
             };
         }
     };
@@ -864,7 +881,59 @@ async fn probe_log_listing(
     LogListingProbe {
         raw_keys: list_raw_log_keys(store.as_ref(), &prefix, &offset).await,
         head_result: head_commit_file(store.as_ref(), &prefix, version).await,
+        head_minus_1: head_earlier_commit_file(store.as_ref(), &prefix, version, 1).await,
+        head_minus_10: head_earlier_commit_file(store.as_ref(), &prefix, version, 10).await,
+        head_minus_100: head_earlier_commit_file(store.as_ref(), &prefix, version, 100).await,
+        reappearance: await_commit_file(store.as_ref(), &prefix, version).await,
     }
+}
+
+/// [`head_commit_file`] for the commit `back` versions before `version`, or `n/a` when there
+/// is no such version.
+async fn head_earlier_commit_file(
+    store: &dyn ObjectStore,
+    prefix: &Path,
+    version: Version,
+    back: Version,
+) -> String {
+    match version.checked_sub(back) {
+        Some(earlier) => format!(
+            "v{earlier} {}",
+            head_commit_file(store, prefix, earlier).await
+        ),
+        None => "n/a".to_owned(),
+    }
+}
+
+/// How long [`await_commit_file`] waits before each repeated HEAD; about four seconds in all.
+const REAPPEARANCE_WAITS: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+    Duration::from_millis(2000),
+];
+
+/// HEADs the commit file for `version` again after each of [`REAPPEARANCE_WAITS`] until it is
+/// found, and reports how long that took, or that the waits ran out.
+async fn await_commit_file(store: &dyn ObjectStore, prefix: &Path, version: Version) -> String {
+    let location = prefix.clone().join(format!("{version:020}.json"));
+    let started = Instant::now();
+    for wait in REAPPEARANCE_WAITS {
+        tokio::time::sleep(wait).await;
+        match store.head(&location).await {
+            Ok(meta) => {
+                return format!(
+                    "found after {} ms last_modified={}",
+                    started.elapsed().as_millis(),
+                    meta.last_modified
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                );
+            }
+            Err(ObjectStoreError::NotFound { .. }) => {}
+            Err(e) => return format!("error after {} ms: {e}", started.elapsed().as_millis()),
+        }
+    }
+    format!("not found after {} ms", started.elapsed().as_millis())
 }
 
 /// Lists the delta log the way the kernel engine does — `list_with_offset` with the log
@@ -1089,6 +1158,14 @@ pub(crate) mod tests {
             "{}",
             probe.head_result
         );
+        // Earlier commits: one back exists, further back is before the table began.
+        assert!(
+            probe.head_minus_1.starts_with("v4 ok last_modified="),
+            "{}",
+            probe.head_minus_1
+        );
+        assert_eq!(probe.head_minus_10, "n/a");
+        assert_eq!(probe.head_minus_100, "n/a");
 
         // A version with no commit file.
         let probe = probe_log_listing(store, &log_root, 7).await;
@@ -1101,6 +1178,40 @@ pub(crate) mod tests {
             probe.head_result.starts_with("error: "),
             "{}",
             probe.head_result
+        );
+        assert!(
+            probe.reappearance.starts_with("not found after "),
+            "{}",
+            probe.reappearance
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_reports_when_a_missing_commit_file_reappears() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let log_root = Url::parse("memory:///table/_delta_log/").unwrap();
+        let writer = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            writer
+                .put(
+                    &Path::from("table/_delta_log/00000000000000000009.json"),
+                    Bytes::new().into(),
+                )
+                .await
+                .unwrap();
+        });
+        let probe = probe_log_listing(store, &log_root, 9).await;
+        assert!(
+            probe.head_result.starts_with("error: "),
+            "{}",
+            probe.head_result
+        );
+        assert!(
+            probe.reappearance.starts_with("found after ")
+                && probe.reappearance.contains(" ms last_modified="),
+            "{}",
+            probe.reappearance
         );
     }
 
